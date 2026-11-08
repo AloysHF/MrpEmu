@@ -647,13 +647,30 @@ impl Guest {
         self.cpu.reg_set(self.cpu.mode(), reg::LR, 0);
         let bridge_end = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4;
 
+        let trace = std::env::var("MRP_TRACE").is_ok();
+        let mut ring: Vec<(u32, u32, u32)> = Vec::new();
         for executed in 0..limit {
+            if trace {
+                ring.push((
+                    self.cpu.reg_get(self.cpu.mode(), reg::PC),
+                    self.r32(self.cpu.reg_get(self.cpu.mode(), reg::PC)),
+                    self.cpu.reg_get(self.cpu.mode(), R0),
+                ));
+                if ring.len() > 24 {
+                    ring.remove(0);
+                }
+            }
             if executed != 0 && executed % 5_000_000 == 0 {
                 let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
                 log::info!("guest still running: {executed} instructions, pc={pc:#010x}");
             }
             let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
             if pc == 0 {
+                if trace {
+                    for (index, (rpc, rinst, rr0)) in ring.iter().enumerate() {
+                        eprintln!("[return ring {index}] pc={rpc:#010x} inst={rinst:#010x} r0={rr0:#010x}");
+                    }
+                }
                 return Ok(self.cpu.reg_get(self.cpu.mode(), R0));
             }
             if (BRIDGE_BASE..bridge_end).contains(&pc) {
