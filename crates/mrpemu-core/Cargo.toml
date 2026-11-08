@@ -10,6 +10,8 @@ thiserror.workspace = true
 log.workspace = true
 encoding_rs.workspace = true
 flate2.workspace = true
+armv4t_emu.workspace = true
 
 [dev-dependencies]
+env_logger.workspace = true
 cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt", "run-cargo-clippy"] }

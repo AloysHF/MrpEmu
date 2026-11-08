@@ -15,9 +15,11 @@
 //! yet; [`MrpMachine::run_frame`] is a documented placeholder that keeps the
 //! screen content unchanged.
 
+pub mod cfunction;
 pub mod display;
 pub mod emulator;
 pub mod error;
+pub mod fmt;
 pub mod format;
 pub mod input;
 pub mod opcodes;
@@ -25,6 +27,7 @@ pub mod package;
 pub mod undump;
 pub mod vfs;
 
+pub use cfunction::{Guest, GuestConfig};
 pub use display::Screen;
 pub use emulator::MrpMachine;
 pub use error::MrpError;
