@@ -1975,7 +1975,6 @@ mod tests {
     /// Boots every reference sample through the real MrpMachine script
     /// path: start.mr runs on the VM, and the script loads ext images via
     /// _com(800). This is the corpus gate.
-
     /// Visual verification: boot hello.mrp, run 60 frames, check the
     /// screen buffer has non-background pixels (drawText output).
     #[test]
