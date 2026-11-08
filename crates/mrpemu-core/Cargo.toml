@@ -11,6 +11,7 @@ log.workspace = true
 encoding_rs.workspace = true
 flate2.workspace = true
 armv4t_emu.workspace = true
+unifont.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

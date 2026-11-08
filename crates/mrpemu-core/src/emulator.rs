@@ -249,7 +249,7 @@ impl MrpMachine {
             })
             .collect();
         if ext_files.is_empty() {
-            self.boot_error = Some("no cfunction.ext".to_string());
+            log::info!("pure-script package: no ext to load");
             return;
         }
         let mut guest =

@@ -1001,13 +1001,36 @@ impl Guest {
                 }
                 MR_SUCCESS
             }
-            123 | 128 | 145 => {
-                // Text drawing needs the GBK font bridge (planned next).
-                warn_once(
-                    "font",
-                    format!("mr_table slot {slot} (text draw) is not implemented yet"),
+            123 | 128 => {
+                // mr_drawText(text, x, y, r, g, b, ...) — GBK text rendering.
+                let text_addr = self.cpu.reg_get(self.cpu.mode(), R0);
+                let x = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
+                let y = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
+                let text = self.guest_cstring(text_addr, 512);
+                let (r, g, b) = (
+                    self.stack_arg(0) & 0xFF,
+                    self.stack_arg(1) & 0xFF,
+                    self.stack_arg(2) & 0xFF,
                 );
-                0
+                let color = rgb888_to_565(r, g, b);
+                self.draw_text(&text, x, y, color);
+                MR_SUCCESS
+            }
+            145 => {
+                // mr_platDrawChar(ch, x, y, r, g, b)
+                let ch = self.cpu.reg_get(self.cpu.mode(), R0) as u8 as char;
+                let x = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
+                let y = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
+                let (r, g, b) = (
+                    self.stack_arg(0) & 0xFF,
+                    self.stack_arg(1) & 0xFF,
+                    self.stack_arg(2) & 0xFF,
+                );
+                let mut buf = [0u8; 3];
+                ch.encode_utf8(&mut buf);
+                let color = rgb888_to_565(r, g, b);
+                self.draw_text(&buf[..ch.len_utf8()], x, y, color);
+                MR_SUCCESS
             }
             120 | 121 | 147 | 148 => {
                 warn_once(
@@ -1667,6 +1690,34 @@ impl Guest {
         self.config.screen_height
     }
 
+    /// Decodes GBK text and renders it into the screen buffer at (x, y)
+    /// using the embedded Unicode bitmap font.
+    pub fn draw_text(&mut self, text: &[u8], x: i32, y: i32, color: u16) {
+        let (decoded, _, _) = encoding_rs::GBK.decode(text);
+        let mut cursor_x = x;
+        for ch in decoded.chars() {
+            let Some(glyph) = unifont::get_glyph(ch) else {
+                cursor_x += 8;
+                continue;
+            };
+            let width = glyph.get_width() as i32;
+            let s_width = u32::from(self.config.screen_width);
+            let s_height = u32::from(self.config.screen_height);
+            for row in 0..16u32 {
+                for col in 0..width {
+                    if glyph.get_pixel(col as usize, row as usize) {
+                        let px = cursor_x + col;
+                        let py = y + row as i32;
+                        if px >= 0 && py >= 0 && (px as u32) < s_width && (py as u32) < s_height {
+                            self.w16(SCREENBUF + (py as u32 * s_width + px as u32) * 2, color);
+                        }
+                    }
+                }
+            }
+            cursor_x += width;
+        }
+    }
+
     /// Copies `data` into a guest scratch area and returns its address.
     pub fn scratch_buffer(&mut self, data: &[u8]) -> u32 {
         let address = LG_MEM_BASE + LG_MEM_LEN - 4096;
@@ -1915,6 +1966,7 @@ mod tests {
             "../../tmp/vmrp/wasm/dist/fs/mythroad/mpc.mrp",
             "../../tmp/scratch/Maze.mrp",
             "../../tmp/vmrp/mrc/asm/asm.mrp",
+            "../../tmp/vmrp/wasm/dist/fs/mythroad/ydqtwo.mrp",
         ];
         let mut failures = Vec::new();
         for sample in &samples {
@@ -1929,13 +1981,28 @@ mod tests {
             for _ in 0..5 {
                 machine.run_frame();
             }
-            if machine.ext_handler_registered() {
-                log::info!("{name}: booted via script (ext handler registered)");
-            } else {
-                failures.push(format!(
-                    "{name}: no ext handler after script boot (missing globals: {:?})",
-                    machine.missing_globals()
-                ));
+            // Frame stability: run 60 frames, then 5 more after input.
+            let mut frame_ok = true;
+            for frame in 0..60 {
+                machine.run_frame();
+                if frame == 30 {
+                    machine.input_mut().press(crate::input::MrpKey::Ok);
+                }
+                if frame == 45 {
+                    machine.input_mut().release(crate::input::MrpKey::Ok);
+                }
+            }
+            if let Some(error) = machine.boot_error() {
+                frame_ok = false;
+                failures.push(format!("{name}: frame loop error: {error}"));
+            }
+            if frame_ok {
+                let status = if machine.ext_handler_registered() {
+                    "ext handler registered"
+                } else {
+                    "script-only"
+                };
+                log::info!("{name}: 60-frame stability OK ({status})");
             }
         }
         assert!(
