@@ -44,7 +44,25 @@ struct Core {
     content: Vec<u8>,
 }
 
-static CORE: Mutex<Core> = Mutex::new(Core {
+/// The libretro ABI may invoke callbacks from different threads, but the
+/// frontend serializes them; the machine's `Rc` graph is single-threaded in
+/// practice. This wrapper marks the guarded core `Send` — the one unsafe
+/// promise at the libretro boundary.
+struct SendCore(Core);
+unsafe impl Send for SendCore {}
+impl std::ops::Deref for SendCore {
+    type Target = Core;
+    fn deref(&self) -> &Core {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for SendCore {
+    fn deref_mut(&mut self) -> &mut Core {
+        &mut self.0
+    }
+}
+
+static CORE: Mutex<SendCore> = Mutex::new(SendCore(Core {
     callbacks: Callbacks {
         environment: None,
         video_refresh: None,
@@ -54,9 +72,9 @@ static CORE: Mutex<Core> = Mutex::new(Core {
     },
     emulator: None,
     content: Vec::new(),
-});
+}));
 
-fn core() -> MutexGuard<'static, Core> {
+fn core() -> MutexGuard<'static, SendCore> {
     CORE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -330,7 +348,7 @@ pub extern "C" fn retro_run() {
             callbacks,
             emulator,
             ..
-        } = &mut *core;
+        } = &mut core.0;
         let Some(emulator) = emulator.as_mut() else {
             return;
         };

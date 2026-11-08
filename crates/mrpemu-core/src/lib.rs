@@ -24,7 +24,9 @@ pub mod format;
 pub mod input;
 pub mod opcodes;
 pub mod package;
+pub mod script;
 pub mod undump;
+pub mod value_helpers;
 pub mod vfs;
 pub mod vm;
 
@@ -36,6 +38,7 @@ pub use format::MrpHeader;
 pub use input::{InputState, MrpKey};
 pub use opcodes::{Instruction, Op};
 pub use package::MrpPackage;
+pub use script::ScriptBridge;
 pub use undump::{Chunk, Constant, Proto};
 pub use vfs::MemoryVfs;
-pub use vm::{Table, Value, Vm};
+pub use vm::{Key, Table, Value, Vm};

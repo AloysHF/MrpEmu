@@ -68,7 +68,7 @@ impl Value {
         }
     }
 
-    fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> &'static str {
         match self {
             Value::Nil => "nil",
             Value::Bool(_) => "boolean",
@@ -81,8 +81,8 @@ impl Value {
 }
 
 /// Hashable projection of a table key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum Key {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Key {
     Bool(bool),
     /// f32 bits; -0.0 normalizes to 0.0 and NaN keys are rejected.
     Num(u32),
@@ -90,6 +90,19 @@ pub(crate) enum Key {
     Table(usize),
     Closure(usize),
     Native(u16),
+}
+
+impl Key {
+    pub(crate) fn sort_bits(&self) -> (u8, u32) {
+        match self {
+            Key::Bool(flag) => (0, *flag as u32),
+            Key::Num(bits) => (1, *bits),
+            Key::Str(bytes) => (2, bytes.len() as u32),
+            Key::Table(id) => (3, *id as u32),
+            Key::Closure(id) => (4, *id as u32),
+            Key::Native(id) => (5, *id as u32),
+        }
+    }
 }
 
 fn key_of(value: &Value) -> Option<Key> {
@@ -174,6 +187,17 @@ impl Table {
     pub fn is_empty(&self) -> bool {
         self.array.is_empty() && self.map.is_empty()
     }
+
+    /// Snapshot of the hash part, sorted for deterministic iteration.
+    pub fn snapshot_map(&self) -> Vec<(Key, Value)> {
+        let mut entries: Vec<(Key, Value)> = self
+            .map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        entries.sort_by_key(|(key, _)| key.sort_bits());
+        entries
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +219,15 @@ pub struct Vm {
     frames: usize,
     /// Stack top marker for variable-result sequences (B==0/C==0 calls).
     pub top: usize,
+    /// Host state the platform natives operate on: the running ext guest,
+    /// the presented screen, and the loaded package.
+    pub guest: Option<crate::cfunction::Guest>,
+    pub screen: crate::display::Screen,
+    pub package: Option<crate::package::MrpPackage>,
+    /// Native slot backing unknown globals (registered by the bridge).
+    pub stub_native: Option<u16>,
+    /// Names of globals the script read but the host never registered.
+    pub missing_globals: RefCell<Vec<String>>,
 }
 
 impl Default for Vm {
@@ -213,17 +246,43 @@ impl Vm {
             open_upvals: Vec::new(),
             frames: 0,
             top: 0,
+            guest: None,
+            screen: crate::display::Screen::new(
+                crate::display::DEFAULT_WIDTH,
+                crate::display::DEFAULT_HEIGHT,
+            ),
+            package: None,
+            stub_native: None,
+            missing_globals: RefCell::new(Vec::new()),
         }
     }
 
     /// Registers a native function under a global name.
-    pub fn register(&mut self, name: &'static str, native: Native) {
+    pub fn add_native(&mut self, name: &'static str, native: Native) -> u16 {
         let index = self.natives.len() as u16;
         self.natives.push(native);
         self.native_names.push(name);
+        index
+    }
+
+    pub fn register(&mut self, name: &'static str, native: Native) {
+        let index = self.add_native(name, native);
         self.globals
             .borrow_mut()
             .set(Value::str_from(name.as_bytes()), Value::Native(index));
+    }
+
+    /// Calls a global function value with the given arguments.
+    pub fn call_global(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>, String> {
+        let func = self.globals.borrow().get(&Value::str_from(name.as_bytes()));
+        match func {
+            Value::Closure(closure) => self.call_closure(closure, args),
+            Value::Native(index) => self.call_native(index, args),
+            other => Err(format!(
+                "global `{name}` is not callable (a {})",
+                other.type_name()
+            )),
+        }
     }
 
     /// Registers a native inside a table stored in the globals.
@@ -376,6 +435,24 @@ impl Vm {
                 Op::GetGlobal => {
                     let name = constant_value(&proto, bx as usize)?;
                     let value = self.globals.borrow().get(&name);
+                    let value = if matches!(value, Value::Nil) {
+                        if let Some(stub) = self.stub_native {
+                            if let Value::Str(text) = &name {
+                                let mut missing = self.missing_globals.borrow_mut();
+                                if !missing
+                                    .iter()
+                                    .any(|entry| entry.as_bytes() == text.as_slice())
+                                {
+                                    missing.push(String::from_utf8_lossy(text).to_string());
+                                }
+                            }
+                            Value::Native(stub)
+                        } else {
+                            value
+                        }
+                    } else {
+                        value
+                    };
                     self.set_stack(base + a, value);
                 }
                 Op::SetGlobal => {

@@ -768,6 +768,9 @@ impl Guest {
         self.w32(sp + 4, 0);
         self.cpu.reg_set(self.cpu.mode(), reg::SP, sp);
         self.cpu.reg_set(self.cpu.mode(), R0, self.c_function_p);
+        // r9 carries the ext's globals base (start_of_ER_RW): the compiled
+        // ext addresses its own globals relative to r9 (fixR9 convention).
+        self.cpu.reg_set(self.cpu.mode(), 9, self.c_function_p);
         self.cpu.reg_set(self.cpu.mode(), R1, code as u32);
         self.cpu.reg_set(self.cpu.mode(), R2, input);
         self.cpu.reg_set(self.cpu.mode(), R3, input_len as u32);
@@ -892,7 +895,7 @@ impl Guest {
             34 => {
                 // mr_getDatetime(struct): year, month, day, hour, minute, second.
                 let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
-                let now = chrono_now();
+                let now = local_datetime();
                 self.w32(buffer, now.0);
                 self.w32(buffer + 4, now.1);
                 self.w32(buffer + 8, now.2);
@@ -1240,7 +1243,7 @@ impl Guest {
         self.guest_cstring(addr, 4096)
     }
 
-    fn refresh_screen(&mut self, screen: &mut crate::display::Screen) {
+    pub fn refresh_screen(&mut self, screen: &mut crate::display::Screen) {
         let width = u32::from(self.config.screen_width);
         let height = u32::from(self.config.screen_height);
         for y in 0..height {
@@ -1372,7 +1375,7 @@ impl Guest {
     /// Looks up `name` in the file table seeded at boot (package members
     /// and VFS content). Falls back to a basename match so guests opening
     /// `mythroad/x.png` find the packaged `x.png`.
-    fn file_lookup(&self, name: &str) -> Option<Vec<u8>> {
+    pub fn file_lookup(&self, name: &str) -> Option<Vec<u8>> {
         let name = name.trim_start_matches('/');
         if let Some((_, data)) = self.files.iter().find(|(entry, _)| entry == name) {
             return Some(data.clone());
@@ -1473,6 +1476,30 @@ impl Guest {
         }
     }
 
+    /// Loads an ext image at `addr` (script-driven flow): writes the
+    /// `mr_table` pointer at base+0 and calls `mr_c_function_load` with the
+    /// script-supplied mode selector. The caller drives any further
+    /// handshake through `call_c_function`.
+    pub fn load_ext_at(
+        &mut self,
+        ext: &[u8],
+        addr: u32,
+        code: i32,
+        screen: &mut crate::display::Screen,
+    ) -> Result<i32, MrpError> {
+        if ext.len() as u32 > EXT_MAX_SIZE || addr + ext.len() as u32 > MEM_SIZE {
+            return Err(MrpError::Unsupported(format!(
+                "ext too large or out of range at {addr:#010x}"
+            )));
+        }
+        let base = addr as usize;
+        self.mem[base..base + ext.len()].copy_from_slice(ext);
+        self.w32(addr, TABLE_BASE);
+        self.cpu.reg_set(self.cpu.mode(), R0, code as u32);
+        self.run_guest(addr + 8, DEFAULT_INSTRUCTION_LIMIT, screen)
+            .map(|value| value as i32)
+    }
+
     /// Boot handshake used by the reference loader: register the table,
     /// call `mr_c_function_load`, then run the 6/8/0 call sequence.
     pub fn boot_ext(
@@ -1565,6 +1592,126 @@ impl Guest {
     }
 }
 
+impl Guest {
+    /// LCG random source shared with the script's `GetRand`.
+    pub fn rand_next(&mut self) -> u32 {
+        self.rand_state = self
+            .rand_state
+            .wrapping_mul(1_103_515_245)
+            .wrapping_add(12_345);
+        (self.rand_state >> 16) & 0x7FFF
+    }
+
+    /// (IMEI, IMSI, vendor, device) strings for `GetSysInfo`.
+    pub fn sysinfo_strings(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        (
+            self.config.imei.clone().into_bytes(),
+            self.config.imsi.clone().into_bytes(),
+            self.config.vendor.clone().into_bytes(),
+            self.config.device.clone().into_bytes(),
+        )
+    }
+
+    pub fn timer_start(&mut self, id: i32, interval_ms: u32) {
+        let interval = std::time::Duration::from_millis(interval_ms.max(1) as u64);
+        if let Some(timer) = self.timers.iter_mut().find(|timer| timer.id == id) {
+            timer.interval = interval;
+            timer.next_fire = std::time::Instant::now() + interval;
+            return;
+        }
+        self.timers.push(GuestTimer {
+            id,
+            interval,
+            next_fire: std::time::Instant::now() + interval,
+        });
+    }
+
+    pub fn timer_stop(&mut self, id: i32) {
+        self.timers.retain(|timer| timer.id != id);
+    }
+
+    pub fn draw_point(&mut self, x: u32, y: u32, color: u32) {
+        let width = u32::from(self.config.screen_width);
+        if x < width {
+            self.w16(SCREENBUF + (y * width + x) * 2, rgb_to_565(color));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_rect(&mut self, x1: u32, y1: u32, x2: u32, y2: u32, r: u32, g: u32, b: u32) {
+        let color = rgb888_to_565(r, g, b);
+        let width = u32::from(self.config.screen_width);
+        let height = u32::from(self.config.screen_height);
+        for y in y1.min(height)..y2.min(height) {
+            for x in x1.min(width)..x2.min(width) {
+                self.w16(SCREENBUF + (y * width + x) * 2, color);
+            }
+        }
+    }
+
+    pub fn fill_screenbuf(&mut self, color: u16) {
+        let width = u32::from(self.config.screen_width);
+        let height = u32::from(self.config.screen_height);
+        for y in 0..height {
+            for x in 0..width {
+                self.w16(SCREENBUF + (y * width + x) * 2, color);
+            }
+        }
+    }
+
+    pub fn screen_width(&self) -> u16 {
+        self.config.screen_width
+    }
+
+    pub fn screen_height(&self) -> u16 {
+        self.config.screen_height
+    }
+
+    /// Copies `data` into a guest scratch area and returns its address.
+    pub fn scratch_buffer(&mut self, data: &[u8]) -> u32 {
+        let address = LG_MEM_BASE + LG_MEM_LEN - 4096;
+        let base = address as usize;
+        let count = data.len().min(4095);
+        self.mem[base..base + count].copy_from_slice(&data[..count]);
+        self.mem[base + count] = 0;
+        address
+    }
+
+    /// Opens a package/VFS file, returning a 1-based handle.
+    pub fn file_open(&mut self, name: &str) -> Option<usize> {
+        let data = self.file_lookup(name)?;
+        self.open_files.push(OpenFile {
+            name: name.to_string(),
+            data,
+            pos: 0,
+            closed: false,
+        });
+        Some(self.open_files.len())
+    }
+
+    pub fn file_read(&mut self, handle: usize, len: usize) -> Option<Vec<u8>> {
+        let file = self.open_files.get_mut(handle.wrapping_sub(1))?;
+        if file.closed {
+            return None;
+        }
+        let remaining = file.data.len().saturating_sub(file.pos);
+        let count = len.min(remaining);
+        let bytes = file.data[file.pos..file.pos + count].to_vec();
+        file.pos += count;
+        Some(bytes)
+    }
+
+    pub fn file_close(&mut self, handle: usize) {
+        if let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) {
+            file.closed = true;
+        }
+    }
+
+    pub fn file_len(&self, handle: usize) -> Option<usize> {
+        Some(self.open_files.get(handle.wrapping_sub(1))?.data.len())
+    }
+}
+
 /// Adapter implementing `armv4t_emu::Memory` over the guest memory vector.
 struct GuestMem<'a>(&'a mut Vec<u8>);
 
@@ -1631,14 +1778,14 @@ fn rgb_to_565(value: u32) -> u16 {
     rgb888_to_565(r, g, b)
 }
 
-fn rgb888_to_565(r: u32, g: u32, b: u32) -> u16 {
+pub fn rgb888_to_565(r: u32, g: u32, b: u32) -> u16 {
     ((r >> 3) as u16) << 11 | ((g >> 2) as u16) << 5 | (b >> 3) as u16
 }
 
 /// Current local time as (year, month, day, hour, minute, second); the
 /// guest datetime comes from the host clock.
 #[allow(clippy::type_complexity)]
-fn chrono_now() -> (u32, u32, u32, u32, u32, u32) {
+pub fn local_datetime() -> (u32, u32, u32, u32, u32, u32) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1753,14 +1900,14 @@ mod tests {
 
     /// Boots the real hello.mrp ext through the full load/handshake/init
     /// sequence. Requires the local reference clone, so it stays ignored.
-    /// Boots every ext-carrying sample from the reference repos. This is
-    /// the corpus gate: each entry must load, register, and finish init.
+    /// Boots every reference sample through the real MrpMachine script
+    /// path: start.mr runs on the VM, and the script loads ext images via
+    /// _com(800). This is the corpus gate.
     #[test]
     #[ignore = "requires the local reference corpus under tmp/"]
     fn boots_reference_samples() {
         let _ = env_logger::try_init();
         let samples = [
-            "hello",
             "../../tmp/mrpemu/sdcard/mythroad/hello.mrp",
             "../../tmp/mrpemu/sdcard/mythroad/gymls.mrp",
             "../../tmp/mrpemu/sdcard/mythroad/test.mrp",
@@ -1770,40 +1917,25 @@ mod tests {
             "../../tmp/vmrp/mrc/asm/asm.mrp",
         ];
         let mut failures = Vec::new();
-        for sample in &samples[1..] {
+        for sample in &samples {
             let name = sample.rsplit('/').next().unwrap_or(sample);
-            let Ok(package) = crate::package::MrpPackage::from_path(sample) else {
-                failures.push(format!("{name}: package unreadable"));
-                continue;
+            let mut machine = match crate::emulator::MrpMachine::from_path(sample) {
+                Ok(machine) => machine,
+                Err(error) => {
+                    failures.push(format!("{name}: load failed: {error}"));
+                    continue;
+                }
             };
-            let Ok(ext) = package.read_entry("cfunction.ext") else {
-                failures.push(format!("{name}: no cfunction.ext"));
-                continue;
-            };
-            let files: Vec<(String, Vec<u8>)> = package
-                .entries()
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.name.clone(),
-                        package.read_entry(&entry.name).unwrap_or_default(),
-                    )
-                })
-                .collect();
-            let mut guest = Guest::new(GuestConfig::default(), files);
-            let mut screen = crate::display::Screen::new(240, 320);
-            match guest.boot_ext(
-                &ext,
-                package.header().build_id,
-                package.header().build_version,
-                &mut screen,
-            ) {
-                Ok(()) => log::info!(
-                    "{name}: booted (handler at {:#010x}, slots called {})",
-                    guest.c_function,
-                    guest.slot_calls.iter().sum::<u64>()
-                ),
-                Err(error) => failures.push(format!("{name}: {error}")),
+            for _ in 0..5 {
+                machine.run_frame();
+            }
+            if machine.ext_handler_registered() {
+                log::info!("{name}: booted via script (ext handler registered)");
+            } else {
+                failures.push(format!(
+                    "{name}: no ext handler after script boot (missing globals: {:?})",
+                    machine.missing_globals()
+                ));
             }
         }
         assert!(
@@ -1814,41 +1946,6 @@ mod tests {
                 "
 "
             )
-        );
-    }
-
-    #[test]
-    #[ignore = "requires the local reference corpus under tmp/; 6/8 reference samples boot, test.mrp and mpc.mrp pending multi-ext investigation"]
-    fn boots_hello_mrp_ext() {
-        let _ = env_logger::try_init();
-        let package =
-            crate::package::MrpPackage::from_path("../../tmp/mrpemu/sdcard/mythroad/hello.mrp")
-                .expect("hello.mrp must load");
-        let ext = package.read_entry("cfunction.ext").expect("ext must exist");
-        let files: Vec<(String, Vec<u8>)> = package
-            .entries()
-            .iter()
-            .map(|entry| {
-                (
-                    entry.name.clone(),
-                    package.read_entry(&entry.name).unwrap_or_default(),
-                )
-            })
-            .collect();
-        let mut guest = Guest::new(GuestConfig::default(), files);
-        let mut screen = crate::display::Screen::new(240, 320);
-        guest
-            .boot_ext(
-                &ext,
-                package.header().build_id,
-                package.header().build_version,
-                &mut screen,
-            )
-            .expect("hello ext must boot");
-        assert_ne!(guest.c_function, 0, "event handler must be registered");
-        assert!(
-            guest.slot_calls[25] >= 1,
-            "mr_c_function_new must have been called"
         );
     }
 

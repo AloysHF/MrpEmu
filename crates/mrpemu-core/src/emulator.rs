@@ -1,11 +1,13 @@
 //! Machine-level orchestration for a loaded MRP application.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::display::{Screen, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use crate::error::MrpError;
 use crate::format::MrpHeader;
-use crate::input::InputState;
+use crate::input::{InputState, MrpKey};
+use crate::script::ScriptBridge;
 use crate::vfs::MemoryVfs;
 
 /// Frame rate reported to frontends while the VM does not drive real timing.
@@ -20,14 +22,16 @@ const PLACEHOLDER_FRAME: u16 = 0x39E7;
 /// The execution environment (MiniJ VM plus the `mrc_` API bridge) is not
 /// implemented yet, so [`MrpMachine::run_frame`] is a placeholder that keeps
 /// the screen content unchanged.
-#[derive(Debug)]
 pub struct MrpMachine {
     header: MrpHeader,
     package: Vec<u8>,
     screen: Screen,
     input: InputState,
     vfs: MemoryVfs,
-    warned_vm_missing: bool,
+    script: Option<ScriptBridge>,
+    boot_attempted: bool,
+    boot_error: Option<String>,
+    last_keys: BTreeSet<MrpKey>,
 }
 
 impl MrpMachine {
@@ -40,7 +44,10 @@ impl MrpMachine {
             screen: Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
             input: InputState::new(),
             vfs: MemoryVfs::new(),
-            warned_vm_missing: false,
+            script: None,
+            boot_attempted: false,
+            boot_error: None,
+            last_keys: BTreeSet::new(),
         };
         machine.draw_placeholder();
         Ok(machine)
@@ -85,18 +92,144 @@ impl MrpMachine {
         &mut self.vfs
     }
 
-    /// Advances the application by one frame.
-    ///
-    /// Placeholder until the MiniJ VM lands: logs a single warning, then
-    /// keeps the placeholder screen content unchanged. Frontends can rely on
-    /// the call being cheap and side-effect free.
+    /// Whether the running guest registered an ext event handler.
+    pub fn ext_handler_registered(&self) -> bool {
+        self.script
+            .as_ref()
+            .and_then(|bridge| bridge.vm.guest.as_ref())
+            .map(|guest| guest.c_function != 0)
+            .unwrap_or(false)
+    }
+
+    /// Missing globals the script referenced (diagnostics).
+    pub fn missing_globals(&self) -> Vec<String> {
+        self.script
+            .as_ref()
+            .map(|bridge| bridge.missing_globals())
+            .unwrap_or_default()
+    }
+
+    /// The boot failure reason, once a boot was attempted and failed.
+    pub fn boot_error(&self) -> Option<&str> {
+        self.boot_error.as_deref()
+    }
+
+    /// Advances the application by one frame: boots through the start.mr
+    /// script on first use, then delivers key edges and fires due timers.
     pub fn run_frame(&mut self) {
-        if !self.warned_vm_missing {
-            log::warn!(
-                "mythroad VM execution is not implemented yet; \
-                 the screen shows a placeholder frame"
-            );
-            self.warned_vm_missing = true;
+        if self.script.is_none() && !self.boot_attempted {
+            self.boot_attempted = true;
+            self.boot_guest();
+        }
+        let Some(bridge) = self.script.as_mut() else {
+            return;
+        };
+        let exit_requested = bridge
+            .vm
+            .guest
+            .as_ref()
+            .map(|guest| guest.exit_requested)
+            .unwrap_or(false);
+        if exit_requested {
+            return;
+        }
+
+        // Key edges: press events before release events, in key order.
+        let current: BTreeSet<MrpKey> = self.input.pressed().collect();
+        let pressed: Vec<MrpKey> = current.difference(&self.last_keys).copied().collect();
+        let released: Vec<MrpKey> = self.last_keys.difference(&current).copied().collect();
+        self.last_keys = current;
+        for key in pressed {
+            let _ = bridge.send_event(0, Self::mrc_key_code(key), 0);
+        }
+        for key in released {
+            let _ = bridge.send_event(1, Self::mrc_key_code(key), 0);
+        }
+
+        // Timers: restart the interval, then invoke the registered handler.
+        let now = std::time::Instant::now();
+        let due: Vec<i32> = bridge
+            .vm
+            .guest
+            .as_ref()
+            .map(|guest| {
+                guest
+                    .timers
+                    .iter()
+                    .filter(|timer| timer.next_fire <= now)
+                    .map(|timer| timer.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in due {
+            if let Some(guest) = bridge.vm.guest.as_mut() {
+                if let Some(timer) = guest.timers.iter_mut().find(|timer| timer.id == id) {
+                    timer.next_fire = now + timer.interval;
+                }
+                let mut screen = std::mem::replace(
+                    &mut bridge.vm.screen,
+                    crate::display::Screen::new(
+                        crate::display::DEFAULT_WIDTH,
+                        crate::display::DEFAULT_HEIGHT,
+                    ),
+                );
+                let _ = guest.fire_timer(&mut screen);
+                bridge.vm.screen = screen;
+            }
+        }
+
+        bridge.present();
+    }
+
+    /// Boots the application through its start.mr script: the bridge runs
+    /// the chunk, and the script loads any ext images itself via
+    /// `_com(800, ...)`.
+    fn boot_guest(&mut self) {
+        let mut bridge = ScriptBridge::new();
+        let Ok(package) = crate::package::MrpPackage::parse(self.package.clone()) else {
+            self.boot_error = Some("package reparse failed".to_string());
+            return;
+        };
+        bridge.load_package(package);
+        bridge.create_guest();
+        if let Err(error) = bridge.run_start_script() {
+            log::error!("script boot failed: {error}");
+            self.boot_error = Some(error);
+            return;
+        }
+        log::info!(
+            "script booted: {:?} (missing globals: {:?})",
+            self.header.display_name,
+            bridge.missing_globals()
+        );
+        self.screen = std::mem::replace(
+            &mut bridge.vm.screen,
+            crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
+        );
+        self.script = Some(bridge);
+    }
+
+    /// MRC key codes expected by guest event handlers.
+    fn mrc_key_code(key: MrpKey) -> i32 {
+        match key {
+            MrpKey::Num0 => 0,
+            MrpKey::Num1 => 1,
+            MrpKey::Num2 => 2,
+            MrpKey::Num3 => 3,
+            MrpKey::Num4 => 4,
+            MrpKey::Num5 => 5,
+            MrpKey::Num6 => 6,
+            MrpKey::Num7 => 7,
+            MrpKey::Num8 => 8,
+            MrpKey::Num9 => 9,
+            MrpKey::Star => 10,
+            MrpKey::Pound => 11,
+            MrpKey::Up => 12,
+            MrpKey::Down => 13,
+            MrpKey::Left => 14,
+            MrpKey::Right => 15,
+            MrpKey::Ok | MrpKey::LeftSoft => 17,
+            MrpKey::RightSoft => 18,
         }
     }
 
