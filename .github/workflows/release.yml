@@ -1,0 +1,442 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: mrpemu-linux-x86_64
+          - platform: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: mrpemu-linux-aarch64
+          - platform: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            artifact: mrpemu-linux-i686
+            libretro_only: true
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            artifact: mrpemu-macos-x86_64
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            artifact: mrpemu-macos-aarch64
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: mrpemu-windows-x86_64
+          - platform: windows-latest
+            target: i686-pc-windows-msvc
+            artifact: mrpemu-windows-i686
+            libretro_only: true
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-dev libudev-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install 32-bit Linux build dependencies
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: sudo apt-get install -y gcc-multilib
+
+      - name: Build standalone
+        # The standalone frontend needs a full set of 32-bit desktop dev
+        # packages on the runner; the 32-bit targets exist for RetroArch, so
+        # they build the core only, the way the GitLab jobs do.
+        if: ${{ !matrix.libretro_only }}
+        run: cargo build -p mrpemu --release --target ${{ matrix.target }}
+
+      - name: Build libretro core
+        run: cargo build -p mrpemu-libretro --release --target ${{ matrix.target }}
+
+      - name: Stage libretro core
+        shell: bash
+        run: |
+          out="libretro/${{ matrix.artifact }}"
+          mkdir -p "$out"
+          rel="target/${{ matrix.target }}/release"
+          # Cargo names the cdylib after its lib target (mrpemu); copy it
+          # to the mrpemu_libretro.<ext> name RetroArch expects.
+          for f in "mrpemu.dll:mrpemu_libretro.dll" \
+                   "libmrpemu.so:mrpemu_libretro.so" \
+                   "libmrpemu.dylib:mrpemu_libretro.dylib"; do
+            src="${f%%:*}"; dst="${f##*:}"
+            if [ -f "$rel/$src" ]; then
+              cp "$rel/$src" "$out/$dst"
+              break
+            fi
+          done
+          cp crates/mrpemu-libretro/mrpemu_libretro.info "$out/mrpemu_libretro.info" 2>/dev/null || true
+          ls -la "$out"
+
+      - name: Package (Unix)
+        if: ${{ runner.os != 'Windows' && !matrix.libretro_only }}
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact }}.tar.gz mrpemu
+          cd ../../..
+
+      - name: Package (Windows)
+        if: ${{ runner.os == 'Windows' && !matrix.libretro_only }}
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.artifact }}.zip mrpemu.exe
+          cd ../../..
+
+      - name: Package libretro (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd libretro
+          tar czf ../${{ matrix.artifact }}-libretro.tar.gz ${{ matrix.artifact }}
+          cd ..
+
+      - name: Package libretro (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd libretro
+          7z a ../${{ matrix.artifact }}-libretro.zip ${{ matrix.artifact }}
+          cd ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.*
+            ${{ matrix.artifact }}-libretro.*
+
+  build-android:
+    name: Build libretro (Android)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build libretro core (all ABIs)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # Android 15 devices require 16 KB page alignment for native libraries.
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+        run: |
+          cargo ndk \
+            -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
+            --platform 21 \
+            build -p mrpemu-libretro --release
+
+      - name: Stage libretro core (Android)
+        shell: bash
+        run: |
+          # RetroArch on Android loads cores named <corename>_libretro_android.so,
+          # one per ABI directory (matching RetroArch's cores/<abi>/ layout).
+          declare -A ABI_TRIPLE=(
+            [arm64-v8a]=aarch64-linux-android
+            [armeabi-v7a]=armv7-linux-androideabi
+            [x86]=i686-linux-android
+            [x86_64]=x86_64-linux-android
+          )
+          for abi in "${!ABI_TRIPLE[@]}"; do
+            triple="${ABI_TRIPLE[$abi]}"
+            out="libretro/mrpemu-android/$abi"
+            mkdir -p "$out"
+            cp "target/$triple/release/libmrpemu.so" \
+               "$out/mrpemu_libretro_android.so"
+          done
+          cp crates/mrpemu-libretro/mrpemu_libretro.info \
+             libretro/mrpemu-android/mrpemu_libretro.info 2>/dev/null || true
+          cp crates/mrpemu-libretro/android.json \
+             libretro/mrpemu-android/android.json
+          ls -laR libretro/mrpemu-android
+
+      - name: Package libretro (Android)
+        shell: bash
+        run: |
+          cd libretro
+          tar czf ../mrpemu-android-libretro.tar.gz mrpemu-android
+          cd ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrpemu-android
+          path: mrpemu-android-libretro.tar.gz
+
+  build-ios:
+    name: Build libretro (iOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ios
+
+      - name: Build libretro core (arm64 for real devices)
+        run: |
+          cargo build -p mrpemu-libretro --release --target aarch64-apple-ios
+
+      - name: Build libretro core (x86_64 for real devices)
+        run: |
+          cargo build -p mrpemu-libretro --release --target x86_64-apple-ios
+
+      - name: Build libretro core (arm64 for simulator)
+        run: |
+          cargo build -p mrpemu-libretro --release --target aarch64-apple-ios-sim
+
+      - name: Create universal library and stage
+        shell: bash
+        run: |
+          out="libretro/mrpemu-ios"
+          mkdir -p "$out/simulator"
+
+          # Create universal library for real devices (arm64 + x86_64)
+          lipo -create \
+            target/aarch64-apple-ios/release/libmrpemu.dylib \
+            target/x86_64-apple-ios/release/libmrpemu.dylib \
+            -output "$out/mrpemu_libretro_ios.dylib"
+
+          # Copy arm64 simulator library
+          cp target/aarch64-apple-ios-sim/release/libmrpemu.dylib \
+             "$out/simulator/mrpemu_libretro_ios.dylib"
+
+          # Copy info file
+          cp crates/mrpemu-libretro/mrpemu_libretro.info "$out/" 2>/dev/null || true
+          ls -laR "$out"
+
+      - name: Package libretro (iOS)
+        shell: bash
+        run: |
+          cd libretro
+          tar czf ../mrpemu-ios-libretro.tar.gz mrpemu-ios
+          cd ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrpemu-ios
+          path: mrpemu-ios-libretro.tar.gz
+
+  build-webos:
+    name: Build libretro (webOS)
+    runs-on: ubuntu-latest
+    env:
+      WEBOS_TOOLCHAIN_URL: https://github.com/openlgtv/buildroot-nc4/releases/latest/download/arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz
+      RUST_TARGET: armv7-unknown-linux-gnueabi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabi
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          key: webos
+
+      - name: Install webOS native toolchain
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            "$WEBOS_TOOLCHAIN_URL" \
+            --output "$RUNNER_TEMP/webos-toolchain.tar.gz"
+          mkdir -p "$RUNNER_TEMP/webos-toolchain"
+          tar xzf "$RUNNER_TEMP/webos-toolchain.tar.gz" \
+            -C "$RUNNER_TEMP/webos-toolchain" --strip-components=1
+          "$RUNNER_TEMP/webos-toolchain/relocate-sdk.sh"
+          echo "$RUNNER_TEMP/webos-toolchain/bin" >> "$GITHUB_PATH"
+          echo "WEBOS_TOOLCHAIN=$RUNNER_TEMP/webos-toolchain" >> "$GITHUB_ENV"
+
+      - name: Build libretro core (webOS ARMv7)
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABI_LINKER: arm-webos-linux-gnueabi-gcc
+          CC_armv7_unknown_linux_gnueabi: arm-webos-linux-gnueabi-gcc
+          AR_armv7_unknown_linux_gnueabi: arm-webos-linux-gnueabi-ar
+        run: cargo build -p mrpemu-libretro --release --target "$RUST_TARGET"
+
+      - name: Verify and stage libretro core (webOS)
+        shell: bash
+        run: |
+          core="target/$RUST_TARGET/release/libmrpemu.so"
+          arm-webos-linux-gnueabi-readelf -h "$core"
+          arm-webos-linux-gnueabi-readelf -d "$core"
+
+          out="libretro/mrpemu-webos"
+          mkdir -p "$out"
+          cp "$core" "$out/mrpemu_libretro.so"
+          cp crates/mrpemu-libretro/mrpemu_libretro.info "$out/" 2>/dev/null || true
+          ls -la "$out"
+
+      - name: Package libretro (webOS)
+        shell: bash
+        run: |
+          cd libretro
+          tar czf ../mrpemu-webos-libretro.tar.gz mrpemu-webos
+          cd ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrpemu-webos
+          path: mrpemu-webos-libretro.tar.gz
+
+  build-emulatorjs:
+    name: Build EmulatorJS core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # -Zbuild-std needs nightly. Rebuilding std with panic=abort keeps wasm
+      # exception handling out of the module: Binaryen's Asyncify pass aborts
+      # on EH instructions.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-10
+          targets: wasm32-unknown-emscripten
+          components: rust-src
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: 3.1.74
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          key: emulatorjs
+
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full zip
+
+      - name: Build wasm staticlib
+        run: >
+          cargo build -p mrpemu-libretro
+          --target wasm32-unknown-emscripten --profile wasm-release
+          -Zbuild-std=std,panic_abort
+
+      - name: Build EmulatorJS core bundles
+        run: |
+          # Keep the RetroArch build tree out of target/: rust-cache archives
+          # target/ and restores it without .git, which breaks the checkout.
+          rm -rf target/emulatorjs-build
+          scripts/build-emulatorjs-core.sh --work-dir "$RUNNER_TEMP/emulatorjs-build"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mrpemu-emulatorjs
+          path: out/mrpemu-emulatorjs.zip
+
+  release:
+    name: Create Release
+    needs: [build, build-android, build-ios, build-webos, build-emulatorjs]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          name: "MrpEmu ${{ github.ref_name }}"
+          body: |
+            MrpEmu ${{ github.ref_name }}
+
+            ## Downloads
+
+            ### Standalone emulator
+            - **Linux x86_64**: `mrpemu-linux-x86_64.tar.gz`
+            - **Linux aarch64**: `mrpemu-linux-aarch64.tar.gz`
+            - **macOS x86_64**: `mrpemu-macos-x86_64.tar.gz`
+            - **macOS aarch64**: `mrpemu-macos-aarch64.tar.gz`
+            - **Windows x86_64**: `mrpemu-windows-x86_64.zip`
+
+            ### libretro core (for RetroArch)
+            - Files ending in `-libretro.*` contain `mrpemu_libretro.<ext>`
+              plus `mrpemu_libretro.info`, ready to drop into RetroArch.
+            - 32-bit builds ship the core only: `mrpemu-linux-i686-libretro.tar.gz`
+              and `mrpemu-windows-i686-libretro.zip`.
+
+            ### Android libretro core (for RetroArch on Android)
+            - `mrpemu-android-libretro.tar.gz` contains
+              `mrpemu_libretro_android.so` for the `arm64-v8a`,
+              `armeabi-v7a`, `x86` and `x86_64` ABIs.
+
+            ### iOS libretro core (for RetroArch on iOS)
+            - `mrpemu-ios-libretro.tar.gz` contains:
+              - `mrpemu_libretro_ios.dylib` for real devices (arm64)
+              - `simulator/mrpemu_libretro_ios.dylib` for iOS Simulator (Apple Silicon)
+
+            ### webOS libretro core (for RetroArch on LG webOS TVs)
+            - `mrpemu-webos-libretro.tar.gz` contains
+              `mrpemu_libretro.so` for the webOS ARMv7 ABI.
+
+            ### Browser (EmulatorJS)
+            - `mrpemu-emulatorjs.zip` contains the wasm core bundles and
+              metadata, ready to drop into an EmulatorJS `data/` directory.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
