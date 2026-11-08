@@ -278,12 +278,6 @@ impl ScriptBridge {
                 "EffSetCon",
                 "DispUpEx",
                 "DispUp",
-                "BitmapLoad",
-                "BitmapShow",
-                "BitmapShowEx",
-                "BitmapNew",
-                "BitmapDraw",
-                "BmGetScr",
                 "SpriteSet",
                 "SpriteDraw",
                 "SpriteDrawEx",
@@ -312,6 +306,98 @@ impl ScriptBridge {
                 "PlatDrawChar",
                 "GetCharBitmap",
             ],
+        );
+
+        // Bitmap management: load from package, blit to screen.
+        self.vm.register(
+            "BitmapLoad",
+            Box::new(|vm, args| {
+                let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let path = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                let name = String::from_utf8_lossy(&path).to_string();
+                let width = args.get(3).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let height = args.get(4).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let Some(guest) = vm.guest.as_mut() else {
+                    return Ok(vec![vh::num_value(-1.0)]);
+                };
+                match guest.file_lookup(&name) {
+                    Some(data) => {
+                        let pixel_count = (width * height) as usize;
+                        let mut pixels = Vec::with_capacity(pixel_count);
+                        for i in 0..pixel_count {
+                            let offset = i * 2;
+                            if offset + 2 <= data.len() {
+                                pixels.push(u16::from_le_bytes([data[offset], data[offset + 1]]));
+                            }
+                        }
+                        guest.bitmaps.insert(
+                            id,
+                            crate::cfunction::Bitmap {
+                                width,
+                                height,
+                                pixels,
+                            },
+                        );
+                        Ok(vec![vh::num_value(0.0)])
+                    }
+                    None => Ok(vec![vh::num_value(-1.0)]),
+                }
+            }),
+        );
+        self.vm.register(
+            "BitmapShow",
+            Box::new(|vm, args| {
+                let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let x = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let y = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                if let Some(guest) = vm.guest.as_mut() {
+                    if let Some(bitmap) = guest.bitmaps.get(&id) {
+                        let pixels = bitmap.pixels.clone();
+                        let width = bitmap.width;
+                        guest.blit_bitmap(&pixels, width, x, y, None);
+                    }
+                }
+                Ok(vec![])
+            }),
+        );
+        self.vm.register(
+            "BitmapNew",
+            Box::new(|vm, args| {
+                let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let width = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let height = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                if let Some(guest) = vm.guest.as_mut() {
+                    guest.bitmaps.insert(
+                        id,
+                        crate::cfunction::Bitmap {
+                            width,
+                            height,
+                            pixels: vec![0; (width * height) as usize],
+                        },
+                    );
+                }
+                Ok(vec![])
+            }),
+        );
+        self.vm.register(
+            "BitmapDraw",
+            Box::new(|vm, args| {
+                let src_id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let x = args.get(3).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                let y = args.get(4).and_then(vh::as_num).unwrap_or(0.0) as u32;
+                if let Some(guest) = vm.guest.as_mut() {
+                    if let Some(bitmap) = guest.bitmaps.get(&src_id) {
+                        let pixels = bitmap.pixels.clone();
+                        let width = bitmap.width;
+                        guest.blit_bitmap(&pixels, width, x, y, None);
+                    }
+                }
+                Ok(vec![])
+            }),
+        );
+        self.vm.register(
+            "BmGetScr",
+            Box::new(|_vm, _args| Ok(vec![vh::num_value(crate::cfunction::SCREENBUF as f32)])),
         );
 
         // Standard-library subset.

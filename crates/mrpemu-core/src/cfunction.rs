@@ -348,6 +348,16 @@ pub struct Guest {
     pub exit_requested: bool,
     /// Diagnostics: how often each table slot was called.
     pub slot_calls: [u64; TABLE_SLOTS],
+    /// Loaded bitmaps: id → RGB565 pixel data.
+    pub bitmaps: std::collections::HashMap<u32, Bitmap>,
+}
+
+/// A loaded bitmap with dimensions and RGB565 pixel data.
+#[derive(Debug, Clone)]
+pub struct Bitmap {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -387,6 +397,7 @@ impl Guest {
             files,
             exit_requested: false,
             slot_calls: [0; TABLE_SLOTS],
+            bitmaps: std::collections::HashMap::new(),
         };
         guest.install_table();
         // The heap starts as one whole free block; the offset `HEAP_LEN`
@@ -1736,6 +1747,35 @@ impl Guest {
                 }
             }
             cursor_x += width;
+        }
+    }
+
+    /// Blits an RGB565 bitmap to the screen buffer at (x, y), with an
+    /// optional transparency color (mr_transBitmapDraw uses this).
+    pub fn blit_bitmap(
+        &mut self,
+        pixels: &[u16],
+        width: u32,
+        x: u32,
+        y: u32,
+        transparent: Option<u16>,
+    ) {
+        let s_width = u32::from(self.config.screen_width);
+        let s_height = u32::from(self.config.screen_height);
+        let bitmap_width = width;
+        for (index, pixel) in pixels.iter().enumerate() {
+            if let Some(color) = transparent {
+                if *pixel == color {
+                    continue;
+                }
+            }
+            let col = index as u32 % bitmap_width;
+            let row = index as u32 / bitmap_width;
+            let px = x + col;
+            let py = y + row;
+            if px < s_width && py < s_height {
+                self.w16(SCREENBUF + (py * s_width + px) * 2, *pixel);
+            }
         }
     }
 
