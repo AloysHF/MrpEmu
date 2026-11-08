@@ -20,7 +20,7 @@
 
 use std::time::{Duration, Instant};
 
-use armv4t_emu::{reg, Cpu, Memory, Mode};
+use armv4t_emu::{reg, Cpu, Memory};
 
 /// General-purpose register numbers (the crate only names the specials).
 const R0: reg::Reg = 0;
@@ -642,19 +642,19 @@ impl Guest {
         limit: u64,
         screen: &mut crate::display::Screen,
     ) -> Result<u32, MrpError> {
-        self.cpu.reg_set(Mode::User, reg::PC, entry);
-        self.cpu.reg_set(Mode::User, reg::SP, STACK_TOP);
-        self.cpu.reg_set(Mode::User, reg::LR, 0);
+        self.cpu.reg_set(self.cpu.mode(), reg::PC, entry);
+        self.cpu.reg_set(self.cpu.mode(), reg::SP, STACK_TOP);
+        self.cpu.reg_set(self.cpu.mode(), reg::LR, 0);
         let bridge_end = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4;
 
         for executed in 0..limit {
             if executed != 0 && executed % 5_000_000 == 0 {
-                let pc = self.cpu.reg_get(Mode::User, reg::PC);
+                let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
                 log::info!("guest still running: {executed} instructions, pc={pc:#010x}");
             }
-            let pc = self.cpu.reg_get(Mode::User, reg::PC);
+            let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
             if pc == 0 {
-                return Ok(self.cpu.reg_get(Mode::User, R0));
+                return Ok(self.cpu.reg_get(self.cpu.mode(), R0));
             }
             if (BRIDGE_BASE..bridge_end).contains(&pc) {
                 let slot = ((pc - BRIDGE_BASE) / 4) as usize;
@@ -665,15 +665,44 @@ impl Guest {
                 }
                 self.slot_calls[slot] += 1;
                 let result = self.dispatch(slot, screen);
-                self.cpu.reg_set(Mode::User, R0, result as u32);
-                let lr = self.cpu.reg_get(Mode::User, reg::LR);
-                self.cpu.reg_set(Mode::User, reg::PC, lr);
+                self.cpu.reg_set(self.cpu.mode(), R0, result as u32);
+                let lr = self.cpu.reg_get(self.cpu.mode(), reg::LR);
+                self.cpu.reg_set(self.cpu.mode(), reg::PC, lr);
                 continue;
             }
             if pc >= MEM_SIZE || (pc & 3) != 0 {
                 return Err(MrpError::Unsupported(format!(
                     "guest PC out of range: {pc:#010x}"
                 )));
+            }
+            if std::env::var("MRP_TRACE").is_ok() && executed < 40 {
+                let inst = self.r32(pc);
+                eprintln!(
+                    "[trace {executed}] pc={pc:#010x} inst={inst:#010x} r0={:#010x} lr={:#010x} sp={:#010x} mode={:?}",
+                    self.cpu.reg_get(self.cpu.mode(), R0),
+                    self.cpu.reg_get(self.cpu.mode(), reg::LR),
+                    self.cpu.reg_get(self.cpu.mode(), reg::SP),
+                    self.cpu.mode(),
+                );
+            }
+            // ARMv5 `BLX register` (E12FFF3X): the ext images target the
+            // ARM9 (ARMv5TE) phones, and armv4t_emu stops at ARMv4, so the
+            // loop decodes this one itself before handing the rest of the
+            // instruction set to the CPU core.
+            let inst = self.r32(pc);
+            if (inst & 0x0FFF_FFF0) == 0x012F_FF30 {
+                let target = self.cpu.reg_get(self.cpu.mode(), (inst & 0xF) as reg::Reg);
+                self.cpu
+                    .reg_set(self.cpu.mode(), reg::LR, pc.wrapping_add(4));
+                self.cpu.reg_set(self.cpu.mode(), reg::PC, target & !1);
+                let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+                let cpsr = if target & 1 != 0 {
+                    cpsr | (1 << 5)
+                } else {
+                    cpsr & !(1 << 5)
+                };
+                self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
+                continue;
             }
             self.cpu.step(&mut GuestMem(&mut self.mem));
         }
@@ -707,20 +736,20 @@ impl Guest {
         }
         // The handler's trailing output arguments live on the stack; push
         // two zero words for them.
-        let sp = self.cpu.reg_get(Mode::User, reg::SP);
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
         let sp = sp.wrapping_sub(8) & !7;
         self.w32(sp, 0);
         self.w32(sp + 4, 0);
-        self.cpu.reg_set(Mode::User, reg::SP, sp);
-        self.cpu.reg_set(Mode::User, R0, self.c_function_p);
-        self.cpu.reg_set(Mode::User, R1, code as u32);
-        self.cpu.reg_set(Mode::User, R2, input);
-        self.cpu.reg_set(Mode::User, R3, input_len as u32);
+        self.cpu.reg_set(self.cpu.mode(), reg::SP, sp);
+        self.cpu.reg_set(self.cpu.mode(), R0, self.c_function_p);
+        self.cpu.reg_set(self.cpu.mode(), R1, code as u32);
+        self.cpu.reg_set(self.cpu.mode(), R2, input);
+        self.cpu.reg_set(self.cpu.mode(), R3, input_len as u32);
         let result = self.run_guest(self.c_function, limit, screen)?;
         // Restore the stack the handler left us with.
-        let sp = self.cpu.reg_get(Mode::User, reg::SP);
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
         self.cpu
-            .reg_set(Mode::User, reg::SP, (sp + 8).min(STACK_TOP));
+            .reg_set(self.cpu.mode(), reg::SP, (sp + 8).min(STACK_TOP));
         Ok(result as i32)
     }
 
@@ -730,17 +759,17 @@ impl Guest {
     /// the stack; `%s` strings are read from guest memory on demand.
     fn guest_format(&self, format_addr: u32, first_arg: u32) -> Vec<u8> {
         let format = self.guest_cstring(format_addr, 4096);
-        let sp = self.cpu.reg_get(Mode::User, reg::SP);
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
         let mut stack_words = Vec::new();
         for index in 0..16u32 {
             stack_words.push(self.r32(sp + index * 4));
         }
         let mut register_args: Vec<u32> = Vec::new();
         let registers = [
-            self.cpu.reg_get(Mode::User, R0),
-            self.cpu.reg_get(Mode::User, R1),
-            self.cpu.reg_get(Mode::User, R2),
-            self.cpu.reg_get(Mode::User, R3),
+            self.cpu.reg_get(self.cpu.mode(), R0),
+            self.cpu.reg_get(self.cpu.mode(), R1),
+            self.cpu.reg_get(self.cpu.mode(), R2),
+            self.cpu.reg_get(self.cpu.mode(), R3),
         ];
         register_args.extend_from_slice(&registers[first_arg.min(4) as usize..]);
         let mut all_args = register_args;
@@ -757,7 +786,7 @@ impl Guest {
 
     /// Reads stack-passed arguments: word 0 is the first argument after r3.
     fn stack_arg(&self, index: u32) -> u32 {
-        let sp = self.cpu.reg_get(Mode::User, reg::SP);
+        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
         self.r32(sp + index * 4)
     }
 
@@ -767,17 +796,17 @@ impl Guest {
         const MR_IGNORE: i32 = 1;
 
         match slot {
-            0 => self.heap_malloc(self.cpu.reg_get(Mode::User, R0)) as i32,
+            0 => self.heap_malloc(self.cpu.reg_get(self.cpu.mode(), R0)) as i32,
             1 => {
-                let addr = self.cpu.reg_get(Mode::User, R0);
-                let len = self.cpu.reg_get(Mode::User, R1);
+                let addr = self.cpu.reg_get(self.cpu.mode(), R0);
+                let len = self.cpu.reg_get(self.cpu.mode(), R1);
                 self.heap_free(addr, len);
                 MR_SUCCESS
             }
             2 => {
                 // realloc: fresh block, copy, release the old one.
-                let old = self.cpu.reg_get(Mode::User, R0);
-                let len = self.cpu.reg_get(Mode::User, R1);
+                let old = self.cpu.reg_get(self.cpu.mode(), R0);
+                let len = self.cpu.reg_get(self.cpu.mode(), R1);
                 let new = self.heap_malloc(len);
                 if new != 0 && old != 0 {
                     let count = len.min(HEAP_MAX_ALLOC) as usize;
@@ -792,8 +821,8 @@ impl Guest {
             3..=19 | 27 | 28 => self.dispatch_mem_string(slot),
             25 => {
                 // mr_c_function_new(func, len)
-                let func = self.cpu.reg_get(Mode::User, R0);
-                let len = self.cpu.reg_get(Mode::User, R1).max(4);
+                let func = self.cpu.reg_get(self.cpu.mode(), R0);
+                let len = self.cpu.reg_get(self.cpu.mode(), R1).max(4);
                 let block = self.heap_malloc(len);
                 if block == 0 {
                     return MR_FAILED;
@@ -808,7 +837,7 @@ impl Guest {
             }
             26 => {
                 // mr_printf(fmt, ...)
-                let message = self.guest_format(self.cpu.reg_get(Mode::User, R0), 1);
+                let message = self.guest_format(self.cpu.reg_get(self.cpu.mode(), R0), 1);
                 log::info!("mr_printf: {}", String::from_utf8_lossy(&message));
                 MR_SUCCESS
             }
@@ -819,8 +848,8 @@ impl Guest {
             }
             31 => {
                 // mr_timerStart(id, interval)
-                let id = self.cpu.reg_get(Mode::User, R0) as i32;
-                let interval = self.cpu.reg_get(Mode::User, R1);
+                let id = self.cpu.reg_get(self.cpu.mode(), R0) as i32;
+                let interval = self.cpu.reg_get(self.cpu.mode(), R1);
                 self.timers.push(GuestTimer {
                     id,
                     interval: Duration::from_millis(u64::from(interval).max(1)),
@@ -829,14 +858,14 @@ impl Guest {
                 MR_SUCCESS
             }
             32 => {
-                let id = self.cpu.reg_get(Mode::User, R0) as i32;
+                let id = self.cpu.reg_get(self.cpu.mode(), R0) as i32;
                 self.timers.retain(|timer| timer.id != id);
                 MR_SUCCESS
             }
             33 => self.started_at.elapsed().as_millis() as u32 as i32,
             34 => {
                 // mr_getDatetime(struct): year, month, day, hour, minute, second.
-                let buffer = self.cpu.reg_get(Mode::User, R0);
+                let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
                 let now = chrono_now();
                 self.w32(buffer, now.0);
                 self.w32(buffer + 4, now.1);
@@ -848,7 +877,7 @@ impl Guest {
             }
             35 => {
                 // mr_getUserInfo: IMEI, IMSI, vendor, device strings.
-                let buffer = self.cpu.reg_get(Mode::User, R0);
+                let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
                 let imei = self.config.imei.clone();
                 let imsi = self.config.imsi.clone();
                 let vendor = self.config.vendor.clone();
@@ -899,7 +928,7 @@ impl Guest {
             }
             80 => {
                 // mr_getScreenInfo(struct)
-                let buffer = self.cpu.reg_get(Mode::User, R0);
+                let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
                 self.w32(buffer, u32::from(self.config.screen_width));
                 self.w32(buffer + 4, u32::from(self.config.screen_height));
                 self.w32(buffer + 8, 16);
@@ -915,9 +944,9 @@ impl Guest {
             113..=118 => 0, // md5 / sms cfg: tolerated stubs
             119 => {
                 // mr_drawPoint(x, y, color): draw into the guest buffer.
-                let x = self.cpu.reg_get(Mode::User, R0);
-                let y = self.cpu.reg_get(Mode::User, R1);
-                let color = rgb_to_565(self.cpu.reg_get(Mode::User, R2));
+                let x = self.cpu.reg_get(self.cpu.mode(), R0);
+                let y = self.cpu.reg_get(self.cpu.mode(), R1);
+                let color = rgb_to_565(self.cpu.reg_get(self.cpu.mode(), R2));
                 let width = u32::from(self.config.screen_width);
                 if x < width {
                     self.w16(SCREENBUF + (y * width + x) * 2, color);
@@ -926,10 +955,10 @@ impl Guest {
             }
             122 => {
                 // mr_drawRect(x1, y1, x2, y2, r, g, b)
-                let x1 = self.cpu.reg_get(Mode::User, R0);
-                let y1 = self.cpu.reg_get(Mode::User, R1);
-                let x2 = self.cpu.reg_get(Mode::User, R2);
-                let y2 = self.cpu.reg_get(Mode::User, R3);
+                let x1 = self.cpu.reg_get(self.cpu.mode(), R0);
+                let y1 = self.cpu.reg_get(self.cpu.mode(), R1);
+                let x2 = self.cpu.reg_get(self.cpu.mode(), R2);
+                let y2 = self.cpu.reg_get(self.cpu.mode(), R3);
                 let r = self.stack_arg(0) & 0xFF;
                 let g = self.stack_arg(1) & 0xFF;
                 let b = self.stack_arg(2) & 0xFF;
@@ -965,15 +994,15 @@ impl Guest {
             129 => 0, // mr_effSetCon
             130 => {
                 // mr_testCom(state, input0, input1)
-                let input0 = self.cpu.reg_get(Mode::User, R1);
-                let input1 = self.cpu.reg_get(Mode::User, R2);
+                let input0 = self.cpu.reg_get(self.cpu.mode(), R1);
+                let input1 = self.cpu.reg_get(self.cpu.mode(), R2);
                 self.dispatch_test_com(input0, input1)
             }
             131 => MR_IGNORE, // mr_testCom1
             132 => 0,         // mr_c2u
             133 => {
-                let a = self.cpu.reg_get(Mode::User, R0) as i32;
-                let b = self.cpu.reg_get(Mode::User, R1) as i32;
+                let a = self.cpu.reg_get(self.cpu.mode(), R0) as i32;
+                let b = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
                 if b == 0 {
                     0
                 } else {
@@ -981,8 +1010,8 @@ impl Guest {
                 }
             }
             134 => {
-                let a = self.cpu.reg_get(Mode::User, R0) as i32;
-                let b = self.cpu.reg_get(Mode::User, R1) as i32;
+                let a = self.cpu.reg_get(self.cpu.mode(), R0) as i32;
+                let b = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
                 if b == 0 {
                     0
                 } else {
@@ -1013,9 +1042,9 @@ impl Guest {
     /// `mr_malloc`/`mr_free`.
     fn dispatch_mem_string(&mut self, slot: usize) -> i32 {
         const MR_SUCCESS: i32 = 0;
-        let r0 = self.cpu.reg_get(Mode::User, R0);
-        let r1 = self.cpu.reg_get(Mode::User, R1);
-        let r2 = self.cpu.reg_get(Mode::User, R2);
+        let r0 = self.cpu.reg_get(self.cpu.mode(), R0);
+        let r1 = self.cpu.reg_get(self.cpu.mode(), R1);
+        let r2 = self.cpu.reg_get(self.cpu.mode(), R2);
         match slot {
             3 => {
                 // memcpy(dst, src, len)
@@ -1197,7 +1226,7 @@ impl Guest {
     }
 
     fn swi_open(&mut self) -> i32 {
-        let path = self.guest_cstring(self.cpu.reg_get(Mode::User, R0), 512);
+        let path = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 512);
         let name = String::from_utf8_lossy(&path).to_string();
         log::info!("mr_open({name:?})");
         // File content is served from the virtual file system; a missing
@@ -1213,7 +1242,7 @@ impl Guest {
     }
 
     fn swi_close(&mut self) -> i32 {
-        let handle = self.cpu.reg_get(Mode::User, R0) as usize;
+        let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
         if handle == 0 || handle > self.open_files.len() {
             return -1;
         }
@@ -1223,7 +1252,7 @@ impl Guest {
 
     fn swi_info(&mut self) -> i32 {
         // mr_info(path) returns the file size, or MR_FAILED (-1).
-        let path = self.guest_cstring(self.cpu.reg_get(Mode::User, R0), 512);
+        let path = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 512);
         let name = String::from_utf8_lossy(&path).to_string();
         match self.file_lookup(&name) {
             Some(data) => data.len() as i32,
@@ -1234,8 +1263,8 @@ impl Guest {
     fn swi_write(&mut self) -> i32 {
         // Writes land in the handle's buffer; persistence lands with the
         // guest file system work.
-        let handle = self.cpu.reg_get(Mode::User, R0) as usize;
-        let len = self.cpu.reg_get(Mode::User, R2) as usize;
+        let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
+        let len = self.cpu.reg_get(self.cpu.mode(), R2) as usize;
         if handle == 0 || handle > self.open_files.len() {
             return -1;
         }
@@ -1243,9 +1272,9 @@ impl Guest {
     }
 
     fn swi_read(&mut self) -> i32 {
-        let handle = self.cpu.reg_get(Mode::User, R0) as usize;
-        let buffer = self.cpu.reg_get(Mode::User, R1);
-        let len = self.cpu.reg_get(Mode::User, R2) as usize;
+        let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
+        let buffer = self.cpu.reg_get(self.cpu.mode(), R1);
+        let len = self.cpu.reg_get(self.cpu.mode(), R2) as usize;
         if handle == 0 || handle > self.open_files.len() || self.open_files[handle - 1].closed {
             return -1;
         }
@@ -1262,9 +1291,9 @@ impl Guest {
     }
 
     fn swi_seek(&mut self) -> i32 {
-        let handle = self.cpu.reg_get(Mode::User, R0) as usize;
-        let offset = self.cpu.reg_get(Mode::User, R1) as i32;
-        let whence = self.cpu.reg_get(Mode::User, R2) as i32;
+        let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
+        let offset = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
+        let whence = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
         if handle == 0 || handle > self.open_files.len() {
             return -1;
         }
@@ -1281,7 +1310,7 @@ impl Guest {
     }
 
     fn swi_get_len(&mut self) -> i32 {
-        let handle = self.cpu.reg_get(Mode::User, R0) as usize;
+        let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
         match self.open_files.get(handle.wrapping_sub(1)) {
             Some(file) => file.data.len() as i32,
             None => -1,
@@ -1292,10 +1321,10 @@ impl Guest {
     /// package first (gzip-aware), then the virtual file system.
     fn swi_read_file(&mut self) -> i32 {
         const MR_FAILED: i32 = -1;
-        let name_addr = self.cpu.reg_get(Mode::User, R0);
-        let buffer = self.cpu.reg_get(Mode::User, R1);
-        let len_ptr = self.cpu.reg_get(Mode::User, R2);
-        let lookfor = self.cpu.reg_get(Mode::User, R3);
+        let name_addr = self.cpu.reg_get(self.cpu.mode(), R0);
+        let buffer = self.cpu.reg_get(self.cpu.mode(), R1);
+        let len_ptr = self.cpu.reg_get(self.cpu.mode(), R2);
+        let lookfor = self.cpu.reg_get(self.cpu.mode(), R3);
         let name = String::from_utf8_lossy(&self.guest_cstring(name_addr, 512)).to_string();
         let Some(content) = self.file_lookup(&name) else {
             return MR_FAILED;
@@ -1440,9 +1469,11 @@ impl Guest {
         // mr_testCom(0, 0xe2d, 0xb61): the loader's flag handshake.
         self.bi |= 0x1;
 
-        // mr_c_function_load: r0 carries the ext base like the reference's
-        // `code` argument.
-        self.cpu.reg_set(Mode::User, R0, EXT_BASE);
+        // mr_c_function_load(code): the ext compares r0 against 1 and only
+        // takes the mr_c_function_new registration path when the argument
+        // is 1 (observed in the reference ext's disassembly); other values
+        // jump to an alternate entry.
+        self.cpu.reg_set(self.cpu.mode(), R0, 1);
         self.run_guest(EXT_BASE + 8, DEFAULT_INSTRUCTION_LIMIT, screen)?;
         if self.c_function == 0 {
             return Err(MrpError::Unsupported(
@@ -1471,9 +1502,9 @@ impl Guest {
         screen: &mut crate::display::Screen,
     ) -> Result<i32, MrpError> {
         if self.event_function != 0 {
-            self.cpu.reg_set(Mode::User, R0, event_type as u32);
-            self.cpu.reg_set(Mode::User, R1, param0 as u32);
-            self.cpu.reg_set(Mode::User, R2, param1 as u32);
+            self.cpu.reg_set(self.cpu.mode(), R0, event_type as u32);
+            self.cpu.reg_set(self.cpu.mode(), R1, param0 as u32);
+            self.cpu.reg_set(self.cpu.mode(), R2, param1 as u32);
             return self
                 .run_guest(self.event_function, DEFAULT_INSTRUCTION_LIMIT, screen)
                 .map(|value| value as i32);
@@ -1668,9 +1699,9 @@ mod tests {
         let format = b"count=%d done";
         g.mem[scratch..scratch + format.len()].copy_from_slice(format);
         g.mem[scratch + format.len()] = 0;
-        g.cpu.reg_set(Mode::User, R0, dst);
-        g.cpu.reg_set(Mode::User, R1, fmt_addr);
-        g.cpu.reg_set(Mode::User, R2, 7);
+        g.cpu.reg_set(g.cpu.mode(), R0, dst);
+        g.cpu.reg_set(g.cpu.mode(), R1, fmt_addr);
+        g.cpu.reg_set(g.cpu.mode(), R2, 7);
         assert_eq!(g.dispatch_mem_string(17), 12);
         assert_eq!(&g.mem[dst as usize..dst as usize + 12], b"count=7 done");
     }
@@ -1678,12 +1709,12 @@ mod tests {
     #[test]
     fn test_com_registrations_are_recorded() {
         let mut g = guest();
-        g.cpu.reg_set(Mode::User, R1, 0x02);
-        g.cpu.reg_set(Mode::User, R2, 0xCAFE);
+        g.cpu.reg_set(g.cpu.mode(), R1, 0x02);
+        g.cpu.reg_set(g.cpu.mode(), R2, 0xCAFE);
         assert_eq!(g.dispatch_test_com(0x02, 0xCAFE), 0);
         assert_eq!(g.event_function, 0xCAFE);
-        g.cpu.reg_set(Mode::User, R1, 0x03);
-        g.cpu.reg_set(Mode::User, R2, 0xBEEF);
+        g.cpu.reg_set(g.cpu.mode(), R1, 0x03);
+        g.cpu.reg_set(g.cpu.mode(), R2, 0xBEEF);
         assert_eq!(g.dispatch_test_com(0x03, 0xBEEF), 0);
         assert_eq!(g.timer_function, 0xBEEF);
     }
