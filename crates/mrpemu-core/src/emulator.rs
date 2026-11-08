@@ -211,11 +211,6 @@ impl MrpMachine {
             self.boot_error = Some("package reparse failed".to_string());
             return;
         };
-        let ext = package
-            .read_entry("cfunction.ext")
-            .ok()
-            .filter(|v| !v.is_empty());
-
         // Script path: start.mr runs on the VM and drives _com(800).
         let mut bridge = ScriptBridge::new();
         bridge.load_package(
@@ -238,55 +233,57 @@ impl MrpMachine {
             self.script = Some(bridge);
             return;
         }
-        let handler_registered = bridge
-            .vm
-            .guest
-            .as_ref()
-            .map(|guest| guest.c_function != 0)
-            .unwrap_or(false);
-
-        // Direct ext path: self-registering ext images skip the script.
-        let Some(ext) = ext else {
+        // Direct ext path: try every .ext member in package order until one
+        // registers an event handler. Self-registering images (hello) work
+        // on the first try; stub loaders (test.mrp/mpc.mrp) need a later
+        // member such as game.ext.
+        let ext_files: Vec<(String, Vec<u8>)> = package
+            .entries()
+            .iter()
+            .filter(|entry| entry.name.to_lowercase().ends_with(".ext"))
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    package.read_entry(&entry.name).unwrap_or_default(),
+                )
+            })
+            .collect();
+        if ext_files.is_empty() {
             self.boot_error = Some("no cfunction.ext".to_string());
-            return;
-        };
-        if handler_registered {
-            // The script already loaded and registered the ext; keep it.
-            log::info!(
-                "script booted: {:?} (missing globals: {:?})",
-                self.header.display_name,
-                bridge.missing_globals()
-            );
-            self.screen = std::mem::replace(
-                &mut bridge.vm.screen,
-                crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
-            );
-            self.script = Some(bridge);
             return;
         }
         let mut guest =
             crate::cfunction::Guest::new(crate::cfunction::GuestConfig::default(), Vec::new());
         let mut screen = crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-        match guest.boot_ext(
-            &ext,
-            self.header.build_id,
-            self.header.build_version,
-            &mut screen,
-        ) {
-            Ok(()) => {
-                log::info!(
-                    "direct ext boot: {:?} (app id {})",
-                    self.header.display_name,
-                    self.header.build_id
-                );
-                self.screen = screen;
-                self.script = Some(ScriptBridge::with_guest(guest, self.screen.clone()));
-            }
-            Err(error) => {
-                log::error!("direct ext boot failed: {error}");
-                self.boot_error = Some(error.to_string());
+        let mut last_error = None;
+        for (name, ext) in &ext_files {
+            match guest.boot_ext(
+                ext,
+                self.header.build_id,
+                self.header.build_version,
+                &mut screen,
+            ) {
+                Ok(()) if guest.c_function != 0 => {
+                    log::info!(
+                        "direct ext boot: {:?} via {} (app id {})",
+                        self.header.display_name,
+                        name,
+                        self.header.build_id
+                    );
+                    self.screen = screen.clone();
+                    self.script = Some(ScriptBridge::with_guest(guest, screen));
+                    return;
+                }
+                Ok(_) => {
+                    log::info!("ext {} loaded but did not register; trying next", name);
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                }
             }
         }
+        self.boot_error =
+            Some(last_error.unwrap_or_else(|| "no ext registered an event handler".to_string()));
     }
 
     /// MRC key codes expected by guest event handlers.

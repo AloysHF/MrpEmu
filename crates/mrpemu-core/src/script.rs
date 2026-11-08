@@ -626,6 +626,7 @@ impl ScriptBridge {
 /// the registered handler with (code, input bytes).
 fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
     let input0 = args.first().and_then(vh::as_num).unwrap_or(0.0) as i32;
+    eprintln!("[_com] input0={input0:#x} nargs={}", args.len());
     match input0 {
         800 | 802 => {
             let code = args
@@ -736,7 +737,7 @@ fn register_stub_group(vm: &mut Vm, names: &[&'static str]) {
                         .get_or_insert_with(HashSet::new)
                         .insert(key.to_string())
                     {
-                        log::warn!("native `{key}` is not implemented; returning 0");
+                        eprintln!("[stub] native `{key}` called");
                     }
                 }
                 Ok(vec![vh::num_value(0.0)])
