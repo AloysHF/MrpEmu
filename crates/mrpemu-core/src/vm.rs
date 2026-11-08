@@ -898,7 +898,7 @@ mod tests {
     use crate::undump::{Constant, LocalVar};
 
     fn inst(op: Op, a: u32, b: u32, c: u32) -> Instruction {
-        Instruction((a << 6) | (c << 14) | (b << 23) | (op as u32))
+        Instruction((a << 6) | (b << 14) | (c << 24) | (op as u32))
     }
 
     /// ABx instructions (LOADK/GETGLOBAL/SETGLOBAL/CLOSURE) carry the raw
