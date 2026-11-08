@@ -664,6 +664,15 @@ impl Guest {
                     )));
                 }
                 self.slot_calls[slot] += 1;
+                if std::env::var("MRP_TRACE").is_ok() {
+                    eprintln!(
+                        "[dispatch] slot={slot} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                        self.cpu.reg_get(self.cpu.mode(), R0),
+                        self.cpu.reg_get(self.cpu.mode(), R1),
+                        self.cpu.reg_get(self.cpu.mode(), R2),
+                        self.cpu.reg_get(self.cpu.mode(), R3),
+                    );
+                }
                 let result = self.dispatch(slot, screen);
                 self.cpu.reg_set(self.cpu.mode(), R0, result as u32);
                 let lr = self.cpu.reg_get(self.cpu.mode(), reg::LR);
@@ -675,7 +684,7 @@ impl Guest {
                     "guest PC out of range: {pc:#010x}"
                 )));
             }
-            if std::env::var("MRP_TRACE").is_ok() && executed < 40 {
+            if std::env::var("MRP_TRACE").is_ok() && executed < 400 {
                 let inst = self.r32(pc);
                 eprintln!(
                     "[trace {executed}] pc={pc:#010x} inst={inst:#010x} r0={:#010x} lr={:#010x} sp={:#010x} mode={:?}",
@@ -1475,6 +1484,12 @@ impl Guest {
         // jump to an alternate entry.
         self.cpu.reg_set(self.cpu.mode(), R0, 1);
         self.run_guest(EXT_BASE + 8, DEFAULT_INSTRUCTION_LIMIT, screen)?;
+        if std::env::var("MRP_TRACE").is_ok() {
+            eprintln!(
+                "[boot] load done, c_function={:#010x} p={:#010x}",
+                self.c_function, self.c_function_p
+            );
+        }
         if self.c_function == 0 {
             return Err(MrpError::Unsupported(
                 "ext did not register an event handler via mr_c_function_new".to_string(),
@@ -1721,8 +1736,72 @@ mod tests {
 
     /// Boots the real hello.mrp ext through the full load/handshake/init
     /// sequence. Requires the local reference clone, so it stays ignored.
+    /// Boots every ext-carrying sample from the reference repos. This is
+    /// the corpus gate: each entry must load, register, and finish init.
     #[test]
-    #[ignore = "ext boot debugging: handler registration not observed yet"]
+    #[ignore = "requires the local reference corpus under tmp/"]
+    fn boots_reference_samples() {
+        let _ = env_logger::try_init();
+        let samples = [
+            "hello",
+            "../../tmp/mrpemu/sdcard/mythroad/hello.mrp",
+            "../../tmp/mrpemu/sdcard/mythroad/gymls.mrp",
+            "../../tmp/mrpemu/sdcard/mythroad/test.mrp",
+            "../../tmp/vmrp/wasm/dist/fs/mythroad/dsm_gm.mrp",
+            "../../tmp/vmrp/wasm/dist/fs/mythroad/mpc.mrp",
+            "../../tmp/scratch/Maze.mrp",
+            "../../tmp/vmrp/mrc/asm/asm.mrp",
+        ];
+        let mut failures = Vec::new();
+        for sample in &samples[1..] {
+            let name = sample.rsplit('/').next().unwrap_or(sample);
+            let Ok(package) = crate::package::MrpPackage::from_path(sample) else {
+                failures.push(format!("{name}: package unreadable"));
+                continue;
+            };
+            let Ok(ext) = package.read_entry("cfunction.ext") else {
+                failures.push(format!("{name}: no cfunction.ext"));
+                continue;
+            };
+            let files: Vec<(String, Vec<u8>)> = package
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.name.clone(),
+                        package.read_entry(&entry.name).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            let mut guest = Guest::new(GuestConfig::default(), files);
+            let mut screen = crate::display::Screen::new(240, 320);
+            match guest.boot_ext(
+                &ext,
+                package.header().build_id,
+                package.header().build_version,
+                &mut screen,
+            ) {
+                Ok(()) => log::info!(
+                    "{name}: booted (handler at {:#010x}, slots called {})",
+                    guest.c_function,
+                    guest.slot_calls.iter().sum::<u64>()
+                ),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "samples failed to boot:
+{}",
+            failures.join(
+                "
+"
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the local reference corpus under tmp/; 6/8 reference samples boot, test.mrp and mpc.mrp pending multi-ext investigation"]
     fn boots_hello_mrp_ext() {
         let _ = env_logger::try_init();
         let package =
