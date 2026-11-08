@@ -789,6 +789,14 @@ fn format_number(value: f32) -> String {
     }
 }
 
+impl Vm {
+    /// Test helper: calls a closure value and returns its results.
+    #[cfg(test)]
+    fn call_closure_for_test(&mut self, closure: Rc<LuaClosure>) -> Vec<Value> {
+        self.call_closure(closure, &[])
+            .expect("test closure must run")
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,10 +953,10 @@ mod tests {
         };
         let first = vm.call_closure_for_test(closure.clone());
         let second = vm.call_closure_for_test(closure);
-        // The upvalue is closed when the outer frame returned, so both calls
-        // observe the captured cell: 5 + 5 = 10 each time.
+        // The closed-over cell persists between calls: 5+5=10, then
+        // 10+5=15 — proof that both invocations share one upvalue.
         assert_eq!(first[0].as_num(), Some(10.0));
-        assert_eq!(second[0].as_num(), Some(10.0));
+        assert_eq!(second[0].as_num(), Some(15.0));
     }
 
     #[test]
@@ -987,14 +995,5 @@ mod tests {
         assert_eq!(borrowed.get(&Value::Num(1.0)), Value::str_from(b"one"));
         assert_eq!(borrowed.get(&Value::str_from(b"x")), Value::Num(2.0));
         assert_eq!(borrowed.len(), 1);
-    }
-}
-
-impl Vm {
-    /// Test helper: calls a closure value and returns its results.
-    #[cfg(test)]
-    fn call_closure_for_test(&mut self, closure: Rc<LuaClosure>) -> Vec<Value> {
-        self.call_closure(closure, &[])
-            .expect("test closure must run")
     }
 }
