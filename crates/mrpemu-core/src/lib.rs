@@ -20,6 +20,9 @@ pub mod emulator;
 pub mod error;
 pub mod format;
 pub mod input;
+pub mod opcodes;
+pub mod package;
+pub mod undump;
 pub mod vfs;
 
 pub use display::Screen;
@@ -27,4 +30,7 @@ pub use emulator::MrpMachine;
 pub use error::MrpError;
 pub use format::MrpHeader;
 pub use input::{InputState, MrpKey};
+pub use opcodes::{Instruction, Op};
+pub use package::MrpPackage;
+pub use undump::{Chunk, Constant, Proto};
 pub use vfs::MemoryVfs;

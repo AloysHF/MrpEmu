@@ -23,6 +23,7 @@ anyhow = "1"              # Error handling at the frontend boundaries
 thiserror = "2"           # Error handling (custom error enums in the core)
 log = "0.4"               # Logging facade
 encoding_rs = "0.8"       # GBK text decoding for MRP string fields
+flate2 = "1"              # gzip member decompression inside .mrp packages
 clap = { version = "4", features = ["derive"] }  # CLI argument parsing (standalone)
 minifb = "0.29"           # Window creation and pixel rendering (standalone)
 env_logger = "0.11"       # Log output to stderr (standalone)
