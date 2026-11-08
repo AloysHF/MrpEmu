@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "core": "mrpemu",
+  "so_name": "libmrpemu.so",
+  "system": "mrp",
+  "display_name": {
+    "en": "MRP (Mythroad)",
+    "zh": "MRP（冒泡）"
+  },
+  "short_name": "MRP",
+  "manufacturer": "Sky-mobi / MTK feature phones",
+  "supported_extensions": ["mrp"],
+  "save_state_format": 0,
+  "firmware": [],
+  "input": {
+    "preset": "dpad-abcd-select"
+  },
+  "video": {
+    "orientation": "portrait",
+    "pixel_format": "rgb565"
+  },
+  "notes": {
+    "en": "Runs Sky-mobi mythroad (MRP) .mrp applications with a 240x320 RGB565 screen and feature-phone key mapping. Experimental: the MiniJ VM is not implemented yet.",
+    "zh": "运行斯凯 mythroad（MRP）平台的 .mrp 应用，240x320 RGB565 屏幕与功能机按键映射。实验性：MiniJ 虚拟机尚未实现。"
+  }
+}

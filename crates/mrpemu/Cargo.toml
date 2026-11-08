@@ -1,0 +1,18 @@
+[package]
+name = "mrpemu"
+description = "Sky-mobi mythroad (MRP) application emulator - Desktop application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mrpemu"
+path = "src/main.rs"
+
+[dependencies]
+mrpemu-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+clap.workspace = true
+minifb.workspace = true
+env_logger.workspace = true
