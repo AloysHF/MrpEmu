@@ -26,8 +26,8 @@ const MAX_PROTO_DEPTH: usize = 64;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     Nil,
-    /// MiniJ stores `lua_Number` as 32-bit floats.
-    Number(f32),
+    /// MiniJ stores `lua_Number` as 32-bit integers (feature-phone Lua).
+    Number(i32),
     /// Byte string; MRP scripts encode text in GBK, so this stays raw.
     Str(Vec<u8>),
 }
@@ -215,7 +215,7 @@ impl<'a> Reader<'a> {
                 0 => Constant::Nil,
                 3 => {
                     let raw = self.u32("constant number")?;
-                    Constant::Number(f32::from_bits(raw))
+                    Constant::Number(raw as i32)
                 }
                 4 => Constant::Str(self.bytes("constant string")?),
                 other => {
@@ -314,7 +314,7 @@ mod tests {
                 Constant::Nil => out.push(0),
                 Constant::Number(value) => {
                     out.push(3);
-                    out.extend_from_slice(&value.to_bits().to_le_bytes());
+                    out.extend_from_slice(&(*value).to_le_bytes());
                 }
                 Constant::Str(value) => {
                     out.push(4);
@@ -349,7 +349,7 @@ mod tests {
             upvalues: vec![],
             constants: vec![
                 Constant::Nil,
-                Constant::Number(1.5),
+                Constant::Number(1500),
                 Constant::Str(b"mrc_clearScreen".to_vec()),
             ],
             protos: vec![Proto {
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(chunk.proto.line_info, vec![2, 2, 2, 52]);
         assert_eq!(chunk.proto.locals.len(), 1);
         assert_eq!(chunk.proto.locals[0].name, b"x");
-        assert_eq!(chunk.proto.constants[1], Constant::Number(1.5));
+        assert_eq!(chunk.proto.constants[1], Constant::Number(1500));
         assert_eq!(
             chunk.proto.constants[2],
             Constant::Str(b"mrc_clearScreen".to_vec())

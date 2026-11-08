@@ -343,10 +343,15 @@ impl Vm {
         upval
     }
 
-    fn set_stack(&mut self, index: usize, value: Value) {
-        if index >= self.stack.len() {
-            self.stack.resize(index + 1, Value::Nil);
+    /// Grows the stack so that `[0..index)` is addressable with nils.
+    fn pad_stack(&mut self, index: usize) {
+        if index > self.stack.len() {
+            self.stack.resize(index, Value::Nil);
         }
+    }
+
+    fn set_stack(&mut self, index: usize, value: Value) {
+        self.pad_stack(index + 1);
         self.stack[index] = value;
     }
 
@@ -360,13 +365,24 @@ impl Vm {
             self.frames -= 1;
             return Err("stack overflow (recursion limit)".to_string());
         }
+        if self.frames > 50 && std::env::var("MRP_TRACE").is_ok() {
+            eprintln!(
+                "[depth {}] pc_base={:p} src={:?}",
+                self.frames,
+                Rc::as_ptr(&closure.proto),
+                closure.proto.source
+            );
+        }
         let base = self.stack.len();
-        let max_stack = closure.proto.max_stack_size.max(closure.proto.num_params) as usize;
+        let frame_size = (closure.proto.max_stack_size as usize)
+            .max(closure.proto.num_params as usize)
+            .max(args.len())
+            .max(1024);
         self.stack.extend(
             args.iter()
                 .cloned()
                 .chain(std::iter::repeat(Value::Nil))
-                .take(args.len().max(max_stack)),
+                .take(frame_size),
         );
         let result = self.execute(closure.clone(), base);
         self.close_upvals(base);
@@ -541,25 +557,26 @@ impl Vm {
                     }
                 }
                 Op::Call => {
-                    let nargs = if b == 0 {
-                        self.top - (base + a + 1)
+                    // MRP shifts the 5.0 convention by one: the callee is
+                    // R[A-1] and the arguments start at R[A].
+                    let func_reg = base + a - 1;
+                    let nargs = if b == 0 { self.top - (base + a) } else { b - 1 };
+                    self.pad_stack(base + a + nargs.max(1));
+                    let args: Vec<Value> = self.stack[base + a..base + a + nargs].to_vec();
+                    let func = self.stack[func_reg].clone();
+                    let nresults = if c == 0 {
+                        None
                     } else {
-                        b - 1
+                        Some(c.saturating_sub(1))
                     };
-                    let args: Vec<Value> = self.stack[base + a + 1..base + a + 1 + nargs].to_vec();
-                    let func = self.stack[base + a].clone();
-                    let nresults = if c == 0 { None } else { Some(c - 1) };
-                    self.call_value_in_place(&func, &args, nresults, base + a)?;
+                    self.call_value_in_place(&func, &args, nresults, func_reg)?;
                     pc += 0;
                 }
                 Op::Tailcall => {
-                    let nargs = if b == 0 {
-                        self.top - (base + a + 1)
-                    } else {
-                        b - 1
-                    };
-                    let args: Vec<Value> = self.stack[base + a + 1..base + a + 1 + nargs].to_vec();
-                    let func = self.stack[base + a].clone();
+                    let func_reg = base + a - 1;
+                    let nargs = if b == 0 { self.top - (base + a) } else { b - 1 };
+                    let args: Vec<Value> = self.stack[base + a..base + a + nargs].to_vec();
+                    let func = self.stack[func_reg].clone();
                     match func {
                         Value::Closure(inner) => {
                             // Replace the current frame in place.
@@ -808,7 +825,7 @@ impl Vm {
 fn constant_value(proto: &Proto, index: usize) -> Result<Value, String> {
     match proto.constants.get(index) {
         Some(crate::undump::Constant::Nil) => Ok(Value::Nil),
-        Some(crate::undump::Constant::Number(number)) => Ok(Value::Num(*number)),
+        Some(crate::undump::Constant::Number(number)) => Ok(Value::Num(*number as f32)),
         Some(crate::undump::Constant::Str(bytes)) => Ok(Value::str_from(bytes)),
         None => Err(format!("constant index {index} out of range")),
     }
@@ -885,9 +902,9 @@ mod tests {
     }
 
     /// ABx instructions (LOADK/GETGLOBAL/SETGLOBAL/CLOSURE) carry the raw
-    /// Bx index; only the jump-style ops apply the sBx bias.
+    /// operand in the high 8 bits.
     fn inst_bx(op: Op, a: u32, bx: u32) -> Instruction {
-        Instruction((a << 6) | (bx << 14) | (op as u32))
+        Instruction((a << 6) | (bx << 24) | (op as u32))
     }
 
     fn proto(constants: Vec<Constant>, code: Vec<Instruction>) -> Rc<Proto> {
@@ -917,8 +934,8 @@ mod tests {
         let proto = proto(
             vec![
                 Constant::Str(b"answer".to_vec()),
-                Constant::Number(6.0),
-                Constant::Number(7.0),
+                Constant::Number(6),
+                Constant::Number(7),
             ],
             vec![
                 inst_bx(Op::LoadK, 0, 1),     // r0 = 6
@@ -979,7 +996,7 @@ mod tests {
                 end_pc: 0,
             }],
             upvalues: vec![],
-            constants: vec![Constant::Number(5.0)],
+            constants: vec![Constant::Number(5)],
             protos: vec![Proto {
                 source: None,
                 line_defined: 0,
@@ -994,7 +1011,7 @@ mod tests {
                     end_pc: 0,
                 }],
                 upvalues: vec![b"x".to_vec()],
-                constants: vec![Constant::Number(5.0)],
+                constants: vec![Constant::Number(5)],
                 protos: vec![],
                 code: vec![
                     inst(Op::GetUpval, 0, 0, 0),
@@ -1015,7 +1032,7 @@ mod tests {
         });
         // Fix: use a proper name constant for SetGlobal.
         let mut outer2 = (*outer).clone();
-        outer2.constants = vec![Constant::Number(5.0), Constant::Str(b"step".to_vec())];
+        outer2.constants = vec![Constant::Number(5), Constant::Str(b"step".to_vec())];
         outer2.code[3] = inst_bx(Op::SetGlobal, 1, 1);
 
         let mut vm = Vm::new();
@@ -1045,8 +1062,8 @@ mod tests {
                 Constant::Str(b"t".to_vec()),
                 Constant::Str(b"one".to_vec()),
                 Constant::Str(b"x".to_vec()),
-                Constant::Number(2.0),
-                Constant::Number(1.0),
+                Constant::Number(2),
+                Constant::Number(1),
             ],
             vec![
                 inst(Op::NewTable, 0, 0, 0),

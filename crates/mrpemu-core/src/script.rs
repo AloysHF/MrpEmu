@@ -18,8 +18,6 @@ use crate::vm::{Value, Vm};
 
 /// Sentinel native slot backing unknown globals: scripts probing optional
 /// API surface get a callable that returns nothing instead of crashing.
-const STUB_NATIVE: u16 = u16::MAX - 1;
-
 pub struct ScriptBridge {
     pub vm: Vm,
     missing_globals: RefCell<HashSet<String>>,
@@ -40,6 +38,20 @@ impl ScriptBridge {
         };
         bridge.register_natives();
         bridge
+    }
+
+    /// Creates a bridge that wraps an already-booted guest (the direct
+    /// ext path); the script never ran, so only guest-level pumping works.
+    pub fn with_guest(guest: crate::cfunction::Guest, screen: crate::display::Screen) -> Self {
+        let mut bridge = Self::new();
+        bridge.vm.guest = Some(guest);
+        bridge.vm.screen = screen;
+        bridge
+    }
+
+    /// The reason `run_start_script` failed, if it was attempted and failed.
+    pub fn run_start_script_failed_reason(&mut self) -> Option<String> {
+        self.run_start_script().err()
     }
 
     /// Loads the package into the bridge: guest files, header data, and the
@@ -113,9 +125,10 @@ impl ScriptBridge {
 
     fn register_natives(&mut self) {
         // The stub sentinel used for unknown globals.
-        self.vm
-            .add_native("__stub", Box::new(|_vm, _args| Ok(vec![Value::Nil])));
-        self.vm.stub_native = Some(STUB_NATIVE);
+        self.vm.stub_native = Some(
+            self.vm
+                .add_native("__stub", Box::new(|_vm, _args| Ok(vec![Value::Nil]))),
+        );
 
         self.vm.register(
             "Exit",

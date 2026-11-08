@@ -7,7 +7,7 @@ pub const DEFAULT_WIDTH: u16 = 240;
 pub const DEFAULT_HEIGHT: u16 = 320;
 
 /// A 16-bit RGB565 framebuffer in row-major order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Screen {
     width: u16,
     height: u16,

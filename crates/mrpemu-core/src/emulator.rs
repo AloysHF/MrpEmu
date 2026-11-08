@@ -134,13 +134,34 @@ impl MrpMachine {
             return;
         }
 
-        // Key edges: press events before release events, in key order.
+        // Key edges: the guest's own event handler runs first (the ext
+        // registers one via testCom); MR_IGNORE falls through to the
+        // script's dealevent.
         let current: BTreeSet<MrpKey> = self.input.pressed().collect();
         let pressed: Vec<MrpKey> = current.difference(&self.last_keys).copied().collect();
         let released: Vec<MrpKey> = self.last_keys.difference(&current).copied().collect();
         self.last_keys = current;
         for key in pressed {
-            let _ = bridge.send_event(0, Self::mrc_key_code(key), 0);
+            let handled = bridge
+                .vm
+                .guest
+                .as_mut()
+                .map(|guest| {
+                    let mut screen = std::mem::replace(
+                        &mut bridge.vm.screen,
+                        crate::display::Screen::new(
+                            crate::display::DEFAULT_WIDTH,
+                            crate::display::DEFAULT_HEIGHT,
+                        ),
+                    );
+                    let result = guest.send_event(0, Self::mrc_key_code(key), 0, &mut screen);
+                    bridge.vm.screen = screen;
+                    !matches!(result, Ok(1))
+                })
+                .unwrap_or(false);
+            if !handled {
+                let _ = bridge.send_event(0, Self::mrc_key_code(key), 0);
+            }
         }
         for key in released {
             let _ = bridge.send_event(1, Self::mrc_key_code(key), 0);
@@ -181,32 +202,91 @@ impl MrpMachine {
         bridge.present();
     }
 
-    /// Boots the application through its start.mr script: the bridge runs
-    /// the chunk, and the script loads any ext images itself via
-    /// `_com(800, ...)`.
+    /// Boots the application: runs start.mr on the script bridge first
+    /// (the SDK wrapper drives ext loading via `_com(800)`); when the
+    /// script fails or does not produce a registered ext handler, falls
+    /// back to loading `cfunction.ext` directly through the guest engine.
     fn boot_guest(&mut self) {
-        let mut bridge = ScriptBridge::new();
         let Ok(package) = crate::package::MrpPackage::parse(self.package.clone()) else {
             self.boot_error = Some("package reparse failed".to_string());
             return;
         };
-        bridge.load_package(package);
+        let ext = package
+            .read_entry("cfunction.ext")
+            .ok()
+            .filter(|v| !v.is_empty());
+
+        // Script path: start.mr runs on the VM and drives _com(800).
+        let mut bridge = ScriptBridge::new();
+        bridge.load_package(
+            crate::package::MrpPackage::parse(self.package.clone())
+                .expect("package parsed at load"),
+        );
         bridge.create_guest();
-        if let Err(error) = bridge.run_start_script() {
-            log::error!("script boot failed: {error}");
-            self.boot_error = Some(error);
+        let script_ok = bridge.run_start_script().is_ok()
+            && bridge
+                .vm
+                .guest
+                .as_ref()
+                .map(|guest| guest.c_function != 0)
+                .unwrap_or(false);
+        if script_ok {
+            self.screen = std::mem::replace(
+                &mut bridge.vm.screen,
+                crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            );
+            self.script = Some(bridge);
             return;
         }
-        log::info!(
-            "script booted: {:?} (missing globals: {:?})",
-            self.header.display_name,
-            bridge.missing_globals()
-        );
-        self.screen = std::mem::replace(
-            &mut bridge.vm.screen,
-            crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
-        );
-        self.script = Some(bridge);
+        let handler_registered = bridge
+            .vm
+            .guest
+            .as_ref()
+            .map(|guest| guest.c_function != 0)
+            .unwrap_or(false);
+
+        // Direct ext path: self-registering ext images skip the script.
+        let Some(ext) = ext else {
+            self.boot_error = Some("no cfunction.ext".to_string());
+            return;
+        };
+        if handler_registered {
+            // The script already loaded and registered the ext; keep it.
+            log::info!(
+                "script booted: {:?} (missing globals: {:?})",
+                self.header.display_name,
+                bridge.missing_globals()
+            );
+            self.screen = std::mem::replace(
+                &mut bridge.vm.screen,
+                crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            );
+            self.script = Some(bridge);
+            return;
+        }
+        let mut guest =
+            crate::cfunction::Guest::new(crate::cfunction::GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+        match guest.boot_ext(
+            &ext,
+            self.header.build_id,
+            self.header.build_version,
+            &mut screen,
+        ) {
+            Ok(()) => {
+                log::info!(
+                    "direct ext boot: {:?} (app id {})",
+                    self.header.display_name,
+                    self.header.build_id
+                );
+                self.screen = screen;
+                self.script = Some(ScriptBridge::with_guest(guest, self.screen.clone()));
+            }
+            Err(error) => {
+                log::error!("direct ext boot failed: {error}");
+                self.boot_error = Some(error.to_string());
+            }
+        }
     }
 
     /// MRC key codes expected by guest event handlers.

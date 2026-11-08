@@ -34,21 +34,25 @@ impl Instruction {
         (self.0 >> SIZE_OP) & mask(SIZE_A)
     }
 
+    /// Empirical MRP layout: op(6) A(8) B(10) C(8).
     pub fn c(self) -> u32 {
-        (self.0 >> (SIZE_OP + SIZE_A)) & mask(SIZE_C)
+        (self.0 >> 24) & 0xFF
     }
 
     pub fn b(self) -> u32 {
-        (self.0 >> (SIZE_OP + SIZE_A + SIZE_C)) & mask(SIZE_B)
+        (self.0 >> 14) & mask(10)
     }
 
     pub fn bx(self) -> i32 {
-        // Bx occupies the combined C+B range, after the A field.
-        ((self.0 >> (SIZE_OP + SIZE_A)) & mask(SIZE_BX)) as i32
+        // Empirically established for MRP: the ABx operand occupies the
+        // high 8 bits (24..32) of the word, not Lua's 18-bit C+B field.
+        ((self.0 >> 24) & 0xFF) as i32
     }
 
+    /// Signed variant for jump offsets: the same 8-bit field, sign-extended
+    /// (backward jumps encode 255 as -1 and so on).
     pub fn sbx(self) -> i32 {
-        self.bx() - OFFSET_SBX
+        ((self.0 >> 24) & 0xFF) as u8 as i8 as i32
     }
 }
 
@@ -162,11 +166,12 @@ mod tests {
     }
 
     #[test]
-    fn decodes_sbx_with_bias() {
-        // Bx = 0 decodes to sBx = -131071; Bx = 131071 decodes to 0.
-        assert_eq!(Instruction(0).sbx(), -OFFSET_SBX);
-        assert_eq!(Instruction(131071 << 14).sbx(), 0);
-        assert_eq!(Instruction(131072 << 14).sbx(), 1);
+    fn decodes_sbx_sign_extended() {
+        // The 8-bit jump field is sign-extended: 0 = 0, 255 = -1, 2 = +2.
+        assert_eq!(Instruction(0).sbx(), 0);
+        assert_eq!(Instruction(255 << 24).sbx(), -1);
+        assert_eq!(Instruction(2 << 24).sbx(), 2);
+        assert_eq!(Instruction(1 << 24).bx(), 1);
     }
 
     #[test]
