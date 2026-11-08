@@ -1032,10 +1032,31 @@ impl Guest {
                 self.draw_text(&buf[..ch.len_utf8()], x, y, color);
                 MR_SUCCESS
             }
-            120 | 121 | 147 | 148 => {
+            120 => {
+                // mr_drawBitmap(data, x, y, w, h, ...) — blit RGB565 pixels.
+                let data_addr = self.cpu.reg_get(self.cpu.mode(), R0);
+                let x = self.cpu.reg_get(self.cpu.mode(), R1);
+                let y = self.cpu.reg_get(self.cpu.mode(), R2);
+                let w = self.cpu.reg_get(self.cpu.mode(), R3);
+                let h = self.stack_arg(0);
+                let s_width = u32::from(self.config.screen_width);
+                let s_height = u32::from(self.config.screen_height);
+                for row in 0..h {
+                    for col in 0..w {
+                        let px = x + col;
+                        let py = y + row;
+                        if px < s_width && py < s_height {
+                            let pixel = self.r16(data_addr + (row * w + col) * 2);
+                            self.w16(SCREENBUF + (py * s_width + px) * 2, pixel);
+                        }
+                    }
+                }
+                MR_SUCCESS
+            }
+            121 | 147 | 148 => {
                 warn_once(
                     "bitmap",
-                    format!("mr_table slot {slot} (bitmap) is not implemented yet"),
+                    format!("mr_table slot {slot} (bitmap variant) is not implemented yet"),
                 );
                 0
             }
@@ -1954,6 +1975,51 @@ mod tests {
     /// Boots every reference sample through the real MrpMachine script
     /// path: start.mr runs on the VM, and the script loads ext images via
     /// _com(800). This is the corpus gate.
+
+    /// Visual verification: boot hello.mrp, run 60 frames, check the
+    /// screen buffer has non-background pixels (drawText output).
+    #[test]
+    #[ignore = "requires the local reference corpus under tmp/"]
+    fn hello_screen_has_text() {
+        let machine =
+            crate::emulator::MrpMachine::from_path("../../tmp/mrpemu/sdcard/mythroad/hello.mrp")
+                .expect("hello.mrp must load");
+        let mut machine = machine;
+        for _ in 0..60 {
+            machine.run_frame();
+        }
+        // Log which table slots the ext actually called.
+        if let Some(guest) = machine.guest_ref() {
+            for (slot, count) in guest.slot_calls.iter().enumerate() {
+                if *count > 0 {
+                    eprintln!("slot {slot}: called {count} times");
+                }
+            }
+        }
+        // The screen must not be all-background (the placeholder or blank).
+        let screen = machine.screen();
+        let pixels = screen.pixels();
+        let unique: std::collections::HashSet<u16> = pixels.iter().copied().collect();
+        eprintln!("unique colors on screen: {}", unique.len());
+        eprintln!(
+            "sample colors: {:?}",
+            unique.iter().take(10).collect::<Vec<_>>()
+        );
+        // The ext replaced the placeholder (0x1082/0x39E7) with its own
+        // drawing. Black+white = the classic terminal text rendering.
+        // drawText IS rendering if we see non-placeholder colors.
+        let has_placeholder = unique.contains(&0x1082) || unique.contains(&0x39E7);
+        assert!(
+            !has_placeholder && unique.len() >= 2,
+            "screen still shows placeholder colors ({:?}); drawText did not render",
+            unique
+        );
+        eprintln!(
+            "✓ drawText rendered: {} colors (black bg + white text)",
+            unique.len()
+        );
+    }
+
     #[test]
     #[ignore = "requires the local reference corpus under tmp/"]
     fn boots_reference_samples() {

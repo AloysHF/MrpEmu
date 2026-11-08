@@ -92,6 +92,13 @@ impl MrpMachine {
         &mut self.vfs
     }
 
+    /// Direct access to the booted guest (diagnostics and tests).
+    pub fn guest_ref(&self) -> Option<&crate::cfunction::Guest> {
+        self.script
+            .as_ref()
+            .and_then(|bridge| bridge.vm.guest.as_ref())
+    }
+
     /// Whether the running guest registered an ext event handler.
     pub fn ext_handler_registered(&self) -> bool {
         self.script
