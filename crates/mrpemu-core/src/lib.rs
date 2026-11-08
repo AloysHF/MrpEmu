@@ -26,6 +26,7 @@ pub mod opcodes;
 pub mod package;
 pub mod undump;
 pub mod vfs;
+pub mod vm;
 
 pub use cfunction::{Guest, GuestConfig};
 pub use display::Screen;
@@ -37,3 +38,4 @@ pub use opcodes::{Instruction, Op};
 pub use package::MrpPackage;
 pub use undump::{Chunk, Constant, Proto};
 pub use vfs::MemoryVfs;
+pub use vm::{Table, Value, Vm};

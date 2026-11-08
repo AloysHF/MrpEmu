@@ -43,7 +43,8 @@ impl Instruction {
     }
 
     pub fn bx(self) -> i32 {
-        ((self.0 >> SIZE_OP) & mask(SIZE_BX)) as i32
+        // Bx occupies the combined C+B range, after the A field.
+        ((self.0 >> (SIZE_OP + SIZE_A)) & mask(SIZE_BX)) as i32
     }
 
     pub fn sbx(self) -> i32 {
@@ -164,8 +165,8 @@ mod tests {
     fn decodes_sbx_with_bias() {
         // Bx = 0 decodes to sBx = -131071; Bx = 131071 decodes to 0.
         assert_eq!(Instruction(0).sbx(), -OFFSET_SBX);
-        assert_eq!(Instruction(131071 << 6).sbx(), 0);
-        assert_eq!(Instruction(131072 << 6).sbx(), 1);
+        assert_eq!(Instruction(131071 << 14).sbx(), 0);
+        assert_eq!(Instruction(131072 << 14).sbx(), 1);
     }
 
     #[test]
