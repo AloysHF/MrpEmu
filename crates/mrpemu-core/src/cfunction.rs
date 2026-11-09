@@ -462,12 +462,20 @@ impl Guest {
         self.store_guest_string(DataSlot::Entry, "_dsm");
         self.store_guest_string(DataSlot::StartFileParameter, "");
         // Large-memory pool starts untouched.
-        // Pointers to small scratch areas for the table/cfg slots.
-        for slot in [
-            DataSlot::CInternalTable,
-            DataSlot::CPortTable,
-            DataSlot::SmsCfgBuf,
-        ] {
+        // The internal state table (slot 23): an array of 7 pointers to
+        // live state cells. The helper consults mr_state (index 2) — it
+        // must be MR_STATE_RUN(1) or refresh/timer/event paths early-return.
+        let table = self.data_slot_address(DataSlot::CInternalTable);
+        self.set_data(DataSlot::CInternalTable, table);
+        // m0_files, vm_state, mr_state, bi, timer_p, timer_state,
+        // timer_run_without_pause
+        for (index, value) in [0u32, 0, 1, 0, 0, 0, 0].iter().enumerate() {
+            let cell = table + 64 + index as u32 * 4;
+            self.w32(table + index as u32 * 4, cell);
+            self.w32(cell, *value);
+        }
+        // Port table and SMS config buffer use self-referential scratch.
+        for slot in [DataSlot::CPortTable, DataSlot::SmsCfgBuf] {
             let address = self.data_slot_address(slot);
             self.set_data(slot, address);
         }
@@ -677,12 +685,27 @@ impl Guest {
 
         let trace = std::env::var("MRP_TRACE").is_ok();
         let mut ring: Vec<(u32, u32, u32)> = Vec::new();
+        let mut prev_pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
         for executed in 0..limit {
+            if trace {
+                let pc_now = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+                if executed > 0
+                    && pc_now != prev_pc.wrapping_add(4)
+                    && pc_now != prev_pc.wrapping_add(8)
+                    && !(BRIDGE_BASE..BRIDGE_BASE + (TABLE_SLOTS as u32) * 4).contains(&pc_now)
+                {
+                    eprintln!(
+                        "[branch {executed}] {prev_pc:#010x} -> {pc_now:#010x} lr={:010x}",
+                        self.cpu.reg_get(self.cpu.mode(), reg::LR)
+                    );
+                }
+                prev_pc = pc_now;
+            }
             if trace {
                 ring.push((
                     self.cpu.reg_get(self.cpu.mode(), reg::PC),
                     self.r32(self.cpu.reg_get(self.cpu.mode(), reg::PC)),
-                    self.cpu.reg_get(self.cpu.mode(), R0),
+                    self.cpu.reg_get(self.cpu.mode(), 9),
                 ));
                 if ring.len() > 24 {
                     ring.remove(0);
@@ -796,9 +819,12 @@ impl Guest {
         self.w32(sp + 4, 0);
         self.cpu.reg_set(self.cpu.mode(), reg::SP, sp);
         self.cpu.reg_set(self.cpu.mode(), R0, self.c_function_p);
-        // r9 carries the ext's globals base (start_of_ER_RW): the compiled
-        // ext addresses its own globals relative to r9 (fixR9 convention).
-        self.cpu.reg_set(self.cpu.mode(), 9, self.c_function_p);
+        // r9 (static base) must hold the ext's RW globals base — the value
+        // at P+0 (start_of_ER_RW), which the ext itself filled during boot
+        // via its wrapped mrc_malloc. Compiled ext code addresses globals
+        // as r9+offset (fixR9 convention); r9 = P would read garbage.
+        let rw_base = self.r32(self.c_function_p);
+        self.cpu.reg_set(self.cpu.mode(), 9, rw_base);
         self.cpu.reg_set(self.cpu.mode(), R1, code as u32);
         self.cpu.reg_set(self.cpu.mode(), R2, input);
         self.cpu.reg_set(self.cpu.mode(), R3, input_len as u32);
@@ -1210,6 +1236,13 @@ impl Guest {
                 0
             }
         }
+    }
+
+    /// Address of a cell in the internal state table
+    /// (0=m0_files, 1=vm_state, 2=mr_state, 3=bi, 4=timer_p,
+    /// 5=timer_state, 6=timer_run_without_pause).
+    fn internal_state_cell(&self, index: u32) -> u32 {
+        self.data_slot_address(DataSlot::CInternalTable) + 64 + index * 4
     }
 
     fn load_base(&self) -> u32 {
@@ -1772,17 +1805,22 @@ impl Guest {
         if let Some(timer) = self.timers.iter_mut().find(|timer| timer.id == id) {
             timer.interval = interval;
             timer.next_fire = std::time::Instant::now() + interval;
-            return;
+        } else {
+            self.timers.push(GuestTimer {
+                id,
+                interval,
+                next_fire: std::time::Instant::now() + interval,
+            });
         }
-        self.timers.push(GuestTimer {
-            id,
-            interval,
-            next_fire: std::time::Instant::now() + interval,
-        });
+        // Mirror MR_TIMER_STATE_RUNNING so helper-side paths unblock.
+        let cell = self.internal_state_cell(5);
+        self.w32(cell, 1);
     }
 
     pub fn timer_stop(&mut self, id: i32) {
         self.timers.retain(|timer| timer.id != id);
+        let cell = self.internal_state_cell(5);
+        self.w32(cell, 0);
     }
 
     pub fn draw_point(&mut self, x: u32, y: u32, color: u32) {
