@@ -350,6 +350,21 @@ pub struct Guest {
     pub slot_calls: [u64; TABLE_SLOTS],
     /// Loaded bitmaps: id → RGB565 pixel data.
     pub bitmaps: std::collections::HashMap<u32, Bitmap>,
+    /// Monotonically increasing handle for GUI controls (menu/dialog/text/edit/win).
+    pub next_gui_handle: u32,
+    /// The active platform menu (runtime-rendered, key-driven).
+    pub menu: Option<MenuState>,
+}
+
+/// A runtime menu: title, items, and the current selection. The platform
+/// menu owns key input while shown; OK selects, RSK cancels.
+#[derive(Debug, Clone, Default)]
+pub struct MenuState {
+    pub handle: u32,
+    pub title: Vec<u8>,
+    pub items: Vec<Vec<u8>>,
+    pub count: usize,
+    pub selection: usize,
 }
 
 /// A loaded bitmap with dimensions and RGB565 pixel data.
@@ -398,6 +413,8 @@ impl Guest {
             exit_requested: false,
             slot_calls: [0; TABLE_SLOTS],
             bitmaps: std::collections::HashMap::new(),
+            next_gui_handle: 0,
+            menu: None,
         };
         guest.install_table();
         // The heap starts as one whole free block; the offset `HEAP_LEN`
@@ -882,8 +899,18 @@ impl Guest {
                 MR_SUCCESS
             }
             29 => {
-                // mr_refreshBuffer: present the guest screen buffer.
-                self.refresh_screen(screen);
+                // mr_drawBitmap(bmp, x, y, w, h): official table slot 29.
+                // The helper's mrc_refreshScreen routes through this slot
+                // with the screen buffer as the source — present it too.
+                let src = self.cpu.reg_get(self.cpu.mode(), R0);
+                let x = self.cpu.reg_get(self.cpu.mode(), R1);
+                let y = self.cpu.reg_get(self.cpu.mode(), R2);
+                let w = self.cpu.reg_get(self.cpu.mode(), R3);
+                let h = self.stack_arg(0);
+                self.blit_from_address(src, x, y, w, h);
+                if src == SCREENBUF {
+                    self.refresh_screen(screen);
+                }
                 MR_SUCCESS
             }
             31 => {
@@ -959,13 +986,75 @@ impl Guest {
             59 | 60 => MR_FAILED,  // SMS/call: never dial out
             61 => 0,               // network id
             62 => MR_FAILED,       // connectWAP: offline
-            63..=79 => {
-                warn_once(
-                    "gui",
-                    format!("mr_table slot {slot} (GUI) is not implemented; returning 0"),
-                );
-                0
+            // GUI natives: menu/dialog/text/edit/win. Each Create returns a
+            // nonzero handle; Set/Show/Refresh return MR_SUCCESS; Release
+            // and GetText return success. This lets ext code that builds
+            // GUI-based UIs proceed past the creation gate.
+            63 => {
+                // mrc_menuCreate(title, num)
+                let title = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 128);
+                let count = self.cpu.reg_get(self.cpu.mode(), R1) as usize;
+                self.next_gui_handle += 1;
+                self.menu = Some(MenuState {
+                    handle: self.next_gui_handle,
+                    title,
+                    items: vec![Vec::new(); count],
+                    count,
+                    selection: 0,
+                });
+                self.next_gui_handle as i32
             }
+            64 => {
+                // mrc_menuSetItem(menu, text, index)
+                let text_addr = self.cpu.reg_get(self.cpu.mode(), R1);
+                let index = self.cpu.reg_get(self.cpu.mode(), R2) as usize;
+                let text = self.guest_cstring(text_addr, 128);
+                if let Some(menu) = self.menu.as_mut() {
+                    if index < menu.items.len() {
+                        menu.items[index] = text;
+                    }
+                }
+                MR_SUCCESS
+            }
+            65 => {
+                // mrc_menuShow(menu): render the menu and take key focus.
+                let menu = self.menu.get_or_insert_with(MenuState::default);
+                menu.handle = self.cpu.reg_get(self.cpu.mode(), R0);
+                menu.selection = 0;
+                self.render_menu();
+                MR_SUCCESS
+            }
+            67 => {
+                // mrc_menuRelease: close the menu.
+                self.menu = None;
+                MR_SUCCESS
+            }
+            68 => {
+                self.render_menu();
+                MR_SUCCESS
+            }
+
+            69 => {
+                self.next_gui_handle += 1;
+                self.next_gui_handle as i32
+            }
+            70..=71 => MR_SUCCESS, // dialogRelease/Refresh
+            72 => {
+                self.next_gui_handle += 1;
+                self.next_gui_handle as i32
+            }
+            73..=74 => MR_SUCCESS, // textRelease/Refresh
+            75 => {
+                self.next_gui_handle += 1;
+                self.next_gui_handle as i32
+            }
+            76 => MR_SUCCESS, // editRelease
+            77 => 0,          // editGetText → empty string (nil terminated at r0)
+            78 => {
+                self.next_gui_handle += 1;
+                self.next_gui_handle as i32
+            }
+            79 => MR_SUCCESS, // winRelease
             80 => {
                 // mr_getScreenInfo(struct)
                 let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
@@ -981,7 +1070,7 @@ impl Guest {
                 );
                 MR_FAILED
             }
-            113..=118 => 0, // md5 / sms cfg: tolerated stubs
+            113..=117 => 0, // md5 / sms cfg: tolerated stubs
             119 => {
                 // mr_drawPoint(x, y, color): draw into the guest buffer.
                 let x = self.cpu.reg_get(self.cpu.mode(), R0);
@@ -1062,6 +1151,12 @@ impl Guest {
                         }
                     }
                 }
+                MR_SUCCESS
+            }
+            118 => {
+                // _DispUpEx: the helper's mrc_refreshScreen presents the
+                // screen buffer rect through this slot.
+                self.refresh_screen(screen);
                 MR_SUCCESS
             }
             121 | 147 | 148 => {
@@ -1312,10 +1407,15 @@ impl Guest {
     fn swi_open(&mut self) -> i32 {
         let path = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 512);
         let name = String::from_utf8_lossy(&path).to_string();
-        log::info!("mr_open({name:?})");
-        // File content is served from the virtual file system; a missing
-        // file opens an empty handle so apps fail later, like on-device.
-        let data = self.file_lookup(&name).unwrap_or_default();
+        let mode = self.cpu.reg_get(self.cpu.mode(), R1);
+        log::info!("mr_open({name:?}, mode={mode:#x})");
+        // Missing files fail with handle 0 unless MR_FILE_CREATE (8) asks
+        // for creation — mirrors the on-device contract (`if (f)`).
+        let data = match self.file_lookup(&name) {
+            Some(data) => data,
+            None if mode & 8 != 0 => Vec::new(),
+            None => return 0,
+        };
         self.open_files.push(OpenFile {
             name,
             data,
@@ -1722,6 +1822,54 @@ impl Guest {
         self.config.screen_height
     }
 
+    /// Renders the active platform menu into the screen buffer: a blue
+    /// title bar, white background, and items with the current selection
+    /// drawn in inverse video.
+    pub fn render_menu(&mut self) {
+        let width = u32::from(self.config.screen_width);
+        let height = u32::from(self.config.screen_height);
+        for y in 0..height {
+            for x in 0..width {
+                let color = if y < 20 { 0x001F } else { 0xFFFF };
+                self.w16(SCREENBUF + (y * width + x) * 2, color);
+            }
+        }
+        let Some(menu) = self.menu.clone() else {
+            return;
+        };
+        self.draw_text(&menu.title, 4, 2, 0xFFFF);
+        for (index, item) in menu.items.iter().enumerate() {
+            let row_y = 24 + index as i32 * 18;
+            if row_y + 16 >= height as i32 {
+                break;
+            }
+            let selected = index == menu.selection;
+            if selected {
+                for y in 0..16u32 {
+                    for x in 0..width {
+                        let py = (row_y as u32 + y) * width + x;
+                        self.w16(SCREENBUF + py * 2, 0x001F);
+                    }
+                }
+            }
+            let color = if selected { 0xFFFF } else { 0x0000 };
+            self.draw_text(item, 12, row_y, color);
+        }
+        if menu.selection < menu.items.len() {
+            self.draw_text(b">", 2, 24 + menu.selection as i32 * 18, 0x03E0);
+        }
+    }
+
+    /// Moves the menu selection by `delta` (wrapping) and re-renders.
+    pub fn move_menu_selection(&mut self, delta: i32) {
+        if let Some(menu) = self.menu.as_mut() {
+            let count = menu.count.max(menu.items.len()).max(1);
+            let next = (menu.selection as i32 + delta).rem_euclid(count as i32) as usize;
+            menu.selection = next;
+        }
+        self.render_menu();
+    }
+
     /// Decodes GBK text and renders it into the screen buffer at (x, y)
     /// using the embedded Unicode bitmap font.
     pub fn draw_text(&mut self, text: &[u8], x: i32, y: i32, color: u16) {
@@ -1775,6 +1923,22 @@ impl Guest {
             let py = y + row;
             if px < s_width && py < s_height {
                 self.w16(SCREENBUF + (py * s_width + px) * 2, *pixel);
+            }
+        }
+    }
+
+    /// Blits a rectangle of raw RGB565 pixels from guest memory at `src`.
+    pub fn blit_from_address(&mut self, src: u32, x: u32, y: u32, w: u32, h: u32) {
+        let s_width = u32::from(self.config.screen_width);
+        let s_height = u32::from(self.config.screen_height);
+        for row in 0..h {
+            for col in 0..w {
+                let px = x + col;
+                let py = y + row;
+                if px < s_width && py < s_height {
+                    let pixel = self.r16(src + (row * w + col) * 2);
+                    self.w16(SCREENBUF + (py * s_width + px) * 2, pixel);
+                }
             }
         }
     }
@@ -2057,6 +2221,60 @@ mod tests {
             "✓ drawText rendered: {} colors (black bg + white text)",
             unique.len()
         );
+    }
+
+    /// Diagnostic: boot Maze.mrp, run 60 frames, dump all slot calls with
+    /// return values, screen color histogram, and missing natives.
+    #[test]
+    #[ignore = "requires the local reference corpus under tmp/"]
+    fn maze_slot_trace() {
+        let _ = env_logger::try_init();
+        let mut machine = crate::emulator::MrpMachine::from_path("../../tmp/scratch/Maze.mrp")
+            .expect("Maze.mrp must load");
+        for frame in 0..120 {
+            machine.run_frame();
+            for (press_frame, key) in [
+                (20u32, crate::input::MrpKey::Down),
+                (25, crate::input::MrpKey::Up),
+                (30, crate::input::MrpKey::Ok),
+            ] {
+                if frame == press_frame {
+                    machine.input_mut().press(key);
+                }
+                if frame == press_frame + 3 {
+                    machine.input_mut().release(key);
+                }
+            }
+        }
+        // Dump slot call counts
+        if let Some(guest) = machine.guest_ref() {
+            eprintln!("=== Maze.mrp slot calls after 60 frames ===");
+            for (slot, count) in guest.slot_calls.iter().enumerate() {
+                if *count > 0 {
+                    eprintln!("  slot {slot}: {count} calls");
+                }
+            }
+            eprintln!("  bitmaps loaded: {}", guest.bitmaps.len());
+            eprintln!("  exit_requested: {}", guest.exit_requested);
+        }
+        // Screen state
+        let screen = machine.screen();
+        let pixels = screen.pixels();
+        let mut histogram: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+        for &pixel in pixels {
+            *histogram.entry(pixel).or_insert(0) += 1;
+        }
+        let mut colors: Vec<_> = histogram.iter().collect();
+        colors.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+        eprintln!("=== screen histogram (top 10) ===");
+        for (color, count) in colors.iter().take(10) {
+            eprintln!(
+                "  {color:#06x}: {count} pixels ({:.1}%)",
+                **count as f64 / pixels.len() as f64 * 100.0
+            );
+        }
+        eprintln!("unique colors: {}", histogram.len());
+        let _ = machine.missing_globals();
     }
 
     #[test]

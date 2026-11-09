@@ -141,37 +141,76 @@ impl MrpMachine {
             return;
         }
 
-        // Key edges: the guest's own event handler runs first (the ext
-        // registers one via testCom); MR_IGNORE falls through to the
-        // script's dealevent.
+        // Event pump: the guest's event handler runs first (the ext
+        // registers via mr_c_function_new or testCom(2)); MR_IGNORE falls
+        // through to the script's dealevent.
         let current: BTreeSet<MrpKey> = self.input.pressed().collect();
         let pressed: Vec<MrpKey> = current.difference(&self.last_keys).copied().collect();
         let released: Vec<MrpKey> = self.last_keys.difference(&current).copied().collect();
         self.last_keys = current;
-        for key in pressed {
-            let handled = bridge
-                .vm
-                .guest
-                .as_mut()
-                .map(|guest| {
-                    let mut screen = std::mem::replace(
-                        &mut bridge.vm.screen,
-                        crate::display::Screen::new(
-                            crate::display::DEFAULT_WIDTH,
-                            crate::display::DEFAULT_HEIGHT,
-                        ),
-                    );
-                    let result = guest.send_event(0, Self::mrc_key_code(key), 0, &mut screen);
-                    bridge.vm.screen = screen;
-                    !matches!(result, Ok(1))
-                })
-                .unwrap_or(false);
-            if !handled {
-                let _ = bridge.send_event(0, Self::mrc_key_code(key), 0);
+
+        let pump = |bridge: &mut ScriptBridge, event_type: i32, p0: i32| {
+            // Try the guest's ext handler first.
+            if let Some(guest) = bridge.vm.guest.as_mut() {
+                let mut screen = std::mem::replace(
+                    &mut bridge.vm.screen,
+                    crate::display::Screen::new(
+                        crate::display::DEFAULT_WIDTH,
+                        crate::display::DEFAULT_HEIGHT,
+                    ),
+                );
+                let result = guest.send_event(event_type, p0, 0, &mut screen);
+                bridge.vm.screen = screen;
+                if !matches!(result, Ok(1)) {
+                    return; // handled by the ext
+                }
             }
-        }
-        for key in released {
-            let _ = bridge.send_event(1, Self::mrc_key_code(key), 0);
+            // Fall through to the script's dealevent.
+            let _ = bridge.send_event(event_type, p0, 0);
+        };
+
+        let menu_active = bridge
+            .vm
+            .guest
+            .as_ref()
+            .map(|guest| guest.menu.is_some())
+            .unwrap_or(false);
+        if menu_active {
+            // The platform menu owns key input while shown: Up/Down move
+            // the selection, OK selects (MR_MENU_SELECT carries the item
+            // index), RSK cancels (MR_MENU_RETURN), digits pick items.
+            let guest = bridge.vm.guest.as_mut().expect("menu implies guest");
+            if pressed.contains(&MrpKey::Up) {
+                guest.move_menu_selection(-1);
+            } else if pressed.contains(&MrpKey::Down) {
+                guest.move_menu_selection(1);
+            } else if pressed.contains(&MrpKey::Ok) || pressed.contains(&MrpKey::LeftSoft) {
+                let selection = guest.menu.as_ref().map(|m| m.selection).unwrap_or(0);
+                pump(bridge, 4, selection as i32);
+            } else if pressed.contains(&MrpKey::RightSoft) {
+                pump(bridge, 5, 0);
+            } else if let Some(digit) = pressed.iter().find_map(|key| match key {
+                MrpKey::Num0 => Some(9usize),
+                MrpKey::Num1 => Some(0),
+                MrpKey::Num2 => Some(1),
+                MrpKey::Num3 => Some(2),
+                MrpKey::Num4 => Some(3),
+                MrpKey::Num5 => Some(4),
+                MrpKey::Num6 => Some(5),
+                MrpKey::Num7 => Some(6),
+                MrpKey::Num8 => Some(7),
+                MrpKey::Num9 => Some(8),
+                _ => None,
+            }) {
+                pump(bridge, 4, digit as i32);
+            }
+        } else {
+            for key in pressed {
+                pump(bridge, 0, Self::mrc_key_code(key));
+            }
+            for key in released {
+                pump(bridge, 1, Self::mrc_key_code(key));
+            }
         }
 
         // Timers: restart the interval, then invoke the registered handler.
@@ -207,6 +246,9 @@ impl MrpMachine {
         }
 
         bridge.present();
+        // Sync the presented guest screen into the machine's public screen
+        // so frontends and tests observe post-boot drawing.
+        self.screen = bridge.vm.screen.clone();
     }
 
     /// Boots the application: runs start.mr on the script bridge first
