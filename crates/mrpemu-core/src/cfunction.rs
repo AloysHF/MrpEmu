@@ -747,6 +747,17 @@ impl Guest {
                 self.cpu.reg_set(self.cpu.mode(), reg::PC, lr);
                 continue;
             }
+            if trace && executed < 80 {
+                eprintln!(
+                    "[step {executed}] pc={pc:#010x} inst={:08x} r0={:#010x} r4={:#010x} r9={:#010x} lr={:#010x} sp={:#010x}",
+                    self.r32(pc),
+                    self.cpu.reg_get(self.cpu.mode(), R0),
+                    self.cpu.reg_get(self.cpu.mode(), 4),
+                    self.cpu.reg_get(self.cpu.mode(), 9),
+                    self.cpu.reg_get(self.cpu.mode(), reg::LR),
+                    self.cpu.reg_get(self.cpu.mode(), reg::SP),
+                );
+            }
             if pc >= MEM_SIZE || (pc & 3) != 0 {
                 return Err(MrpError::Unsupported(format!(
                     "guest PC out of range: {pc:#010x}"
@@ -1748,6 +1759,12 @@ impl Guest {
         param1: i32,
         screen: &mut crate::display::Screen,
     ) -> Result<i32, MrpError> {
+        if std::env::var("MRP_TRACE").is_ok() {
+            eprintln!(
+                "[send_event] type={event_type} p0={param0} p1={param1} evt_fn={:#x} cfn={:#x}",
+                self.event_function, self.c_function
+            );
+        }
         if self.event_function != 0 {
             self.cpu.reg_set(self.cpu.mode(), R0, event_type as u32);
             self.cpu.reg_set(self.cpu.mode(), R1, param0 as u32);
