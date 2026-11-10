@@ -557,12 +557,17 @@ impl Vm {
                     }
                 }
                 Op::Call => {
-                    // MRP shifts the 5.0 convention by one: the callee is
-                    // R[A-1] and the arguments start at R[A].
-                    let func_reg = base + a - 1;
-                    let nargs = if b == 0 { self.top - (base + a) } else { b - 1 };
-                    self.pad_stack(base + a + nargs.max(1));
-                    let args: Vec<Value> = self.stack[base + a..base + a + nargs].to_vec();
+                    // Lua 5.0/5.1 calling convention: the callee sits in
+                    // R[A], arguments follow at R[A+1] (B = arg count + 1,
+                    // C = result count + 1; zero means "to top"/"all").
+                    let func_reg = base + a;
+                    let nargs = if b == 0 {
+                        self.top.saturating_sub(base + a + 1)
+                    } else {
+                        b - 1
+                    };
+                    self.pad_stack(base + a + 1 + nargs.max(1));
+                    let args: Vec<Value> = self.stack[base + a + 1..base + a + 1 + nargs].to_vec();
                     let func = self.stack[func_reg].clone();
                     let nresults = if c == 0 {
                         None
@@ -573,13 +578,18 @@ impl Vm {
                     pc += 0;
                 }
                 Op::Tailcall => {
-                    let func_reg = base + a - 1;
-                    let nargs = if b == 0 { self.top - (base + a) } else { b - 1 };
-                    let args: Vec<Value> = self.stack[base + a..base + a + nargs].to_vec();
+                    let func_reg = base + a;
+                    let nargs = if b == 0 {
+                        self.top.saturating_sub(base + a + 1)
+                    } else {
+                        b - 1
+                    };
+                    let args: Vec<Value> = self.stack[base + a + 1..base + a + 1 + nargs].to_vec();
                     let func = self.stack[func_reg].clone();
                     match func {
                         Value::Closure(inner) => {
-                            // Replace the current frame in place.
+                            // Replace the current frame in place: arguments
+                            // move down onto the callee's register window.
                             self.close_upvals(base);
                             for (index, arg) in args.iter().enumerate() {
                                 self.set_stack(base + index, arg.clone());
@@ -894,17 +904,16 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opcodes::Instruction;
+    use crate::opcodes::{encode, encode_bx, Instruction};
     use crate::undump::{Constant, LocalVar};
 
     fn inst(op: Op, a: u32, b: u32, c: u32) -> Instruction {
-        Instruction((a << 6) | (b << 14) | (c << 24) | (op as u32))
+        encode(op, a, b, c)
     }
 
-    /// ABx instructions (LOADK/GETGLOBAL/SETGLOBAL/CLOSURE) carry the raw
-    /// operand in the high 8 bits.
+    /// ABx instructions (LOADK/GETGLOBAL/SETGLOBAL/CLOSURE).
     fn inst_bx(op: Op, a: u32, bx: u32) -> Instruction {
-        Instruction((a << 6) | (bx << 24) | (op as u32))
+        encode_bx(op, a, bx)
     }
 
     fn proto(constants: Vec<Constant>, code: Vec<Instruction>) -> Rc<Proto> {
