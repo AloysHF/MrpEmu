@@ -140,6 +140,11 @@ impl ScriptBridge {
             }),
         );
         self.vm.register("_com", Box::new(com_native));
+        // `TestCom` is the same dispatcher as `_com` (the SDK exposes both
+        // names); `_strCom` is the string-input variant used to read package
+        // files and to drive the ext loader.
+        self.vm.register("TestCom", Box::new(com_native));
+        self.vm.register("_strCom", Box::new(str_com_native));
         self.vm.register(
             "TestCom1",
             Box::new(|_vm, _args| Ok(vec![vh::num_value(1.0)])),
@@ -176,7 +181,37 @@ impl ScriptBridge {
                     .as_ref()
                     .map(|guest| guest.sysinfo_strings())
                     .unwrap_or_default();
+                let scrw = vm.screen.width();
+                let scrh = vm.screen.height();
+                // Glyph metrics the scripts read for text layout: the first
+                // CJK sample character and a Latin sample digit.
+                let dims = |ch| {
+                    unifont::get_glyph(ch)
+                        .map(|glyph| (glyph.get_width() as i32, 16))
+                        .unwrap_or((8, 16))
+                };
+                let (chw, chh) = dims('\u{70b9}');
+                let (ascw, asch) = dims('2');
                 Ok(vec![vh::table_value(|table| {
+                    // Platform field names (short forms plus the legacy
+                    // aliases older applications expect).
+                    table.set(vh::str_value(b"vmver"), vh::num_value(1968.0));
+                    table.set(vh::str_value(b"scrw"), vh::num_value(scrw as f32));
+                    table.set(vh::str_value(b"scrh"), vh::num_value(scrh as f32));
+                    table.set(vh::str_value(b"ScreenW"), vh::num_value(scrw as f32));
+                    table.set(vh::str_value(b"ScreenH"), vh::num_value(scrh as f32));
+                    table.set(vh::str_value(b"chw"), vh::num_value(chw as f32));
+                    table.set(vh::str_value(b"chh"), vh::num_value(chh as f32));
+                    table.set(vh::str_value(b"ChineseWidth"), vh::num_value(chw as f32));
+                    table.set(vh::str_value(b"ChineseHigh"), vh::num_value(chh as f32));
+                    table.set(vh::str_value(b"ascw"), vh::num_value(ascw as f32));
+                    table.set(vh::str_value(b"asch"), vh::num_value(asch as f32));
+                    table.set(vh::str_value(b"EnglishWidth"), vh::num_value(ascw as f32));
+                    table.set(vh::str_value(b"EnglishHigh"), vh::num_value(asch as f32));
+                    table.set(vh::str_value(b"packname"), vh::str_value(b""));
+                    table.set(vh::str_value(b"hsman"), vh::str_value(&vendor));
+                    table.set(vh::str_value(b"hstype"), vh::str_value(&device));
+                    table.set(vh::str_value(b"hsver"), vh::num_value(0.0));
                     table.set(vh::str_value(b"IMEI"), vh::str_value(&imei));
                     table.set(vh::str_value(b"IMSI"), vh::str_value(&imsi));
                     table.set(vh::str_value(b"manufactory"), vh::str_value(&vendor));
@@ -193,7 +228,7 @@ impl ScriptBridge {
                     table.set(vh::str_value(b"mon"), vh::num_value(now.1 as f32));
                     table.set(vh::str_value(b"day"), vh::num_value(now.2 as f32));
                     table.set(vh::str_value(b"hour"), vh::num_value(now.3 as f32));
-                    table.set(vh::str_value(b"minute"), vh::num_value(now.4 as f32));
+                    table.set(vh::str_value(b"min"), vh::num_value(now.4 as f32));
                     table.set(vh::str_value(b"sec"), vh::num_value(now.5 as f32));
                 })])
             }),
@@ -712,14 +747,27 @@ impl ScriptBridge {
 /// the registered handler with (code, input bytes).
 fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
     let input0 = args.first().and_then(vh::as_num).unwrap_or(0.0) as i32;
-    eprintln!("[_com] input0={input0:#x} nargs={}", args.len());
+    log::trace!("_com input0={input0:#x} nargs={}", args.len());
     match input0 {
+        // The startup handshake: `_com(3629, 2913)` marks the platform
+        // "BI" (boot-initialized) flag once the wrapper script is running.
+        3629 => {
+            let input1 = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as i32;
+            if input1 == 2913 {
+                if let Some(guest) = vm.guest.as_mut() {
+                    guest.bi |= 0x1;
+                }
+            }
+            Ok(vec![vh::num_value(0.0)])
+        }
+        // setgcthreshold: the interpreter has no incremental GC to tune.
+        403 => Ok(vec![vh::num_value(0.0)]),
         800 | 802 => {
             let code = args
-                .get(3)
+                .get(2)
                 .and_then(vh::as_num)
                 .map(|value| value as i32)
-                .unwrap_or(1);
+                .unwrap_or(0);
             let Some(Value::Str(ext)) = args.get(1) else {
                 return Ok(vec![vh::num_value(-1.0)]);
             };
@@ -774,7 +822,9 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
             );
             vm.screen = screen;
             match result {
-                Ok(value) => Ok(vec![vh::num_value(value as f32)]),
+                // The platform convention returns (output, ret); the output
+                // buffer is not exposed yet, so it stays empty.
+                Ok(value) => Ok(vec![vh::str_value(b""), vh::num_value(value as f32)]),
                 Err(error) => {
                     log::error!("_com(801) failed: {error}");
                     Ok(vec![vh::num_value(-1.0)])
@@ -784,6 +834,114 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
         other => {
             log::warn!("_com got unknown input0 {other:#x}");
             Ok(vec![vh::num_value(1.0)])
+        }
+    }
+}
+
+/// `_strCom(input0, payload, [code])`: the string-input dispatcher. The
+/// payload is either a Lua string or a `{ptr, len}` pair addressing guest
+/// memory. 601 reads a package file, 800 loads an ext image, 801 calls the
+/// registered handler with (code, payload bytes).
+fn str_com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
+    let input0 = args.first().and_then(vh::as_num).unwrap_or(0.0) as i32;
+    let payload: Vec<u8> = match args.get(1) {
+        Some(Value::Str(text)) => text.as_ref().clone(),
+        Some(Value::Table(pair)) => {
+            let cells: Vec<f32> = {
+                let table = pair.borrow();
+                table.array.iter().filter_map(Value::as_num).collect()
+            };
+            let (ptr, len) = (
+                cells.first().copied().unwrap_or(0.0) as u32,
+                cells.get(1).copied().unwrap_or(0.0) as u32,
+            );
+            let len = len.min(16 * 1024 * 1024);
+            match vm.guest.as_ref() {
+                Some(guest) => {
+                    let mut bytes = Vec::with_capacity(len as usize);
+                    for index in 0..len {
+                        let addr = ptr.wrapping_add(index);
+                        let word = guest.r32(addr & !3);
+                        bytes.push((word >> ((addr & 3) * 8)) as u8);
+                    }
+                    bytes
+                }
+                None => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    };
+    let code = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as i32;
+    match input0 {
+        // Read a file from the running package (gzip-transparent).
+        601 => {
+            let name = String::from_utf8_lossy(&payload).to_string();
+            match vm.package.as_ref() {
+                Some(package) => match package.read_entry(&name) {
+                    Ok(bytes) => Ok(vec![Value::str_from(&bytes)]),
+                    Err(error) => {
+                        log::error!("_strCom(601) read {name:?} failed: {error}");
+                        Ok(vec![Value::Nil])
+                    }
+                },
+                None => Ok(vec![Value::Nil]),
+            }
+        }
+        800 | 802 => {
+            if payload.is_empty() {
+                return Ok(vec![vh::num_value(-1.0)]);
+            }
+            let Some(guest) = vm.guest.as_mut() else {
+                return Ok(vec![vh::num_value(-1.0)]);
+            };
+            let mut screen = std::mem::replace(
+                &mut vm.screen,
+                crate::display::Screen::new(
+                    crate::display::DEFAULT_WIDTH,
+                    crate::display::DEFAULT_HEIGHT,
+                ),
+            );
+            let result = guest.load_ext_at(&payload, crate::cfunction::EXT_BASE, code, &mut screen);
+            vm.screen = screen;
+            match result {
+                Ok(value) => Ok(vec![vh::num_value(value as f32)]),
+                Err(error) => {
+                    log::error!("_strCom(800) failed: {error}");
+                    Ok(vec![vh::num_value(-1.0)])
+                }
+            }
+        }
+        801 => {
+            let Some(guest) = vm.guest.as_mut() else {
+                return Ok(vec![vh::num_value(-1.0)]);
+            };
+            let scratch = guest.scratch_buffer(&payload);
+            let mut screen = std::mem::replace(
+                &mut vm.screen,
+                crate::display::Screen::new(
+                    crate::display::DEFAULT_WIDTH,
+                    crate::display::DEFAULT_HEIGHT,
+                ),
+            );
+            let result = guest.call_c_function(
+                code,
+                scratch,
+                payload.len() as i32,
+                crate::cfunction::DEFAULT_INSTRUCTION_LIMIT,
+                &mut screen,
+            );
+            vm.screen = screen;
+            match result {
+                Ok(value) => Ok(vec![vh::str_value(b""), vh::num_value(value as f32)]),
+                Err(error) => {
+                    log::error!("_strCom(801) failed: {error}");
+                    Ok(vec![vh::str_value(b""), vh::num_value(-1.0)])
+                }
+            }
+        }
+        other => {
+            log::warn!("_strCom got unknown input0 {other:#x}");
+            Ok(vec![vh::num_value(-1.0)])
         }
     }
 }

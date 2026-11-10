@@ -670,6 +670,99 @@ impl Guest {
 
     // -- Guest execution -----------------------------------------------------
 
+    /// Evaluates the ARM condition field (bits 31-28) against the current
+    /// CPSR flags. Used for in-loop decodes that armv4t_emu never sees.
+    fn arm_cond_passed(&self, cond: u32) -> bool {
+        let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+        let n = (cpsr >> 31) & 1 == 1;
+        let z = (cpsr >> 30) & 1 == 1;
+        let c = (cpsr >> 29) & 1 == 1;
+        let v = (cpsr >> 28) & 1 == 1;
+        match cond & 0xF {
+            0x0 => z,            // EQ
+            0x1 => !z,           // NE
+            0x2 => c,            // CS
+            0x3 => !c,           // CC
+            0x4 => n,            // MI
+            0x5 => !n,           // PL
+            0x6 => v,            // VS
+            0x7 => !v,           // VC
+            0x8 => c && !z,      // HI
+            0x9 => !c || z,      // LS
+            0xA => n == v,       // GE
+            0xB => n != v,       // LT
+            0xC => !z && n == v, // GT
+            0xD => z || n != v,  // LE
+            0xE => true,         // AL
+            _ => false,          // NV / unpredictable: never execute
+        }
+    }
+
+    /// Executes one ARMv5TE DSP multiply instruction (`SMLAxy`, `SMULxy`,
+    /// `SMLAWy`, `SMULWy`, or `SMLALxy`), which armv4t_emu never sees.
+    ///
+    /// Encoding: `cond 0001 op Rd Rn Rs 1 x y b Rm` where `x`/`y` pick the
+    /// high (`T`) or low (`B`) halfword of `Rm`/`Rs` and `op` (bits23-20
+    /// plus bit7..4 shape) selects the variant.
+    fn dsp_multiply(&mut self, inst: u32, op: u32) {
+        let mode = self.cpu.mode();
+        let rd = (inst >> 16) & 0xF;
+        let rn = (inst >> 12) & 0xF;
+        let rs = (inst >> 8) & 0xF;
+        let rm = inst & 0xF;
+        let x = (inst >> 6) & 1; // Rm halfword: 0 = low (B), 1 = high (T)
+        let y = (inst >> 5) & 1; // Rs halfword
+        let half = |value: u32, high: u32| -> i32 {
+            let bits = if high != 0 {
+                (value >> 16) & 0xFFFF
+            } else {
+                value & 0xFFFF
+            };
+            (bits as u16) as i16 as i32
+        };
+        let a = half(self.cpu.reg_get(mode, rm as reg::Reg), x);
+        let b = half(self.cpu.reg_get(mode, rs as reg::Reg), y);
+        match op {
+            // SMLAxy: Rd = Rm[x] * Rs[y] + Rn
+            0x10 => {
+                let result = a
+                    .wrapping_mul(b)
+                    .wrapping_add(self.cpu.reg_get(mode, rn as reg::Reg) as i32);
+                self.cpu.reg_set(mode, rd as reg::Reg, result as u32);
+            }
+            // SMULxy: Rd = Rm[x] * Rs[y]
+            0x16 => {
+                self.cpu
+                    .reg_set(mode, rd as reg::Reg, a.wrapping_mul(b) as u32);
+            }
+            // SMLAWy (bit4=0): Rd = (Rm * Rs[y]) top 32 bits + Rn.
+            // SMULWy (bit4=1): the same product without the accumulate.
+            0x12 => {
+                let wide = (self.cpu.reg_get(mode, rm as reg::Reg) as i32) as i64;
+                let product = wide * b as i64;
+                let top = (product >> 16) as i32;
+                let result = if inst & 0x10 != 0 {
+                    top
+                } else {
+                    top.wrapping_add(self.cpu.reg_get(mode, rn as reg::Reg) as i32)
+                };
+                self.cpu.reg_set(mode, rd as reg::Reg, result as u32);
+            }
+            // SMLALxy: RdHi:RdLo += Rm[x] * Rs[y] (64-bit accumulate)
+            0x14 => {
+                let product = (a as i64).wrapping_mul(b as i64);
+                let hi = self.cpu.reg_get(mode, rd as reg::Reg) as u64;
+                let lo = self.cpu.reg_get(mode, rn as reg::Reg) as u64;
+                let acc = ((hi << 32) | lo).wrapping_add(product as u64);
+                self.cpu.reg_set(mode, rd as reg::Reg, (acc >> 32) as u32);
+                self.cpu.reg_set(mode, rn as reg::Reg, acc as u32);
+            }
+            // SMULWy handled by 0x12 with bit4 set; unreachable here because
+            // the caller masks bit4 = 0, but kept exhaustive for op values.
+            _ => {}
+        }
+    }
+
     /// Runs guest code from `entry` until it returns through LR==0 or jumps
     /// back to zero, intercepting bridge calls. Returns the guest's r0.
     pub fn run_guest(
@@ -718,11 +811,32 @@ impl Guest {
             let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
             if pc == 0 {
                 if trace {
+                    let r9 = self.cpu.reg_get(self.cpu.mode(), 9);
+                    let pool = self.r32(EXT_BASE + 0x60e4);
+                    let var_a = self.r32(r9.wrapping_add(0xf9c4).wrapping_add(0x84));
+                    let var_b = self.r32(0x00606144);
+                    eprintln!(
+                        "[ret] r9={r9:#x} pool@60e4={pool:#x} rw+fa48={var_a:#x} pc+lit+84={var_b:#x} r0={:#x}",
+                        self.cpu.reg_get(self.cpu.mode(), R0)
+                    );
+                }
+                if trace {
                     for (index, (rpc, rinst, rr0)) in ring.iter().enumerate() {
                         eprintln!("[return ring {index}] pc={rpc:#010x} inst={rinst:#010x} r0={rr0:#010x}");
                     }
                 }
                 return Ok(self.cpu.reg_get(self.cpu.mode(), R0));
+            }
+            if trace && pc == 0x0020_60b0 {
+                eprintln!(
+                    "[guard@60b0] r0={:#x} r1={:#x} cpsr={:#x} flags: n={} z={} c={}",
+                    self.cpu.reg_get(self.cpu.mode(), R0),
+                    self.cpu.reg_get(self.cpu.mode(), R1),
+                    self.cpu.reg_get(self.cpu.mode(), reg::CPSR),
+                    (self.cpu.reg_get(self.cpu.mode(), reg::CPSR) >> 31) & 1,
+                    (self.cpu.reg_get(self.cpu.mode(), reg::CPSR) >> 30) & 1,
+                    (self.cpu.reg_get(self.cpu.mode(), reg::CPSR) >> 29) & 1,
+                );
             }
             if (BRIDGE_BASE..bridge_end).contains(&pc) {
                 let slot = ((pc - BRIDGE_BASE) / 4) as usize;
@@ -734,11 +848,12 @@ impl Guest {
                 self.slot_calls[slot] += 1;
                 if std::env::var("MRP_TRACE").is_ok() {
                     eprintln!(
-                        "[dispatch] slot={slot} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x}",
+                        "[dispatch] slot={slot} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
                         self.cpu.reg_get(self.cpu.mode(), R0),
                         self.cpu.reg_get(self.cpu.mode(), R1),
                         self.cpu.reg_get(self.cpu.mode(), R2),
                         self.cpu.reg_get(self.cpu.mode(), R3),
+                        self.cpu.reg_get(self.cpu.mode(), reg::LR),
                     );
                 }
                 let result = self.dispatch(slot, screen);
@@ -773,23 +888,56 @@ impl Guest {
                     self.cpu.mode(),
                 );
             }
-            // ARMv5 `BLX register` (E12FFF3X): the ext images target the
+            // ARMv5 `BLX register` (x12FFF3X): the ext images target the
             // ARM9 (ARMv5TE) phones, and armv4t_emu stops at ARMv4, so the
             // loop decodes this one itself before handing the rest of the
-            // instruction set to the CPU core.
+            // instruction set to the CPU core. The top nibble carries the
+            // ARM condition: the runtime guards optional hooks with
+            // `cmp r0, #0; blxne r0`, so a failed condition must skip the
+            // call instead of branching through a null pointer.
             let inst = self.r32(pc);
             if (inst & 0x0FFF_FFF0) == 0x012F_FF30 {
-                let target = self.cpu.reg_get(self.cpu.mode(), (inst & 0xF) as reg::Reg);
-                self.cpu
-                    .reg_set(self.cpu.mode(), reg::LR, pc.wrapping_add(4));
-                self.cpu.reg_set(self.cpu.mode(), reg::PC, target & !1);
-                let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
-                let cpsr = if target & 1 != 0 {
-                    cpsr | (1 << 5)
+                if self.arm_cond_passed(inst >> 28) {
+                    let target = self.cpu.reg_get(self.cpu.mode(), (inst & 0xF) as reg::Reg);
+                    self.cpu
+                        .reg_set(self.cpu.mode(), reg::LR, pc.wrapping_add(4));
+                    self.cpu.reg_set(self.cpu.mode(), reg::PC, target & !1);
+                    let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+                    let cpsr = if target & 1 != 0 {
+                        cpsr | (1 << 5)
+                    } else {
+                        cpsr & !(1 << 5)
+                    };
+                    self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
                 } else {
-                    cpsr & !(1 << 5)
-                };
-                self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
+                    // Failed condition: the BLX is a no-op; advance past it.
+                    self.cpu
+                        .reg_set(self.cpu.mode(), reg::PC, pc.wrapping_add(4));
+                }
+                continue;
+            }
+            // ARMv5TE DSP multiply family (SMLAxy/SMULxy/SMLAWy/SMULWy/
+            // SMLALxy): armv4t_emu has no ARMv5TE, and the ext runtime uses
+            // `smlabb` for its index math (e.g. `col + row * width`), so the
+            // loop decodes these itself. Encoding: bits27-20 select the
+            // variant, bits7-4 = 1xy0/1xy1 pick the halfword operands.
+            let inst = self.r32(pc);
+            let dsp_op = (inst >> 20) & 0xFF;
+            let dsp_bits74 = (inst >> 4) & 0xF;
+            let dsp_match = match dsp_op {
+                // SMLAxy / SMLALxy / SMULxy: bits7-4 = 1xy0.
+                0x10 | 0x14 | 0x16 => (dsp_bits74 & 0b1001) == 0b1000,
+                // SMLAWy (bit4=0) / SMULWy (bit4=1): bits7-4 = 1xyb.
+                0x12 => (dsp_bits74 & 0b1000) == 0b1000,
+                _ => false,
+            };
+            if (inst & 0x0F00_0000) == 0x0100_0000 && dsp_match {
+                if self.arm_cond_passed(inst >> 28) {
+                    self.dsp_multiply(inst, dsp_op);
+                }
+                // Both paths resume at the following instruction.
+                self.cpu
+                    .reg_set(self.cpu.mode(), reg::PC, pc.wrapping_add(4));
                 continue;
             }
             self.cpu.step(&mut GuestMem(&mut self.mem));
@@ -951,19 +1099,26 @@ impl Guest {
                 MR_SUCCESS
             }
             31 => {
-                // mr_timerStart(id, interval)
-                let id = self.cpu.reg_get(self.cpu.mode(), R0) as i32;
-                let interval = self.cpu.reg_get(self.cpu.mode(), R1);
+                // mr_timerStart(time_ms): the SDK runtime schedules its own
+                // timer chain and hands the platform the next timeout; r1 is
+                // leftover register content, not an argument. The internal
+                // `mr_timer_state` cell goes to RUNNING.
+                let interval = self.cpu.reg_get(self.cpu.mode(), R0).max(1);
+                self.timers.retain(|timer| timer.id != 0);
                 self.timers.push(GuestTimer {
-                    id,
-                    interval: Duration::from_millis(u64::from(interval).max(1)),
-                    next_fire: Instant::now() + Duration::from_millis(u64::from(interval).max(1)),
+                    id: 0,
+                    interval: Duration::from_millis(u64::from(interval)),
+                    next_fire: Instant::now() + Duration::from_millis(u64::from(interval)),
                 });
+                let cell = self.internal_state_cell(5);
+                self.w32(cell, 1);
                 MR_SUCCESS
             }
             32 => {
-                let id = self.cpu.reg_get(self.cpu.mode(), R0) as i32;
-                self.timers.retain(|timer| timer.id != id);
+                // mr_timerStop(): stops the single platform timer.
+                self.timers.retain(|timer| timer.id != 0);
+                let cell = self.internal_state_cell(5);
+                self.w32(cell, 0);
                 MR_SUCCESS
             }
             33 => self.started_at.elapsed().as_millis() as u32 as i32,
@@ -1784,10 +1939,19 @@ impl Guest {
         Ok(1)
     }
 
-    /// Fires one due timer through the registered timer handler; ext apps
-    /// register theirs via `mr_testCom(3, fn)`. Falls back to a timer event
-    /// (type 1) when no handler was registered.
+    /// Fires one due timer. Ext apps receive the platform timer through
+    /// helper message 2 (`mrc_timerTimeout`); the SDK runtime stored the
+    /// guest callback when `mrc_timerStart` ran. Script-level apps fall
+    /// back to a key-style timer event.
     pub fn fire_timer(&mut self, screen: &mut crate::display::Screen) -> Result<i32, MrpError> {
+        log::debug!(
+            "fire_timer: cfn={:#x} timers={}",
+            self.c_function,
+            self.timers.len()
+        );
+        if self.c_function != 0 {
+            return self.call_c_function(2, 0, 0, DEFAULT_INSTRUCTION_LIMIT, screen);
+        }
         if self.timer_function != 0 {
             return self
                 .run_guest(self.timer_function, DEFAULT_INSTRUCTION_LIMIT, screen)
@@ -2286,7 +2450,7 @@ mod tests {
         let _ = env_logger::try_init();
         let mut machine = crate::emulator::MrpMachine::from_path("../../tmp/scratch/Maze.mrp")
             .expect("Maze.mrp must load");
-        for frame in 0..120 {
+        for frame in 0..400 {
             machine.run_frame();
             for (press_frame, key) in [
                 (20u32, crate::input::MrpKey::Down),
@@ -2329,6 +2493,42 @@ mod tests {
             );
         }
         eprintln!("unique colors: {}", histogram.len());
+        // Dump the final frame as a 24-bit BMP for visual inspection.
+        let (width, height) = (screen.width() as u32, screen.height() as u32);
+        let row_size = width * 3;
+        let padding = (4 - (row_size % 4)) % 4;
+        let pixel_bytes = (row_size + padding) * height;
+        let mut bmp = Vec::with_capacity(54 + pixel_bytes as usize);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(54 + pixel_bytes).to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&width.to_le_bytes());
+        bmp.extend_from_slice(&height.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&24u16.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&pixel_bytes.to_le_bytes());
+        bmp.extend_from_slice(&2835u32.to_le_bytes());
+        bmp.extend_from_slice(&2835u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        for y in (0..height).rev() {
+            for x in 0..width {
+                let pixel = pixels[(y * width + x) as usize];
+                let red = ((pixel >> 11) & 0x1F) as u8;
+                let green = ((pixel >> 5) & 0x3F) as u8;
+                let blue = (pixel & 0x1F) as u8;
+                bmp.extend_from_slice(&[
+                    (blue << 3) | (blue >> 2),
+                    (green << 2) | (green >> 4),
+                    (red << 3) | (red >> 2),
+                ]);
+            }
+            bmp.resize(bmp.len() + padding as usize, 0);
+        }
+        let _ = std::fs::write("../../tmp/scratch/maze_screen.bmp", &bmp);
         let _ = machine.missing_globals();
     }
 
@@ -2404,5 +2604,62 @@ mod tests {
             g.run_guest(EXT_BASE, 1_000, &mut screen),
             Err(MrpError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn smlabb_computes_row_width_col_index() {
+        let mut g = guest();
+        // The maze generator computes `col + row * width` with an ARMv5TE
+        // SMLABB (16x16 signed multiply-accumulate), which armv4t_emu
+        // cannot execute: r0 = r2(low16) * r0(low16) + r1 = 3*15 + 1 = 46.
+        g.w32(LG_MEM_BASE, 0xE3A0_000F); // mov    r0, #15      ; width
+        g.w32(LG_MEM_BASE + 4, 0xE3A0_2003); // mov    r2, #3       ; row
+        g.w32(LG_MEM_BASE + 8, 0xE3A0_1001); // mov    r1, #1       ; col
+        g.w32(LG_MEM_BASE + 12, 0xE100_1082); // smlabb r0, r2, r0, r1
+        g.w32(LG_MEM_BASE + 16, 0xE12F_FF1E); // bx     lr
+        let mut screen = crate::display::Screen::new(240, 320);
+        let result = g.run_guest(LG_MEM_BASE, 1_000, &mut screen);
+        assert!(
+            matches!(result, Ok(46)),
+            "smlabb index math, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_dsp_multiply_skips_when_condition_fails() {
+        let mut g = guest();
+        // A failed condition must leave the destination untouched.
+        g.w32(LG_MEM_BASE, 0xE3A0_0002); // mov    r0, #2
+        g.w32(LG_MEM_BASE + 4, 0xE350_0002); // cmp    r0, #2       ; equal: Z=1
+        g.w32(LG_MEM_BASE + 8, 0xE3A0_1005); // mov    r1, #5
+        g.w32(LG_MEM_BASE + 12, 0xE3A0_2003); // mov    r2, #3
+        g.w32(LG_MEM_BASE + 16, 0x1100_1082); // smlabbne r0, r2, r0, r1 (NE fails)
+        g.w32(LG_MEM_BASE + 20, 0xE12F_FF1E); // bx     lr
+        let mut screen = crate::display::Screen::new(240, 320);
+        let result = g.run_guest(LG_MEM_BASE, 1_000, &mut screen);
+        assert!(
+            matches!(result, Ok(2)),
+            "failed-cond SMLA is a no-op, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn conditional_blx_skips_when_condition_fails() {
+        // The SDK runtime guards its optional hooks with
+        // `cmp r0, #0; blxne r0` (e.g. inside mrc_refreshScreen). A failed
+        // condition must skip the call, not execute it as an unconditional
+        // BLX — otherwise a null hook would jump to zero and abort the
+        // caller mid-function.
+        let mut g = guest();
+        g.w32(LG_MEM_BASE, 0xE350_0000); // cmp   r0, #0   (r0 == 0 at entry)
+        g.w32(LG_MEM_BASE + 4, 0x112F_FF30); // blxne r0   (condition fails)
+        g.w32(LG_MEM_BASE + 8, 0xE3A0_002A); // mov   r0, #42
+        g.w32(LG_MEM_BASE + 12, 0xE12F_FF1E); // bx    lr    (lr == 0: return)
+        let mut screen = crate::display::Screen::new(240, 320);
+        let result = g.run_guest(LG_MEM_BASE, 1_000, &mut screen);
+        assert!(
+            matches!(result, Ok(42)),
+            "fall through past the failed blxne, got {result:?}"
+        );
     }
 }
