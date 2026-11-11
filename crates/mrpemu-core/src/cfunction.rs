@@ -592,6 +592,9 @@ impl Guest {
     pub fn guest_cstring(&self, addr: u32, max: usize) -> Vec<u8> {
         let mut out = Vec::new();
         let start = addr as usize;
+        if start >= self.mem.len() {
+            return out;
+        }
         let end = self.mem.len().min(start.saturating_add(max));
         for &byte in &self.mem[start..end] {
             if byte == 0 {
@@ -1006,7 +1009,18 @@ impl Guest {
                     .reg_set(self.cpu.mode(), reg::PC, pc.wrapping_add(4));
                 continue;
             }
-            self.cpu.step(&mut GuestMem(&mut self.mem));
+            // A guest-triggered debug_assert inside armv4t_emu (e.g. a
+            // misidentified ARMv5TE encoding reaching the ARMv4 decoder)
+            // must not abort the emulator.
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.cpu.step(&mut GuestMem(&mut self.mem))
+            }));
+            if step.is_err() {
+                return Err(MrpError::Unsupported(format!(
+                    "guest step panicked at pc {pc:#010x} inst {:#010x}",
+                    self.r32(pc)
+                )));
+            }
         }
         let hot: Vec<String> = self
             .slot_calls
