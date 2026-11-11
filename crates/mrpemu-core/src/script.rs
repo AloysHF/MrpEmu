@@ -21,6 +21,8 @@ use crate::vm::{Native, Value, Vm};
 pub struct ScriptBridge {
     pub vm: Vm,
     missing_globals: RefCell<HashSet<String>>,
+    /// File table captured by `load_package` before `create_guest` runs.
+    pending_files: Option<Vec<(String, Vec<u8>)>>,
 }
 
 impl Default for ScriptBridge {
@@ -35,6 +37,7 @@ impl ScriptBridge {
         let mut bridge = Self {
             vm: Vm::new(),
             missing_globals: RefCell::new(HashSet::new()),
+            pending_files: None,
         };
         bridge.register_natives();
         bridge
@@ -69,6 +72,10 @@ impl ScriptBridge {
             .collect();
         if let Some(guest) = self.vm.guest.as_mut() {
             guest.files = files;
+        } else {
+            // The guest is created after load (create_guest); remember the
+            // file table so the new guest still sees the package members.
+            self.pending_files = Some(files);
         }
         // The boot entry the runtime passes in (`_dsm` by default) plus the
         // empty start parameter — scripts branch on both.
@@ -98,9 +105,10 @@ impl ScriptBridge {
     /// Creates the ext guest with the default platform configuration.
     pub fn create_guest(&mut self) {
         if self.vm.guest.is_none() {
+            let files = self.pending_files.take().unwrap_or_default();
             self.vm.guest = Some(crate::cfunction::Guest::new(
                 crate::cfunction::GuestConfig::default(),
-                Vec::new(),
+                files,
             ));
         }
     }

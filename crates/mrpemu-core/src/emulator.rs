@@ -318,8 +318,20 @@ impl MrpMachine {
             log::info!("pure-script package: no ext to load");
             return;
         }
+        // Seed the guest with the package members so loader-stub exts can
+        // read the application resources through mr_readFile.
+        let packaged_files: Vec<(String, Vec<u8>)> = package
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    package.read_entry(&entry.name).unwrap_or_default(),
+                )
+            })
+            .collect();
         let mut guest =
-            crate::cfunction::Guest::new(crate::cfunction::GuestConfig::default(), Vec::new());
+            crate::cfunction::Guest::new(crate::cfunction::GuestConfig::default(), packaged_files);
         let mut screen = crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         let mut last_error = None;
         for (name, ext) in &ext_files {

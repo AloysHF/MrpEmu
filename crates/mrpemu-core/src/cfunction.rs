@@ -1394,6 +1394,21 @@ impl Guest {
                 warn_once("unzip", "mr_unzip is not implemented yet".to_string());
                 MR_FAILED
             }
+            // mr_getCharBitmap(ch, font, &width, &height): resolve the
+            // glyph box through the embedded Unicode font so text layout
+            // math works; the bitmap bytes themselves are not exported.
+            30 => {
+                let ch = self.cpu.reg_get(self.cpu.mode(), R0);
+                let width_ptr = self.cpu.reg_get(self.cpu.mode(), R2);
+                let height_ptr = self.cpu.reg_get(self.cpu.mode(), R3);
+                let glyph = char::from_u32(ch & 0xFFFF)
+                    .and_then(unifont::get_glyph)
+                    .map(|glyph| (glyph.get_width() as u32, 16u32))
+                    .unwrap_or((8, 16));
+                self.w32(width_ptr, glyph.0);
+                self.w32(height_ptr, glyph.1);
+                MR_SUCCESS
+            }
             other => {
                 warn_once(
                     "slot",
@@ -1637,10 +1652,12 @@ impl Guest {
         // mr_info(path) returns the file size, or MR_FAILED (-1).
         let path = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 512);
         let name = String::from_utf8_lossy(&path).to_string();
-        match self.file_lookup(&name) {
+        let result = match self.file_lookup(&name) {
             Some(data) => data.len() as i32,
             None => -1,
-        }
+        };
+        log::info!("mr_info({name:?}) -> {result}");
+        result
     }
 
     fn swi_write(&mut self) -> i32 {
@@ -1703,27 +1720,34 @@ impl Guest {
     /// `mr_readFile(name, buf, *len, lookfor)` — reads from the running
     /// package first (gzip-aware), then the virtual file system.
     fn swi_read_file(&mut self) -> i32 {
-        const MR_FAILED: i32 = -1;
+        // mr_readFile(name, &filelen, lookfor) → malloc'd buffer pointer
+        // (or 0). lookfor 1 asks for the ram file only, which this emulator
+        // does not host; everything else resolves from the package.
         let name_addr = self.cpu.reg_get(self.cpu.mode(), R0);
-        let buffer = self.cpu.reg_get(self.cpu.mode(), R1);
-        let len_ptr = self.cpu.reg_get(self.cpu.mode(), R2);
-        let lookfor = self.cpu.reg_get(self.cpu.mode(), R3);
+        let len_ptr = self.cpu.reg_get(self.cpu.mode(), R1);
+        let lookfor = self.cpu.reg_get(self.cpu.mode(), R2);
         let name = String::from_utf8_lossy(&self.guest_cstring(name_addr, 512)).to_string();
-        let Some(content) = self.file_lookup(&name) else {
-            return MR_FAILED;
+        let content = if lookfor == 1 {
+            None
+        } else {
+            self.file_lookup(&name)
         };
-        if lookfor != 0 {
-            return 1;
+        log::info!(
+            "mr_readFile({name:?}, lookfor={lookfor}) -> {} bytes",
+            content.as_ref().map(|data| data.len()).unwrap_or(0)
+        );
+        let Some(content) = content else {
+            self.w32(len_ptr, 0);
+            return 0;
+        };
+        let block = self.heap_malloc(content.len() as u32);
+        if block == 0 {
+            return 0;
         }
+        let base = block as usize;
+        self.mem[base..base + content.len()].copy_from_slice(&content);
         self.w32(len_ptr, content.len() as u32);
-        if buffer == 0 {
-            return content.len() as i32;
-        }
-        let base = buffer as usize;
-        if base + content.len() <= self.mem.len() {
-            self.mem[base..base + content.len()].copy_from_slice(&content);
-        }
-        content.len() as i32
+        block as i32
     }
 
     /// Looks up `name` in the file table seeded at boot (package members
