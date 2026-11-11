@@ -348,6 +348,8 @@ pub struct Guest {
     pub exit_requested: bool,
     /// Diagnostics: how often each table slot was called.
     pub slot_calls: [u64; TABLE_SLOTS],
+    /// Heap address of the single glyph export buffer (lazily allocated).
+    glyph_buf: u32,
     /// Loaded bitmaps: id → RGB565 pixel data.
     pub bitmaps: std::collections::HashMap<u32, Bitmap>,
     /// Monotonically increasing handle for GUI controls (menu/dialog/text/edit/win).
@@ -412,6 +414,7 @@ impl Guest {
             files,
             exit_requested: false,
             slot_calls: [0; TABLE_SLOTS],
+            glyph_buf: 0,
             bitmaps: std::collections::HashMap::new(),
             next_gui_handle: 0,
             menu: None,
@@ -1325,24 +1328,50 @@ impl Guest {
                 MR_SUCCESS
             }
             120 => {
-                // mr_drawBitmap(data, x, y, w, h, ...) — blit RGB565 pixels.
-                let data_addr = self.cpu.reg_get(self.cpu.mode(), R0);
-                let x = self.cpu.reg_get(self.cpu.mode(), R1);
-                let y = self.cpu.reg_get(self.cpu.mode(), R2);
+                // mr_drawBitmap(p, x, y, w, h, rop, transcolor, sx, sy, mw):
+                // the ten-argument sprite blit (rop modes, rotate/flip).
+                let p = self.cpu.reg_get(self.cpu.mode(), R0);
+                let x = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
+                let y = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
                 let w = self.cpu.reg_get(self.cpu.mode(), R3);
                 let h = self.stack_arg(0);
-                let s_width = u32::from(self.config.screen_width);
-                let s_height = u32::from(self.config.screen_height);
-                for row in 0..h {
-                    for col in 0..w {
-                        let px = x + col;
-                        let py = y + row;
-                        if px < s_width && py < s_height {
-                            let pixel = self.r16(data_addr + (row * w + col) * 2);
-                            self.w16(SCREENBUF + (py * s_width + px) * 2, pixel);
-                        }
-                    }
-                }
+                let rop = self.stack_arg(1);
+                let transcolor = self.stack_arg(2) as u16;
+                let sx = self.stack_arg(3) as i32;
+                let sy = self.stack_arg(4) as i32;
+                let mw = self.stack_arg(5);
+                self.draw_bitmap_rop(p, x, y, w, h, rop, transcolor, sx, sy, mw);
+                MR_SUCCESS
+            }
+            121 => {
+                // mr_drawBitmapEx(srcbmp*, dstbmp*, w, h, trans*, transcolor):
+                // affine 2x2-matrix blit between two bitmaps.
+                let srcbmp = self.cpu.reg_get(self.cpu.mode(), R0);
+                let dstbmp = self.cpu.reg_get(self.cpu.mode(), R1);
+                let w = self.cpu.reg_get(self.cpu.mode(), R2);
+                let h = self.cpu.reg_get(self.cpu.mode(), R3);
+                let p_trans = self.stack_arg(0);
+                let transcolor = self.stack_arg(1) as u16;
+                self.draw_bitmap_ex(srcbmp, dstbmp, w, h, p_trans, transcolor);
+                MR_SUCCESS
+            }
+            147 => {
+                // mr_transbitmapDraw(hTransBmp, dstBuf, destMaxW, destMaxH,
+                // sx, sy, width, height, dx, dy): RLE-matrix blit from a
+                // MrTransBitmap built by the ext's own transbitmap helpers.
+                let h_trans = self.cpu.reg_get(self.cpu.mode(), R0);
+                let dst_buf = self.cpu.reg_get(self.cpu.mode(), R1);
+                let dest_max_w = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
+                let dest_max_h = self.cpu.reg_get(self.cpu.mode(), R3) as i32;
+                let sx = self.stack_arg(0) as i32;
+                let sy = self.stack_arg(1) as i32;
+                let width = self.stack_arg(2) as i32;
+                let height = self.stack_arg(3) as i32;
+                let dx = self.stack_arg(4) as i32;
+                let dy = self.stack_arg(5) as i32;
+                self.transbitmap_draw(
+                    h_trans, dst_buf, dest_max_w, dest_max_h, sx, sy, width, height, dx, dy,
+                );
                 MR_SUCCESS
             }
             118 => {
@@ -1351,7 +1380,7 @@ impl Guest {
                 self.refresh_screen(screen);
                 MR_SUCCESS
             }
-            121 | 147 | 148 => {
+            148 => {
                 warn_once(
                     "bitmap",
                     format!("mr_table slot {slot} (bitmap variant) is not implemented yet"),
@@ -1391,23 +1420,62 @@ impl Guest {
             }
             137 => 0, // mr_updCrc
             141 => {
-                warn_once("unzip", "mr_unzip is not implemented yet".to_string());
-                MR_FAILED
+                // mr_unzip(inputBuf, inputLen, &outputBuf, &outputLen):
+                // gunzip into a fresh malloc'd buffer; the ext frees it.
+                let input_buf = self.cpu.reg_get(self.cpu.mode(), R0);
+                let input_len = self.cpu.reg_get(self.cpu.mode(), R1) as usize;
+                let out_buf_ptr = self.cpu.reg_get(self.cpu.mode(), R2);
+                let out_len_ptr = self.cpu.reg_get(self.cpu.mode(), R3);
+                let Some(input) = self.guest_bytes(input_buf, input_len) else {
+                    return MR_FAILED;
+                };
+                let Some(output) = gunzip_any(&input) else {
+                    warn_once("unzip", "mr_unzip: payload is not gzip/zlib".to_string());
+                    return MR_FAILED;
+                };
+                let block = self.heap_malloc(output.len() as u32);
+                if block == 0 {
+                    return MR_FAILED;
+                }
+                let base = block as usize;
+                self.mem[base..base + output.len()].copy_from_slice(&output);
+                self.w32(out_buf_ptr, block);
+                self.w32(out_len_ptr, output.len() as u32);
+                MR_SUCCESS
             }
-            // mr_getCharBitmap(ch, font, &width, &height): resolve the
-            // glyph box through the embedded Unicode font so text layout
-            // math works; the bitmap bytes themselves are not exported.
+            // mr_getCharBitmap(ch, font, &width, &height) → glyph bitmap
+            // pointer: 1 bit per pixel, rows aligned to 2 bytes, MSB first
+            // (the MTK font convention the ext renderers expect).
             30 => {
                 let ch = self.cpu.reg_get(self.cpu.mode(), R0);
                 let width_ptr = self.cpu.reg_get(self.cpu.mode(), R2);
                 let height_ptr = self.cpu.reg_get(self.cpu.mode(), R3);
-                let glyph = char::from_u32(ch & 0xFFFF)
-                    .and_then(unifont::get_glyph)
-                    .map(|glyph| (glyph.get_width() as u32, 16u32))
+                let glyph = char::from_u32(ch & 0xFFFF).and_then(unifont::get_glyph);
+                let (width, rows) = glyph
+                    .as_ref()
+                    .map(|glyph| (glyph.get_width(), 16))
                     .unwrap_or((8, 16));
-                self.w32(width_ptr, glyph.0);
-                self.w32(height_ptr, glyph.1);
-                MR_SUCCESS
+                let row_bytes = width.div_ceil(16) * 2;
+                let buffer = self.glyph_buffer();
+                for row in 0..rows {
+                    for byte in 0..row_bytes {
+                        let mut value = 0u8;
+                        for bit in 0..8 {
+                            let column = byte * 8 + bit;
+                            let set = glyph
+                                .as_ref()
+                                .and_then(|glyph| glyph.get_pixel(column, row).then_some(()))
+                                .is_some();
+                            if set {
+                                value |= 0x80 >> bit;
+                            }
+                        }
+                        self.w8(buffer + (row * row_bytes + byte) as u32, value);
+                    }
+                }
+                self.w32(width_ptr, width as u32);
+                self.w32(height_ptr, rows as u32);
+                buffer as i32
             }
             other => {
                 warn_once(
@@ -2267,9 +2335,302 @@ impl Guest {
         file.pos as i32
     }
 
+    /// Persistent buffer for `mr_getCharBitmap` glyph exports: 32 rows
+    /// × 2 bytes covers a 16-pixel-wide, 32-row glyph at 1 bit per pixel.
+    fn glyph_buffer(&mut self) -> u32 {
+        if self.glyph_buf == 0 {
+            self.glyph_buf = self.heap_malloc(64);
+        }
+        self.glyph_buf
+    }
+
     /// Milliseconds since the guest engine started (`mr_getTime` base).
     pub fn uptime_ms(&self) -> u32 {
         self.started_at.elapsed().as_millis() as u32
+    }
+
+    /// Screen-buffer plot with clipping.
+    fn screen_put(&mut self, x: i32, y: i32, color: u16) {
+        let width = u32::from(self.config.screen_width);
+        let height = u32::from(self.config.screen_height);
+        if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
+            let (x, y) = (x as u32, y as u32);
+            self.w16(SCREENBUF + (y * width + x) * 2, color);
+        }
+    }
+
+    /// Reads a guest byte range (bounds-safe).
+    pub fn guest_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        let base = addr as usize;
+        if base + len <= self.mem.len() {
+            Some(self.mem[base..base + len].to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// The platform `mr_drawBitmap`: a 16bpp blit with the bitmap raster
+    /// operations (OR/XOR/COPY/NOT/MERGENOT/ANDNOT/TRANSPARENT/AND/GRAY/
+    /// REVERSE) and, above `MR_SPRITE_TRANSPARENT`, the tile path with
+    /// rotate/flip bits. Mirrors the reference `_DrawBitmap`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_bitmap_rop(
+        &mut self,
+        p: u32,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        rop: u32,
+        transcolor: u16,
+        sx: i32,
+        sy: i32,
+        mw: u32,
+    ) {
+        let _ = (sx, sy, mw); // source-window form only used by tile draws
+        let screen_w = u32::from(self.config.screen_width) as i32;
+        let screen_h = u32::from(self.config.screen_height) as i32;
+        let (w, h) = (w as i32, h as i32);
+        let (min_x, min_y) = (x.max(0), y.max(0));
+        let (max_x, max_y) = (screen_w.min(x + w), screen_h.min(y + h));
+        if min_x >= max_x || min_y >= max_y {
+            return;
+        }
+        let sprite_path = rop > 0x400;
+        let bitmap_rop = rop & 0x3FF;
+        let rotate = (rop >> 11) & 0x3;
+        let flip = (rop >> 11) & 0x4 != 0;
+        let screen_stride = u32::from(self.config.screen_width);
+        let dst = |x: u32, y: u32| SCREENBUF + (y * screen_stride + x) * 2;
+        for dy in min_y..max_y {
+            for dx in min_x..max_x {
+                let lx = dx - x;
+                let ly = dy - y;
+                let src = if sprite_path && rotate != 0 {
+                    let (row, col) = match (rotate, flip) {
+                        (1, false) => (lx, w - 1 - ly),
+                        (1, true) => (h - 1 - lx, w - 1 - ly),
+                        (2, false) => (h - 1 - ly, w - 1 - lx),
+                        (2, true) => (ly, lx),
+                        (3, false) => (w - 1 - lx, ly),
+                        _ => (lx, ly),
+                    };
+                    p + ((row.max(0) * w + col.max(0)) as u32) * 2
+                } else {
+                    p + ((ly.max(0) * w + lx.max(0)) as u32) * 2
+                };
+                let value = self.r16(src);
+                let under = self.r16(dst(dx as u32, dy as u32));
+                let next = match (sprite_path, bitmap_rop) {
+                    (_, 2) | (_, 6) => {
+                        // BM_COPY / BM_TRANSPARENT (with the wrapper color).
+                        if bitmap_rop == 6 && value == transcolor {
+                            None
+                        } else {
+                            Some(value)
+                        }
+                    }
+                    (_, 0) => Some(under | value),  // BM_OR
+                    (_, 1) => Some(under ^ value),  // BM_XOR
+                    (_, 3) => Some(!value),         // BM_NOT
+                    (_, 4) => Some(under | !value), // BM_MERGENOT
+                    (_, 5) => Some(under & !value), // BM_ANDNOT
+                    (_, 7) => Some(under & value),  // BM_AND
+                    (_, 8) => {
+                        // BM_GRAY: luma to an equal-channel RGB565 gray.
+                        let red = ((value >> 11) & 0x1F) as u32;
+                        let green = ((value >> 5) & 0x3F) as u32;
+                        let blue = (value & 0x1F) as u32;
+                        let luma = (red * 8 * 299 + green * 4 * 587 + blue * 8 * 114) / 2000;
+                        let gray = luma.min(31) as u16;
+                        Some(gray << 11 | gray << 6 | gray)
+                    }
+                    (_, 9) => Some(!value), // BM_REVERSE
+                    _ => Some(value),
+                };
+                if let Some(value) = next {
+                    self.screen_put(dx, dy, value);
+                }
+            }
+        }
+    }
+
+    /// The platform `mr_drawBitmapEx`: affine blit between two bitmap
+    /// descriptors (`MrBitmapDraw{p,w,h,x,y}`) through a 2x2 matrix
+    /// (`MrTransMatrix{a,b,c,d,rop}`), 8.8 fixed point per the reference.
+    pub fn draw_bitmap_ex(
+        &mut self,
+        srcbmp_ptr: u32,
+        dstbmp_ptr: u32,
+        w: u32,
+        h: u32,
+        p_trans: u32,
+        transcolor: u16,
+    ) {
+        let read_bitmap = |guest: &Self, addr: u32| -> (u32, u32, u32, u32, u32) {
+            // {p:u32, w:u16, h:u16, x:u16, y:u16} -> (p, w, h, x, y)
+            (
+                guest.r32(addr),
+                guest.r16(addr + 4) as u32,
+                guest.r16(addr + 6) as u32,
+                guest.r16(addr + 8) as u32,
+                guest.r16(addr + 10) as u32,
+            )
+        };
+        let (src_p, src_w, _src_h, src_x, src_y) = read_bitmap(self, srcbmp_ptr);
+        let (dst_p, dst_w, dst_h, dst_x, dst_y) = read_bitmap(self, dstbmp_ptr);
+        if src_p == 0 || dst_p == 0 || src_w == 0 || dst_w == 0 || w == 0 || h == 0 {
+            return;
+        }
+        let a = i32::from(self.r16(p_trans) as i16);
+        let b = i32::from(self.r16(p_trans + 2) as i16);
+        let c = i32::from(self.r16(p_trans + 4) as i16);
+        let d = i32::from(self.r16(p_trans + 6) as i16);
+        let rop = self.r16(p_trans + 8);
+        let determinant = a * d - b * c;
+        if determinant == 0 {
+            return;
+        }
+        let (w, h) = (w as i32, h as i32);
+        let center_x = dst_x as i32 + w / 2;
+        let center_y = dst_y as i32 + h / 2;
+        let max_y = ((c.abs() * w + d.abs() * h) >> 9).min(dst_h as i32 - center_y);
+        let min_y = 0i32.max(-(center_y));
+        for dy in min_y..max_y {
+            let half_w_det = (w * determinant) >> 9;
+            let half_h_det = (h * determinant) >> 9;
+            let (max_by_d, min_by_d) = if d == 0 {
+                (999, -999)
+            } else {
+                (
+                    ((half_w_det + b * dy) / d).max((b * dy - half_w_det) / d),
+                    ((b * dy - half_w_det) / d).min((half_w_det + b * dy) / d),
+                )
+            };
+            let (max_by_c, min_by_c) = if c == 0 {
+                (999, -999)
+            } else {
+                (
+                    ((a * dy + half_h_det) / c).max((a * dy - half_h_det) / c),
+                    ((a * dy - half_h_det) / c).min((a * dy + half_h_det) / c),
+                )
+            };
+            let max_x = max_by_d.min(max_by_c).min(dst_w as i32 - center_x);
+            let min_x = min_by_d.min(min_by_c).max(-center_x);
+            if min_x >= max_x {
+                continue;
+            }
+            for dx in min_x..max_x {
+                let offset_y = ((((a * dy - c * dx) as i64) << 8) / i64::from(determinant)
+                    + i64::from(h / 2)) as i32;
+                let offset_x = ((((d * dx - b * dy) as i64) << 8) / i64::from(determinant)
+                    + i64::from(w / 2)) as i32;
+                if offset_y < 0 || offset_y >= h || offset_x < 0 || offset_x >= w {
+                    continue;
+                }
+                let src = src_p
+                    + (((offset_y + src_y as i32) * src_w as i32 + offset_x + src_x as i32) as u32)
+                        * 2;
+                let value = self.r16(src);
+                if rop & 0x3FF == 6 && value == transcolor {
+                    continue;
+                }
+                let dst = dst_p + (((dy + center_y) * dst_w as i32 + dx + center_x) as u32) * 2;
+                self.w16(dst, value);
+            }
+        }
+    }
+
+    /// The platform `mr_transbitmapDraw`: blit from an `MrTransBitmap`
+    /// (run-length matrix of opaque spans) into `dstBuf` with clipping,
+    /// mirroring the reference implementation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transbitmap_draw(
+        &mut self,
+        h_trans: u32,
+        dst_buf: u32,
+        dest_max_w: i32,
+        dest_max_h: i32,
+        sx: i32,
+        sy: i32,
+        width: i32,
+        height: i32,
+        dx: i32,
+        dy: i32,
+    ) {
+        // MrTransBitmap { p_data, width, height, max_width,
+        // trans_color(u16 + pad), p_matrix, mark_count, p_zion }
+        if h_trans == 0 || dst_buf == 0 {
+            return;
+        }
+        let p_data = self.r32(h_trans);
+        let max_width = self.r32(h_trans + 12) as i32;
+        let p_matrix = self.r32(h_trans + 20);
+        let mark_count = self.r32(h_trans + 24) as i32;
+        if p_data == 0
+            || p_matrix == 0
+            || dest_max_w <= 0
+            || dest_max_h <= 0
+            || max_width <= 0
+            || mark_count <= 0
+        {
+            return;
+        }
+        let (mut sx, mut sy, mut width, mut height, mut dx, mut dy) =
+            (sx, sy, width, height, dx, dy);
+        if dx < 0 {
+            sx -= dx;
+            width += dx;
+            dx = 0;
+        }
+        if dy < 0 {
+            sy -= dy;
+            height += dy;
+            dy = 0;
+        }
+        if sx < 0 {
+            width += sx;
+            dx -= sx;
+            sx = 0;
+        }
+        if sy < 0 {
+            height += sy;
+            dy -= sy;
+            sy = 0;
+        }
+        width = width.min(dest_max_w - dx);
+        height = height.min(dest_max_h - dy);
+        if width <= 0 || height <= 0 || dx >= dest_max_w || dy >= dest_max_h {
+            return;
+        }
+        for row in 0..height {
+            let matrix = p_matrix + ((sy + row) * 2 * mark_count) as u32;
+            let src_line = p_data + (max_width * (sy + row)) as u32;
+            let dst_line = dst_buf + (dest_max_w * (dy + row) + dx) as u32 * 2;
+            let pos1_e = sx + width;
+            for mark in 0..mark_count {
+                let start = i16::try_from(self.r16(matrix + (mark * 2) as u32)).unwrap_or(0) as i32;
+                if start < 0 {
+                    break;
+                }
+                let mut len =
+                    i16::try_from(self.r16(matrix + (mark * 2 + 2) as u32)).unwrap_or(0) as i32;
+                if mark == mark_count - 1 {
+                    // The last mark's top bit chains into the next row.
+                    len &= 0x3FFF;
+                }
+                let pos2_e = start + len;
+                if pos2_e < start || pos1_e < sx {
+                    continue;
+                }
+                let start = start.max(sx);
+                let end = pos2_e.min(pos1_e);
+                for offset in 0..(end - start) {
+                    let value = self.r16(src_line + (start + offset) as u32 * 2);
+                    self.w16(dst_line + (start - sx + offset) as u32 * 2, value);
+                }
+            }
+        }
     }
 
     /// Bresenham line into the screen buffer (clipped per pixel).
@@ -2370,6 +2731,20 @@ fn rgb_to_565(value: u32) -> u16 {
     let g = (value >> 8) & 0xFF;
     let b = value & 0xFF;
     rgb888_to_565(r, g, b)
+}
+
+/// Gunzip (or raw-zlib) decompression for `mr_unzip`; accepts both
+/// containers since the platform calls sites pass gzip members.
+fn gunzip_any(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if data.len() >= 2 && data[0] == 0x1F && data[1] == 0x8B {
+        let mut decoder = flate2::read::GzDecoder::new(data);
+        let mut out = Vec::new();
+        return decoder.read_to_end(&mut out).ok().map(|_| out);
+    }
+    let mut decoder = flate2::read::ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok().map(|_| out)
 }
 
 pub fn rgb888_to_565(r: u32, g: u32, b: u32) -> u16 {
