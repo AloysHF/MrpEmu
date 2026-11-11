@@ -46,6 +46,11 @@ impl MrpPackage {
         Self::parse(data)
     }
 
+    /// The raw package bytes (magic + header + entries + data).
+    pub fn raw_data(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn header(&self) -> &MrpHeader {
         &self.header
     }

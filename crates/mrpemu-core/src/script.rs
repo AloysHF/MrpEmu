@@ -1305,6 +1305,87 @@ impl ScriptBridge {
                 Ok(vec![vh::str_value(&encoded)])
             }),
         );
+        // `string.pack`/`unpack`: the platform's fixed-width binary format
+        // (i/I = 4 bytes, h/H = 2, b/B = 1, little-endian) that the SDK
+        // loader scripts use to marshal ext headers and struct data.
+        let pack_fmt = |format: &[u8], args: &[Value]| -> Result<Vec<u8>, String> {
+            let mut out = Vec::new();
+            for (offset, &conversion) in (1usize..).zip(format.iter()) {
+                let arg = args.get(offset).cloned().unwrap_or(Value::Nil);
+                let number = vh::as_num(&arg).unwrap_or(0.0) as i64;
+                match conversion {
+                    b'i' | b'I' => out.extend_from_slice(&(number as u32).to_le_bytes()),
+                    b'h' | b'H' => out.extend_from_slice(&(number as u16).to_le_bytes()),
+                    b'b' | b'B' => out.push(number as u8),
+                    other => return Err(format!("string.pack: unsupported format `{other}`")),
+                }
+            }
+            Ok(out)
+        };
+        let unpack_fmt = |format: &[u8],
+                          data: &[u8],
+                          init: usize|
+         -> Result<(Vec<Value>, usize), String> {
+            let mut values = Vec::new();
+            let mut cursor = init;
+            for &conversion in format {
+                let need = match conversion {
+                    b'i' | b'I' => 4,
+                    b'h' | b'H' => 2,
+                    b'b' | b'B' => 1,
+                    other => return Err(format!("string.unpack: unsupported format `{other}`")),
+                };
+                if cursor + need > data.len() {
+                    return Err("string.unpack: data too short".to_string());
+                }
+                let slice = &data[cursor..cursor + need];
+                let mut bytes = [0u8; 8];
+                bytes[..need].copy_from_slice(slice);
+                let value = match conversion {
+                    b'i' => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as f32,
+                    b'I' => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as f32,
+                    b'h' => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as f32,
+                    b'H' => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as f32,
+                    _ => bytes[0] as i8 as f32,
+                };
+                values.push(vh::num_value(value));
+                cursor += need;
+            }
+            Ok((values, cursor + 1))
+        };
+        self.vm.register_in(
+            "string",
+            "pack",
+            Rc::new(move |_vm, args| {
+                let format = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                Ok(vec![vh::str_value(&pack_fmt(&format, args)?)])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "unpack",
+            Rc::new(move |_vm, args| {
+                let format = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let data = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                let init = args
+                    .get(2)
+                    .and_then(vh::as_num)
+                    .map(|value| value.max(1.0) as usize - 1)
+                    .unwrap_or(0);
+                let (values, next) = unpack_fmt(&format, &data, init)?;
+                let mut out = values;
+                out.push(vh::num_value(next as f32));
+                Ok(out)
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "packLen",
+            Rc::new(move |_vm, args| {
+                let format = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                Ok(vec![vh::num_value(pack_fmt(&format, args)?.len() as f32)])
+            }),
+        );
         self.vm.register_in(
             "string",
             "find",
@@ -1999,7 +2080,7 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
                     crate::display::DEFAULT_HEIGHT,
                 ),
             );
-            let result = guest.call_c_function(
+            let result = guest.call_c_function_full(
                 code,
                 scratch,
                 payload.len() as i32,
@@ -2008,9 +2089,19 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
             );
             vm.screen = screen;
             match result {
-                // The platform convention returns (output, ret); the output
-                // buffer is not exposed yet, so it stays empty.
-                Ok(value) => Ok(vec![vh::str_value(b""), vh::num_value(value as f32)]),
+                // The platform convention returns (output, ret): the handler
+                // writes an output pointer/length through the trailing stack
+                // slots; expose those bytes to the script.
+                Ok((value, (output_ptr, output_len))) => {
+                    let output = if output_ptr != 0 && output_len > 0 {
+                        guest
+                            .guest_bytes(output_ptr, output_len as usize)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(vec![vh::str_value(&output), vh::num_value(value as f32)])
+                }
                 Err(error) => {
                     log::error!("_com(801) failed: {error}");
                     Ok(vec![vh::num_value(-1.0)])
@@ -2109,7 +2200,7 @@ fn str_com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
                     crate::display::DEFAULT_HEIGHT,
                 ),
             );
-            let result = guest.call_c_function(
+            let result = guest.call_c_function_full(
                 code,
                 scratch,
                 payload.len() as i32,
@@ -2118,7 +2209,16 @@ fn str_com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
             );
             vm.screen = screen;
             match result {
-                Ok(value) => Ok(vec![vh::str_value(b""), vh::num_value(value as f32)]),
+                Ok((value, (output_ptr, output_len))) => {
+                    let output = if output_ptr != 0 && output_len > 0 {
+                        guest
+                            .guest_bytes(output_ptr, output_len as usize)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(vec![vh::str_value(&output), vh::num_value(value as f32)])
+                }
                 Err(error) => {
                     log::error!("_strCom(801) failed: {error}");
                     Ok(vec![vh::str_value(b""), vh::num_value(-1.0)])

@@ -299,7 +299,7 @@ impl Default for GuestConfig {
             imsi: "000000000000000".to_string(),
             vendor: "MRPEMU".to_string(),
             device: "MRPEMU".to_string(),
-            pack_filename: "*A".to_string(),
+            pack_filename: "app.mrp".to_string(),
         }
     }
 }
@@ -768,14 +768,28 @@ impl Guest {
 
     /// Runs guest code from `entry` until it returns through LR==0 or jumps
     /// back to zero, intercepting bridge calls. Returns the guest's r0.
+    /// SP starts at `STACK_TOP`, LR at 0.
     pub fn run_guest(
         &mut self,
         entry: u32,
         limit: u64,
         screen: &mut crate::display::Screen,
     ) -> Result<u32, MrpError> {
+        self.run_guest_with_sp(entry, STACK_TOP, limit, screen)
+    }
+
+    /// [`Self::run_guest`] with an explicit initial SP — used when the
+    /// caller must place stack arguments for the guest (the `mr_c_function`
+    /// trailing output pointers).
+    pub fn run_guest_with_sp(
+        &mut self,
+        entry: u32,
+        sp: u32,
+        limit: u64,
+        screen: &mut crate::display::Screen,
+    ) -> Result<u32, MrpError> {
         self.cpu.reg_set(self.cpu.mode(), reg::PC, entry);
-        self.cpu.reg_set(self.cpu.mode(), reg::SP, STACK_TOP);
+        self.cpu.reg_set(self.cpu.mode(), reg::SP, sp);
         self.cpu.reg_set(self.cpu.mode(), reg::LR, 0);
         let bridge_end = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4;
 
@@ -960,10 +974,8 @@ impl Guest {
                         self.w32(aligned, low);
                         self.w32(aligned + 4, high);
                     }
-                    if !pre_index || writeback {
-                        if rn != 15 {
-                            self.cpu.reg_set(self.cpu.mode(), rn as reg::Reg, target);
-                        }
+                    if (!pre_index || writeback) && rn != 15 {
+                        self.cpu.reg_set(self.cpu.mode(), rn as reg::Reg, target);
                     }
                 }
                 self.cpu
@@ -1019,18 +1031,44 @@ impl Guest {
         limit: u64,
         screen: &mut crate::display::Screen,
     ) -> Result<i32, MrpError> {
+        let (ret, _output) = self.call_c_function_full(code, input, input_len, limit, screen)?;
+        Ok(ret)
+    }
+
+    /// Like [`Self::call_c_function`], additionally returning the
+    /// `(output_ptr, output_len)` the handler wrote into the trailing
+    /// stack slots (the `mr_c_function` out-parameters).
+    pub fn call_c_function_full(
+        &mut self,
+        code: i32,
+        input: u32,
+        input_len: i32,
+        limit: u64,
+        screen: &mut crate::display::Screen,
+    ) -> Result<(i32, (u32, u32)), MrpError> {
         if self.c_function == 0 {
             return Err(MrpError::Unsupported(
                 "ext has not registered its event handler".to_string(),
             ));
         }
-        // The handler's trailing output arguments live on the stack; push
-        // two zero words for them.
-        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
-        let sp = sp.wrapping_sub(8) & !7;
-        self.w32(sp, 0);
-        self.w32(sp + 4, 0);
-        self.cpu.reg_set(self.cpu.mode(), reg::SP, sp);
+        // The handler's trailing arguments (`uint8** output`,
+        // `int32* output_len`) live on the stack at SP+0/SP+4 as seen at
+        // handler entry. run_guest resets SP to STACK_TOP, so lower the
+        // entry SP to make room for the handler's own frame, park the two
+        // slot words above the handler's frame region, and point them at
+        // heap scratch buffers that survive any stack depth.
+        let scratch1 = self.heap_malloc(8);
+        let scratch2 = self.heap_malloc(8);
+        if scratch1 == 0 || scratch2 == 0 {
+            return Err(MrpError::Unsupported(
+                "call_c_function: heap exhausted for output scratch".to_string(),
+            ));
+        }
+        self.w32(scratch1, 0);
+        self.w32(scratch2, 0);
+        const HANDLER_SP: u32 = STACK_TOP - 0x200;
+        self.w32(HANDLER_SP, scratch1);
+        self.w32(HANDLER_SP + 4, scratch2);
         self.cpu.reg_set(self.cpu.mode(), R0, self.c_function_p);
         // r9 (static base) must hold the ext's RW globals base — the value
         // at P+0 (start_of_ER_RW), which the ext itself filled during boot
@@ -1041,12 +1079,10 @@ impl Guest {
         self.cpu.reg_set(self.cpu.mode(), R1, code as u32);
         self.cpu.reg_set(self.cpu.mode(), R2, input);
         self.cpu.reg_set(self.cpu.mode(), R3, input_len as u32);
-        let result = self.run_guest(self.c_function, limit, screen)?;
-        // Restore the stack the handler left us with.
-        let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
-        self.cpu
-            .reg_set(self.cpu.mode(), reg::SP, (sp + 8).min(STACK_TOP));
-        Ok(result as i32)
+        let result = self.run_guest_with_sp(self.c_function, HANDLER_SP, limit, screen)?;
+        let output_ptr = self.r32(scratch1);
+        let output_len = self.r32(scratch2);
+        Ok((result as i32, (output_ptr, output_len)))
     }
 
     // -- mrc_ host implementations (the bridge) ------------------------------
@@ -1976,15 +2012,16 @@ impl Guest {
                 // `mr_L_optint(L, 3, 0)` — no Lua frame on this path, so the
                 // platform default 0 applies.
                 let buffer = input1;
-                let code = 0u32;
+                let code = 0u32; // mr_L_optint(L, 3, 0) platform default
+                let _ = code;
                 if buffer == 0 {
                     return -1; // MR_FAILED
                 }
                 self.w32(buffer, TABLE_BASE);
                 let entry = buffer + 8;
                 let mut screen = crate::display::Screen::new(
-                    u16::try_from(self.config.screen_width).unwrap_or(240),
-                    u16::try_from(self.config.screen_height).unwrap_or(320),
+                    self.config.screen_width,
+                    self.config.screen_height,
                 );
                 let result = self
                     .run_guest(entry, DEFAULT_INSTRUCTION_LIMIT, &mut screen)

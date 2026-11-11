@@ -70,12 +70,19 @@ fn corpus_smoke_sample() {
 
     let mut tally: std::collections::BTreeMap<&'static str, Vec<String>> =
         std::collections::BTreeMap::new();
+    // CORPUS_ONLY=<substring> restricts the run to matching packages.
+    let only = std::env::var("CORPUS_ONLY").ok();
     for path in &picks {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?")
             .to_string();
+        if let Some(only) = &only {
+            if !name.contains(only.as_str()) {
+                continue;
+            }
+        }
         // A guest panicking inside the ARM core must not abort the whole
         // sweep; classify it and keep walking the corpus.
         let outcome = std::panic::catch_unwind(|| -> &'static str {
@@ -105,4 +112,5 @@ fn corpus_smoke_sample() {
     for (outcome, names) in &tally {
         eprintln!("{outcome:12} {:4}  e.g. {}", names.len(), names[0]);
     }
+    let _ = std::env::var("CORPUS_ONLY");
 }

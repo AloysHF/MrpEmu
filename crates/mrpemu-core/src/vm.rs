@@ -206,6 +206,14 @@ impl Table {
 
 pub type Native = Rc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, String>>;
 
+/// Diagnostic switch: when `MRP_TRACE_CALLS` is set at boot, every Call
+/// whose callee register holds nil is logged with its chunk and pc.
+static CALL_NIL_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn call_nil_trace_enabled() -> bool {
+    *CALL_NIL_TRACE.get_or_init(|| std::env::var("MRP_TRACE_CALLS").is_ok())
+}
+
 /// Errors surfaced by the interpreter (script `error()` and internal faults).
 #[derive(Debug, Clone)]
 pub struct VmError(pub String);
@@ -603,6 +611,19 @@ impl Vm {
                     // R[A], arguments follow at R[A+1] (B = arg count + 1,
                     // C = result count + 1; zero means "to top"/"all").
                     let func_reg = base + a;
+                    if call_nil_trace_enabled()
+                        && matches!(self.stack.get(func_reg), Some(Value::Nil))
+                    {
+                        let source = closure
+                            .proto
+                            .source
+                            .as_deref()
+                            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[call-nil {source} pc={pc}] a={a} b={b} c={c} callee_reg=R[{func_reg}]"
+                        );
+                    }
                     let nargs = if b == 0 {
                         self.top.saturating_sub(base + a + 1)
                     } else {
