@@ -919,6 +919,57 @@ impl Guest {
                 }
                 continue;
             }
+            // ARMv5TE `LDRD`/`STRD` (double-word load/store): armv4t_emu's
+            // halfword path debug-asserts on the encoding, which aborts the
+            // emulator in debug builds. Encoding:
+            // cond 000 P U I W L Rn Rd imm4H 1101 imm4L.
+            let inst = self.r32(pc);
+            if (inst & 0x0E00_00F0) == 0x0000_00D0 {
+                let cond_ok = self.arm_cond_passed(inst >> 28);
+                if cond_ok {
+                    let pre_index = inst & 0x0200_0000 != 0; // P
+                    let up = inst & 0x0080_0000 != 0; // U
+                    let writeback = inst & 0x0020_0000 != 0; // W
+                    let load = inst & 0x0010_0000 != 0; // L
+                    let rn = (inst >> 16) & 0xF;
+                    let rd = (inst >> 12) & 0xF;
+                    let imm = (((inst >> 8) & 0xF) << 4) | (inst & 0xF);
+                    let offset = (imm * 4) as i32;
+                    let base = if rn == 15 {
+                        pc.wrapping_add(8)
+                    } else {
+                        self.cpu.reg_get(self.cpu.mode(), rn as reg::Reg)
+                    };
+                    let target = if up {
+                        base.wrapping_add(offset as u32)
+                    } else {
+                        base.wrapping_sub(offset as u32)
+                    };
+                    let addr = if pre_index { target } else { base };
+                    let aligned = addr & !3;
+                    let rd_pair = rd & !1;
+                    if load {
+                        let low = self.r32(aligned);
+                        let high = self.r32(aligned + 4);
+                        self.cpu.reg_set(self.cpu.mode(), rd_pair as reg::Reg, low);
+                        self.cpu
+                            .reg_set(self.cpu.mode(), (rd_pair + 1) as reg::Reg, high);
+                    } else {
+                        let low = self.cpu.reg_get(self.cpu.mode(), rd_pair as reg::Reg);
+                        let high = self.cpu.reg_get(self.cpu.mode(), (rd_pair + 1) as reg::Reg);
+                        self.w32(aligned, low);
+                        self.w32(aligned + 4, high);
+                    }
+                    if !pre_index || writeback {
+                        if rn != 15 {
+                            self.cpu.reg_set(self.cpu.mode(), rn as reg::Reg, target);
+                        }
+                    }
+                }
+                self.cpu
+                    .reg_set(self.cpu.mode(), reg::PC, pc.wrapping_add(4));
+                continue;
+            }
             // ARMv5TE DSP multiply family (SMLAxy/SMULxy/SMLAWy/SMULWy/
             // SMLALxy): armv4t_emu has no ARMv5TE, and the ext runtime uses
             // `smlabb` for its index math (e.g. `col + row * width`), so the
@@ -1915,8 +1966,41 @@ impl Guest {
                 self.bi &= !0x2;
                 0
             }
+            // Secondary ext load (the loader-chain flow): the ext hands the
+            // platform a buffer holding a full ext image; the runtime writes
+            // the function-table pointer at its base and executes
+            // buffer+8 with r0 = code. This mirrors the platform's
+            // `_mr_TestCom` case 800.
+            800 => {
+                // The C-level `_mr_TestCom(?, 800, buf)` reads its code via
+                // `mr_L_optint(L, 3, 0)` — no Lua frame on this path, so the
+                // platform default 0 applies.
+                let buffer = input1;
+                let code = 0u32;
+                if buffer == 0 {
+                    return -1; // MR_FAILED
+                }
+                self.w32(buffer, TABLE_BASE);
+                let entry = buffer + 8;
+                let mut screen = crate::display::Screen::new(
+                    u16::try_from(self.config.screen_width).unwrap_or(240),
+                    u16::try_from(self.config.screen_height).unwrap_or(320),
+                );
+                let result = self
+                    .run_guest(entry, DEFAULT_INSTRUCTION_LIMIT, &mut screen)
+                    .map(|value| value as i32)
+                    .unwrap_or(-1); // MR_FAILED
+                self.refresh_screen(&mut screen);
+                result
+            }
             other => {
-                warn_once("testcom", format!("mr_testCom got unknown code {other:#x}"));
+                warn_once(
+                    "testcom",
+                    format!(
+                        "mr_testCom got unknown code {other:#x} (arg {input1:#x}, stack {:#x})",
+                        self.stack_arg(0)
+                    ),
+                );
                 1 // MR_IGNORE
             }
         }
