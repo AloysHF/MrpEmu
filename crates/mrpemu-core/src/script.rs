@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use crate::package::MrpPackage;
 use crate::value_helpers as vh;
-use crate::vm::{Value, Vm};
+use crate::vm::{Native, Value, Vm};
 
 /// Sentinel native slot backing unknown globals: scripts probing optional
 /// API surface get a callable that returns nothing instead of crashing.
@@ -70,7 +70,29 @@ impl ScriptBridge {
         if let Some(guest) = self.vm.guest.as_mut() {
             guest.files = files;
         }
+        // The boot entry the runtime passes in (`_dsm` by default) plus the
+        // empty start parameter — scripts branch on both.
+        self.vm
+            .globals
+            .borrow_mut()
+            .set(vh::str_value(b"_mr_entry"), vh::str_value(b"_dsm"));
+        self.vm
+            .globals
+            .borrow_mut()
+            .set(vh::str_value(b"_mr_param"), vh::str_value(b""));
+        // Platform-visible package identity: the header app id and pack
+        // file name back the `o_APPID` / `contentMrp` globals.
+        let app_id = package.header().app_id;
+        let pack_name = package.header().internal_name.clone();
         self.vm.package = Some(package);
+        self.vm
+            .globals
+            .borrow_mut()
+            .set(vh::str_value(b"o_APPID"), vh::num_value(app_id as f32));
+        self.vm.globals.borrow_mut().set(
+            vh::str_value(b"contentMrp"),
+            vh::str_value(pack_name.as_bytes()),
+        );
     }
 
     /// Creates the ext guest with the default platform configuration.
@@ -100,6 +122,22 @@ impl ScriptBridge {
 
     /// Calls the script's `dealevent(type, param0, param1)` global.
     pub fn send_event(&mut self, event_type: i32, p0: i32, p1: i32) -> Result<(), String> {
+        // A handler registered through `_com(2, fn)` takes priority over the
+        // conventional `dealevent` global.
+        let registered = self.vm.globals.borrow().get(&vh::str_value(b"__event_cb"));
+        if let Value::Closure(closure) = registered {
+            return self
+                .vm
+                .call_closure(
+                    closure,
+                    &[
+                        vh::num_value(event_type as f32),
+                        vh::num_value(p0 as f32),
+                        vh::num_value(p1 as f32),
+                    ],
+                )
+                .map(|_| ());
+        }
         let handler = self.vm.globals.borrow().get(&vh::str_value(b"dealevent"));
         if matches!(handler, Value::Nil) {
             return Ok(());
@@ -116,6 +154,20 @@ impl ScriptBridge {
             .map(|_| ())
     }
 
+    /// Fires a due script timer: `_com(3, fn)` registrations first, then the
+    /// conventional `dealtimer` global.
+    pub fn fire_script_timer(&mut self) -> Result<(), String> {
+        let registered = self.vm.globals.borrow().get(&vh::str_value(b"__timer_cb"));
+        if let Value::Closure(closure) = registered {
+            return self.vm.call_closure(closure, &[]).map(|_| ());
+        }
+        let handler = self.vm.globals.borrow().get(&vh::str_value(b"dealtimer"));
+        if matches!(handler, Value::Nil) {
+            return Ok(());
+        }
+        self.vm.call_global("dealtimer", &[]).map(|_| ())
+    }
+
     /// Globals the script referenced but the bridge does not implement.
     pub fn missing_globals(&self) -> Vec<String> {
         self.missing_globals.borrow().iter().cloned().collect()
@@ -127,31 +179,31 @@ impl ScriptBridge {
         // The stub sentinel used for unknown globals.
         self.vm.stub_native = Some(
             self.vm
-                .add_native("__stub", Box::new(|_vm, _args| Ok(vec![Value::Nil]))),
+                .add_native("__stub", Rc::new(|_vm, _args| Ok(vec![Value::Nil]))),
         );
 
         self.vm.register(
             "Exit",
-            Box::new(|vm, _args| {
+            Rc::new(|vm, _args| {
                 if let Some(guest) = vm.guest.as_mut() {
                     guest.exit_requested = true;
                 }
                 Ok(vec![])
             }),
         );
-        self.vm.register("_com", Box::new(com_native));
+        self.vm.register("_com", Rc::new(com_native));
         // `TestCom` is the same dispatcher as `_com` (the SDK exposes both
         // names); `_strCom` is the string-input variant used to read package
         // files and to drive the ext loader.
-        self.vm.register("TestCom", Box::new(com_native));
-        self.vm.register("_strCom", Box::new(str_com_native));
+        self.vm.register("TestCom", Rc::new(com_native));
+        self.vm.register("_strCom", Rc::new(str_com_native));
         self.vm.register(
             "TestCom1",
-            Box::new(|_vm, _args| Ok(vec![vh::num_value(1.0)])),
+            Rc::new(|_vm, _args| Ok(vec![vh::num_value(1.0)])),
         );
         self.vm.register(
             "GetRand",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let limit = args.first().and_then(vh::as_num).unwrap_or(32767.0);
                 let value = vm
                     .guest
@@ -163,7 +215,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "mod",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let a = args.first().and_then(vh::as_num).unwrap_or(0.0);
                 let b = args.get(1).and_then(vh::as_num).unwrap_or(1.0);
                 if b == 0.0 {
@@ -175,67 +227,15 @@ impl ScriptBridge {
         );
         self.vm.register(
             "GetSysInfo",
-            Box::new(|vm, _args| {
-                let (imei, imsi, vendor, device) = vm
-                    .guest
-                    .as_ref()
-                    .map(|guest| guest.sysinfo_strings())
-                    .unwrap_or_default();
-                let scrw = vm.screen.width();
-                let scrh = vm.screen.height();
-                // Glyph metrics the scripts read for text layout: the first
-                // CJK sample character and a Latin sample digit.
-                let dims = |ch| {
-                    unifont::get_glyph(ch)
-                        .map(|glyph| (glyph.get_width() as i32, 16))
-                        .unwrap_or((8, 16))
-                };
-                let (chw, chh) = dims('\u{70b9}');
-                let (ascw, asch) = dims('2');
-                Ok(vec![vh::table_value(|table| {
-                    // Platform field names (short forms plus the legacy
-                    // aliases older applications expect).
-                    table.set(vh::str_value(b"vmver"), vh::num_value(1968.0));
-                    table.set(vh::str_value(b"scrw"), vh::num_value(scrw as f32));
-                    table.set(vh::str_value(b"scrh"), vh::num_value(scrh as f32));
-                    table.set(vh::str_value(b"ScreenW"), vh::num_value(scrw as f32));
-                    table.set(vh::str_value(b"ScreenH"), vh::num_value(scrh as f32));
-                    table.set(vh::str_value(b"chw"), vh::num_value(chw as f32));
-                    table.set(vh::str_value(b"chh"), vh::num_value(chh as f32));
-                    table.set(vh::str_value(b"ChineseWidth"), vh::num_value(chw as f32));
-                    table.set(vh::str_value(b"ChineseHigh"), vh::num_value(chh as f32));
-                    table.set(vh::str_value(b"ascw"), vh::num_value(ascw as f32));
-                    table.set(vh::str_value(b"asch"), vh::num_value(asch as f32));
-                    table.set(vh::str_value(b"EnglishWidth"), vh::num_value(ascw as f32));
-                    table.set(vh::str_value(b"EnglishHigh"), vh::num_value(asch as f32));
-                    table.set(vh::str_value(b"packname"), vh::str_value(b""));
-                    table.set(vh::str_value(b"hsman"), vh::str_value(&vendor));
-                    table.set(vh::str_value(b"hstype"), vh::str_value(&device));
-                    table.set(vh::str_value(b"hsver"), vh::num_value(0.0));
-                    table.set(vh::str_value(b"IMEI"), vh::str_value(&imei));
-                    table.set(vh::str_value(b"IMSI"), vh::str_value(&imsi));
-                    table.set(vh::str_value(b"manufactory"), vh::str_value(&vendor));
-                    table.set(vh::str_value(b"type"), vh::str_value(&device));
-                })])
-            }),
+            Rc::new(|vm, _args| Ok(vec![sysinfo_value(vm)])),
         );
         self.vm.register(
             "GetDatetime",
-            Box::new(|_vm, _args| {
-                let now = crate::cfunction::local_datetime();
-                Ok(vec![vh::table_value(|table| {
-                    table.set(vh::str_value(b"year"), vh::num_value(now.0 as f32));
-                    table.set(vh::str_value(b"mon"), vh::num_value(now.1 as f32));
-                    table.set(vh::str_value(b"day"), vh::num_value(now.2 as f32));
-                    table.set(vh::str_value(b"hour"), vh::num_value(now.3 as f32));
-                    table.set(vh::str_value(b"min"), vh::num_value(now.4 as f32));
-                    table.set(vh::str_value(b"sec"), vh::num_value(now.5 as f32));
-                })])
-            }),
+            Rc::new(|_vm, _args| Ok(vec![datetime_value()])),
         );
         self.vm.register(
             "TimerStart",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as i32;
                 let interval = args.get(1).and_then(vh::as_num).unwrap_or(100.0);
                 if let Some(guest) = vm.guest.as_mut() {
@@ -246,7 +246,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "TimerStop",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as i32;
                 if let Some(guest) = vm.guest.as_mut() {
                     guest.timer_stop(id);
@@ -258,7 +258,7 @@ impl ScriptBridge {
         // Drawing natives write into the guest screen buffer.
         self.vm.register(
             "ClearScreen",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let (r, g, b) = color_args(args);
                 if let Some(guest) = vm.guest.as_mut() {
                     guest.fill_screenbuf(crate::cfunction::rgb888_to_565(r, g, b));
@@ -270,7 +270,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "DrawRect",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let numbers: Vec<f32> = args.iter().filter_map(vh::as_num).collect();
                 if let (Some(guest), true) = (vm.guest.as_mut(), numbers.len() >= 7) {
                     guest.draw_rect(
@@ -288,7 +288,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "DrawPoint",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let numbers: Vec<f32> = args.iter().filter_map(vh::as_num).collect();
                 if let (Some(guest), true) = (vm.guest.as_mut(), numbers.len() >= 3) {
                     guest.draw_point(numbers[0] as u32, numbers[1] as u32, numbers[2] as u32);
@@ -298,21 +298,95 @@ impl ScriptBridge {
         );
         self.vm.register(
             "RefreshScreen",
-            Box::new(|vm, _args| {
+            Rc::new(|vm, _args| {
                 present_screen(vm);
                 Ok(vec![])
             }),
         );
+        // Script-side drawing primitives routed through the guest engine.
+        self.vm.register(
+            "DrawText",
+            Rc::new(|vm, args| {
+                let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let x = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as i32;
+                let y = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as i32;
+                let (r, g, b) = color_args(&args[3.min(args.len())..]);
+                let color = crate::cfunction::rgb888_to_565(r, g, b);
+                if let Some(guest) = vm.guest.as_mut() {
+                    guest.draw_text(&text, x, y, color);
+                }
+                present_screen(vm);
+                Ok(vec![])
+            }),
+        );
+        // `TextWidth` returns (width, height) — the platform convention the
+        // SDK scripts rely on when seeding glyph metrics.
+        self.vm.register(
+            "TextWidth",
+            Rc::new(|_vm, args| {
+                let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let (decoded, _, _) = encoding_rs::GBK.decode(&text);
+                let mut width = 0i32;
+                for ch in decoded.chars() {
+                    width += unifont::get_glyph(ch)
+                        .map(|glyph| glyph.get_width() as i32)
+                        .unwrap_or(8);
+                }
+                Ok(vec![vh::num_value(width as f32), vh::num_value(16.0)])
+            }),
+        );
+        self.vm.register(
+            "DrawLine",
+            Rc::new(|vm, args| {
+                let nums: Vec<i32> = args
+                    .iter()
+                    .filter_map(vh::as_num)
+                    .map(|v| v as i32)
+                    .collect();
+                let (r, g, b) = color_args(&args[4.min(args.len())..]);
+                let color = crate::cfunction::rgb888_to_565(r, g, b);
+                if nums.len() >= 4 {
+                    if let Some(guest) = vm.guest.as_mut() {
+                        guest.draw_line(nums[0], nums[1], nums[2], nums[3], color);
+                    }
+                }
+                present_screen(vm);
+                Ok(vec![])
+            }),
+        );
+        self.vm.register(
+            "DrawPoint",
+            Rc::new(|vm, args| {
+                let nums: Vec<i32> = args
+                    .iter()
+                    .filter_map(vh::as_num)
+                    .map(|v| v as i32)
+                    .collect();
+                let (r, g, b) = color_args(&args[2.min(args.len())..]);
+                let color = crate::cfunction::rgb888_to_565(r, g, b);
+                if nums.len() >= 2 {
+                    if let Some(guest) = vm.guest.as_mut() {
+                        guest.draw_line(nums[0], nums[1], nums[0], nums[1], color);
+                    }
+                }
+                present_screen(vm);
+                Ok(vec![])
+            }),
+        );
+        for name in ["DispUpEx", "DispUp"] {
+            self.vm.register(
+                name,
+                Rc::new(|vm, _args| {
+                    present_screen(vm);
+                    Ok(vec![])
+                }),
+            );
+        }
         register_stub_group(
             &mut self.vm,
             &[
-                "DrawText",
                 "DrawTextEx",
-                "DrawLine",
-                "TextWidth",
                 "EffSetCon",
-                "DispUpEx",
-                "DispUp",
                 "SpriteSet",
                 "SpriteDraw",
                 "SpriteDrawEx",
@@ -346,7 +420,7 @@ impl ScriptBridge {
         // Bitmap management: load from package, blit to screen.
         self.vm.register(
             "BitmapLoad",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
                 let path = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
                 let name = String::from_utf8_lossy(&path).to_string();
@@ -381,7 +455,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "BitmapShow",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
                 let x = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as u32;
                 let y = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as u32;
@@ -397,7 +471,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "BitmapNew",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
                 let width = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as u32;
                 let height = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as u32;
@@ -416,7 +490,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "BitmapDraw",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let src_id = args.first().and_then(vh::as_num).unwrap_or(0.0) as u32;
                 let x = args.get(3).and_then(vh::as_num).unwrap_or(0.0) as u32;
                 let y = args.get(4).and_then(vh::as_num).unwrap_or(0.0) as u32;
@@ -432,13 +506,13 @@ impl ScriptBridge {
         );
         self.vm.register(
             "BmGetScr",
-            Box::new(|_vm, _args| Ok(vec![vh::num_value(crate::cfunction::SCREENBUF as f32)])),
+            Rc::new(|_vm, _args| Ok(vec![vh::num_value(crate::cfunction::SCREENBUF as f32)])),
         );
 
         // Standard-library subset.
         self.vm.register(
             "type",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let name = args
                     .first()
                     .map(|value| value.type_name().to_string())
@@ -448,7 +522,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "tonumber",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 Ok(vec![args
                     .first()
                     .and_then(vh::as_num)
@@ -458,7 +532,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "tostring",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let text = args
                     .first()
                     .map(vh::to_string_bytes)
@@ -468,7 +542,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "error",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let text = args
                     .first()
                     .map(vh::to_string_bytes)
@@ -478,7 +552,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "assert",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let truthy = !args.first().map(Value::is_false_y).unwrap_or(true);
                 if truthy {
                     Ok(args.to_vec())
@@ -489,7 +563,7 @@ impl ScriptBridge {
         );
         self.vm.register(
             "next",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 // Table iteration for generic-for: returns the next key/value.
                 let Some(Value::Table(table)) = args.first() else {
                     return Ok(vec![Value::Nil]);
@@ -526,14 +600,528 @@ impl ScriptBridge {
         );
         self.vm.register(
             "ipairs",
-            Box::new(|_vm, _args| {
+            Rc::new(|_vm, _args| {
                 Ok(vec![Value::Nil]) // replaced by the ipairs_iter pair below
+            }),
+        );
+        // `pcall`/`xpcall`: call a function value with error capture. The
+        // native re-enters the interpreter for closures.
+        self.vm.register(
+            "pcall",
+            Rc::new(|vm, args| {
+                let outcome = match args.first() {
+                    Some(Value::Closure(closure)) => vm.call_closure(closure.clone(), &args[1..]),
+                    Some(Value::Native(index)) => vm.call_native(*index, &args[1..]),
+                    Some(other) => Err(format!("attempt to call a {} value", other.type_name())),
+                    None => Err("bad argument #1 to 'pcall'".to_string()),
+                };
+                match outcome {
+                    Ok(mut results) => {
+                        let mut out = vec![vh::num_value(1.0)];
+                        out.append(&mut results);
+                        Ok(out)
+                    }
+                    Err(error) => Ok(vec![vh::num_value(0.0), vh::str_value(error.as_bytes())]),
+                }
+            }),
+        );
+        self.vm.register(
+            "xpcall",
+            Rc::new(|vm, args| {
+                let handler = args.get(1).cloned();
+                let outcome = match args.first() {
+                    Some(Value::Closure(closure)) => vm.call_closure(closure.clone(), &args[2..]),
+                    Some(Value::Native(index)) => vm.call_native(*index, &args[2..]),
+                    Some(other) => Err(format!("attempt to call a {} value", other.type_name())),
+                    None => Err("bad argument #1 to 'xpcall'".to_string()),
+                };
+                match outcome {
+                    Ok(mut results) => {
+                        let mut out = vec![vh::num_value(1.0)];
+                        out.append(&mut results);
+                        Ok(out)
+                    }
+                    Err(error) => {
+                        let message = vh::str_value(error.as_bytes());
+                        let mut handled = match handler {
+                            Some(Value::Closure(closure)) => {
+                                vm.call_closure(closure, &[message]).unwrap_or_default()
+                            }
+                            Some(Value::Native(index)) => {
+                                vm.call_native(index, &[message]).unwrap_or_default()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let mut out = vec![vh::num_value(0.0)];
+                        out.append(&mut handled);
+                        Ok(out)
+                    }
+                }
+            }),
+        );
+        self.vm.register("rawequal", Rc::new(raw_equal_native));
+        self.vm.register("rawget", Rc::new(raw_get_native));
+        self.vm.register("unpack", Rc::new(unpack_native));
+        // Chunk loaders: packaged `.mr` members are already-compiled MiniJ
+        // chunks, so `loadfile`/`dofile`/`loadstring` parse them with the
+        // same deserializer the boot script used — no source compiler.
+        self.vm.register(
+            "loadfile",
+            Rc::new(|vm, args| {
+                let name = String::from_utf8_lossy(
+                    &args.first().map(vh::to_string_bytes).unwrap_or_default(),
+                )
+                .to_string();
+                match load_package_chunk(vm, &name) {
+                    Ok(closure) => Ok(vec![closure]),
+                    Err(error) => Ok(vec![Value::Nil, vh::str_value(error.as_bytes())]),
+                }
+            }),
+        );
+        self.vm.register(
+            "dofile",
+            Rc::new(|vm, args| {
+                let name = String::from_utf8_lossy(
+                    &args.first().map(vh::to_string_bytes).unwrap_or_default(),
+                )
+                .to_string();
+                let closure = match load_package_chunk(vm, &name) {
+                    Ok(Value::Closure(closure)) => closure,
+                    Ok(Value::Nil) => return Ok(vec![Value::Nil]),
+                    Ok(other) => {
+                        return Err(format!("attempt to call a {} value", other.type_name()))
+                    }
+                    Err(error) => {
+                        log::warn!("dofile({name:?}) failed: {error}");
+                        return Ok(vec![Value::Nil]);
+                    }
+                };
+                vm.call_closure(closure, &[])
+            }),
+        );
+        self.vm.register(
+            "loadstring",
+            Rc::new(|_vm, args| {
+                let data = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                match crate::undump::Chunk::parse(&data) {
+                    Ok(chunk) => Ok(vec![Value::Closure(Rc::new(crate::vm::LuaClosure {
+                        proto: Rc::new(chunk.proto),
+                        upvals: Vec::new(),
+                    }))]),
+                    Err(error) => Ok(vec![
+                        Value::Nil,
+                        vh::str_value(error.to_string().as_bytes()),
+                    ]),
+                }
+            }),
+        );
+        // Remaining compiler/runtime entry points that no reference sample
+        // has needed yet; log-once stubs keep scripts alive.
+        for (name, note) in [
+            ("_runFile", "run packaged mrp"),
+            ("RunFile", "run packaged mrp"),
+            ("_loadPack", "switch package"),
+            ("LoadPack", "switch package"),
+            ("SaveTable", "persist table"),
+            ("LoadTable", "restore table"),
+            ("_getTab", "metatable support"),
+            ("_setTab", "metatable support"),
+        ] {
+            self.vm.register(
+                name,
+                Rc::new(move |_vm, _args| {
+                    log::warn!("native `{name}` is not implemented yet ({note})");
+                    Ok(vec![Value::Nil])
+                }),
+            );
+        }
+        // The platform's `_lowerCamel` aliases over the standard library.
+        self.vm.alias("error", "_error");
+        self.vm.alias("assert", "_assert");
+        self.vm.alias("next", "_next");
+        self.vm.alias("ipairs", "_iPairs");
+        self.vm.alias("tonumber", "_num");
+        self.vm.alias("tostring", "_str");
+        self.vm.alias("pcall", "_pCall");
+        self.vm.alias("xpcall", "_pCallEx");
+        self.vm.alias("rawequal", "_rawEq");
+        self.vm.alias("loadfile", "_loadFile");
+        self.vm.alias("dofile", "_execFile");
+        self.vm.alias("loadstring", "_loads");
+        self.vm.alias("loadstring", "_loadBuf");
+        // Drawing/API aliases: scripts reach the same natives through the
+        // `_lowerCamel` names the SDK headers document.
+        self.vm.alias("DrawText", "_drawText");
+        self.vm.alias("DrawRect", "_drawRect");
+        self.vm.alias("DrawLine", "_drawLine");
+        self.vm.alias("DrawPoint", "_drawPoint");
+        self.vm.alias("ClearScreen", "_clearScr");
+        self.vm.alias("TextWidth", "_textWidth");
+        self.vm.alias("BitmapLoad", "_bmpLoad");
+        self.vm.alias("BitmapShow", "_bmpShow");
+        self.vm.alias("BitmapNew", "_bmpNew");
+        self.vm.alias("BitmapDraw", "_bmpDraw");
+        self.vm.alias("DispUpEx", "_dispUpEx");
+        self.vm.alias("RefreshScreen", "_refreshScr");
+        // Standard-library namespaces the scripts index directly. The
+        // `table` surface follows the platform's tablib (getArrSize/setn
+        // aliases, forEach pairs, rawGet/rawSet, items = unpack).
+        self.vm
+            .register_in("table", "insert", Rc::new(table_insert_native));
+        self.vm
+            .register_in("table", "remove", Rc::new(table_remove_native));
+        let getn = |_vm: &mut Vm, args: &[Value]| -> Result<Vec<Value>, String> {
+            let len = match args.first() {
+                Some(Value::Table(table)) => table.borrow().array.len(),
+                _ => 0,
+            };
+            Ok(vec![vh::num_value(len as f32)])
+        };
+        self.vm.register_in("table", "getn", Rc::new(getn));
+        self.vm.register_in("table", "getArrSize", Rc::new(getn));
+        self.vm.register_in(
+            "table",
+            "setArrSize",
+            Rc::new(|_vm, args| {
+                let Some(Value::Table(table)) = args.first() else {
+                    return Err("bad argument #1 to 'setArrSize' (table expected)".to_string());
+                };
+                let size = args.get(1).and_then(vh::as_num).unwrap_or(0.0).max(0.0) as usize;
+                table.borrow_mut().array.resize(size, Value::Nil);
+                Ok(vec![])
+            }),
+        );
+        self.vm.register_in(
+            "table",
+            "concat",
+            Rc::new(|_vm, args| {
+                let Some(Value::Table(table)) = args.first() else {
+                    return Err("bad argument #1 to 'concat' (table expected)".to_string());
+                };
+                let separator = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                let mut out = Vec::new();
+                for (index, value) in table.borrow().array.iter().enumerate() {
+                    if index > 0 {
+                        out.extend_from_slice(&separator);
+                    }
+                    out.extend_from_slice(&vh::to_string_bytes(value));
+                }
+                Ok(vec![vh::str_value(&out)])
+            }),
+        );
+        self.vm
+            .register_in("table", "items", Rc::new(unpack_native));
+        self.vm
+            .register_in("table", "rawGet", Rc::new(raw_get_native));
+        self.vm.register_in(
+            "table",
+            "rawSet",
+            Rc::new(|_vm, args| {
+                let Some(Value::Table(table)) = args.first() else {
+                    return Err("bad argument #1 to 'rawSet' (table expected)".to_string());
+                };
+                let key = args.get(1).cloned().unwrap_or(Value::Nil);
+                let value = args.get(2).cloned().unwrap_or(Value::Nil);
+                table.borrow_mut().set(key, value);
+                Ok(vec![])
+            }),
+        );
+        self.vm.register_in(
+            "table",
+            "next",
+            Rc::new(|vm, args| (next_native_ref())(vm, args)),
+        );
+        self.vm.register_in(
+            "table",
+            "iPairs",
+            Rc::new(|vm, args| {
+                let Some(Value::Table(table)) = args.first() else {
+                    return Err("bad argument #1 to 'iPairs' (table expected)".to_string());
+                };
+                let iter = vm
+                    .native_index(IPAIRS_ITER_NAME)
+                    .ok_or("ipairs_iter missing")?;
+                Ok(vec![
+                    Value::Native(iter),
+                    Value::Table(table.clone()),
+                    vh::num_value(0.0),
+                ])
+            }),
+        );
+        self.vm.register_in(
+            "table",
+            "pairs",
+            Rc::new(|vm, args| {
+                let Some(Value::Table(table)) = args.first() else {
+                    return Err("bad argument #1 to 'pairs' (table expected)".to_string());
+                };
+                let iter = vm.native_index("next").ok_or("next missing")?;
+                Ok(vec![
+                    Value::Native(iter),
+                    Value::Table(table.clone()),
+                    Value::Nil,
+                ])
+            }),
+        );
+        self.vm.register(
+            IPAIRS_ITER_NAME,
+            Rc::new(|_vm, args| {
+                let Some(Value::Table(table)) = args.first() else {
+                    return Ok(vec![Value::Nil]);
+                };
+                let index = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as usize;
+                let table = table.borrow();
+                match table.array.get(index) {
+                    Some(value) => Ok(vec![vh::num_value(index as f32 + 1.0), value.clone()]),
+                    None => Ok(vec![Value::Nil]),
+                }
+            }),
+        );
+        self.vm.register_in(
+            "table",
+            "sort",
+            Rc::new(|vm, args| {
+                let Some(Value::Table(table)) = args.first() else {
+                    return Err("bad argument #1 to 'sort' (table expected)".to_string());
+                };
+                let comparator = args.get(1).cloned();
+                let mut items = table.borrow().array.clone();
+                // Insertion sort; ordering through the comparator value when
+                // given, otherwise numeric/string natural order.
+                for sorted in 1..items.len() {
+                    let mut cursor = sorted;
+                    while cursor > 0 {
+                        let (before, after) = (&items[cursor - 1], &items[cursor]);
+                        let less = match &comparator {
+                            Some(Value::Closure(closure)) => vm
+                                .call_closure(closure.clone(), &[after.clone(), before.clone()])?
+                                .first()
+                                .map(|value| !value.is_false_y())
+                                .unwrap_or(false),
+                            Some(Value::Native(index)) => vm
+                                .call_native(*index, &[after.clone(), before.clone()])?
+                                .first()
+                                .map(|value| !value.is_false_y())
+                                .unwrap_or(false),
+                            _ => match (before.as_num(), after.as_num()) {
+                                (Some(before), Some(after)) => before > after,
+                                _ => {
+                                    let (before, after) =
+                                        (vh::to_string_bytes(before), vh::to_string_bytes(after));
+                                    before > after
+                                }
+                            },
+                        };
+                        if !less {
+                            break;
+                        }
+                        items.swap(cursor - 1, cursor);
+                        cursor -= 1;
+                    }
+                }
+                table.borrow_mut().array = items;
+                Ok(vec![])
+            }),
+        );
+        let foreach = |indexed: bool| -> Native {
+            Rc::new(
+                move |vm: &mut Vm, args: &[Value]| -> Result<Vec<Value>, String> {
+                    let Some(Value::Table(table)) = args.first() else {
+                        return Err("bad argument #1 (table expected)".to_string());
+                    };
+                    let callback = args.get(1).cloned().unwrap_or(Value::Nil);
+                    let entries: Vec<(Value, Value)> = {
+                        let table = table.borrow();
+                        if indexed {
+                            table
+                                .array
+                                .iter()
+                                .enumerate()
+                                .map(|(index, value)| {
+                                    (vh::num_value(index as f32 + 1.0), value.clone())
+                                })
+                                .collect()
+                        } else {
+                            table
+                                .snapshot_map()
+                                .iter()
+                                .map(|(key, value)| (vh::key_to_value(key), value.clone()))
+                                .collect()
+                        }
+                    };
+                    for (key, value) in entries {
+                        match &callback {
+                            Value::Closure(closure) => {
+                                vm.call_closure(closure.clone(), &[key, value])?;
+                            }
+                            Value::Native(index) => {
+                                vm.call_native(*index, &[key, value])?;
+                            }
+                            _ => return Err("attempt to call a non-function".to_string()),
+                        }
+                    }
+                    Ok(vec![])
+                },
+            )
+        };
+        self.vm.register_in("table", "forEach", foreach(false));
+        self.vm.register_in("table", "foreach", foreach(false));
+        self.vm.register_in("table", "iforEach", foreach(true));
+        self.vm.register_in("table", "foreachi", foreach(true));
+        for name in ["save", "load"] {
+            self.vm.register_in(
+                "table",
+                name,
+                Rc::new(move |_vm, _args| {
+                    log::warn!("table.{name} persistence is not implemented yet");
+                    Ok(vec![Value::Nil])
+                }),
+            );
+        }
+        // Platform extension entry points: no operator services in this
+        // emulator. `_platEx(code, input)` returns (output, ret); code 1204
+        // is the drive-change request the runtime echoes back.
+        self.vm.register(
+            "_platEx",
+            Rc::new(|_vm, args| {
+                let code = args.first().and_then(vh::as_num).unwrap_or(0.0) as i32;
+                let input = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                if code == 1204 {
+                    return Ok(vec![vh::str_value(&input), vh::num_value(0.0)]);
+                }
+                match code {
+                    // MD5 digest (16 raw bytes).
+                    500 => Ok(vec![
+                        vh::str_value(&crate::md5::md5(&input)),
+                        vh::num_value(0.0),
+                    ]),
+                    // The mythroad base64 variant: encode / decode.
+                    501 => match mr_encode(&input) {
+                        Some(encoded) => Ok(vec![
+                            vh::str_value(&encoded),
+                            vh::num_value(encoded.len() as f32),
+                        ]),
+                        None => Ok(vec![vh::str_value(b""), vh::num_value(-1.0)]),
+                    },
+                    502 => match mr_decode(&input) {
+                        Some(decoded) => Ok(vec![
+                            vh::str_value(&decoded),
+                            vh::num_value(decoded.len() as f32),
+                        ]),
+                        None => Ok(vec![vh::str_value(b""), vh::num_value(-1.0)]),
+                    },
+                    _ => Ok(vec![vh::str_value(b""), vh::num_value(-1.0)]),
+                }
+            }),
+        );
+        for name in ["_plat", "_closeNet"] {
+            self.vm
+                .register(name, Rc::new(|_vm, _args| Ok(vec![vh::num_value(-1.0)])));
+        }
+        // `print`: Lua's debug output, routed to the log.
+        self.vm.register(
+            "print",
+            Rc::new(|_vm, args| {
+                let mut line: Vec<u8> = Vec::new();
+                for (index, piece) in args.iter().map(vh::to_string_bytes).enumerate() {
+                    if index > 0 {
+                        line.push(b'\t');
+                    }
+                    line.extend_from_slice(&piece);
+                }
+                log::info!("print: {}", String::from_utf8_lossy(&line));
+                Ok(vec![])
+            }),
+        );
+        self.vm
+            .register("_gc", Rc::new(|_vm, _args| Ok(vec![vh::num_value(0.0)])));
+        // The `sys` namespace: platform services the scripts reach through
+        // `sys.getInfo()`, `sys.datetime()`, and file management.
+        self.vm.register_in(
+            "sys",
+            "getInfo",
+            Rc::new(|vm, _args| Ok(vec![sysinfo_value(vm)])),
+        );
+        self.vm.register_in(
+            "sys",
+            "getuptime",
+            Rc::new(|vm, _args| {
+                Ok(vec![vh::num_value(
+                    vm.guest
+                        .as_ref()
+                        .map(|guest| guest.uptime_ms())
+                        .unwrap_or(0) as f32,
+                )])
+            }),
+        );
+        self.vm.register_in(
+            "sys",
+            "datetime",
+            Rc::new(|_vm, _args| Ok(vec![datetime_value()])),
+        );
+        self.vm.register_in(
+            "sys",
+            "getFileLen",
+            Rc::new(|vm, args| {
+                let handle = args.first().and_then(vh::as_num).unwrap_or(0.0) as usize;
+                let len = vm
+                    .guest
+                    .as_ref()
+                    .and_then(|guest| guest.file_len(handle))
+                    .unwrap_or(0);
+                Ok(vec![vh::num_value(len as f32)])
+            }),
+        );
+        for op in ["rm", "rename", "mkDir", "mkdir", "rmDir", "rmdir"] {
+            self.vm.register_in(
+                "sys",
+                op,
+                Rc::new(move |_vm, _args| {
+                    log::warn!("sys.{op} is not implemented yet; reporting success");
+                    Ok(vec![vh::num_value(0.0)])
+                }),
+            );
+        }
+        for op in [
+            "findStart",
+            "findstart",
+            "findNext",
+            "findnext",
+            "findStop",
+            "findstop",
+        ] {
+            self.vm.register_in(
+                "sys",
+                op,
+                Rc::new(move |_vm, _args| {
+                    log::warn!("sys.{op} is not implemented yet; returning nothing");
+                    Ok(vec![Value::Nil])
+                }),
+            );
+        }
+        // `sys.getFileInfo(name)` mirrors `mr_info`: the file size in bytes
+        // or MR_FAILED for missing files.
+        self.vm.register_in(
+            "sys",
+            "getFileInfo",
+            Rc::new(|vm, args| {
+                let name = String::from_utf8_lossy(
+                    &args.first().map(vh::to_string_bytes).unwrap_or_default(),
+                )
+                .to_string();
+                let size = vm
+                    .package
+                    .as_ref()
+                    .and_then(|package| package.read_entry(&name).ok())
+                    .map(|data| data.len() as i32)
+                    .unwrap_or(-1);
+                Ok(vec![vh::num_value(size as f32)])
             }),
         );
         self.vm.register_in(
             "string",
             "sub",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let Some(Value::Str(text)) = args.first() else {
                     return Ok(vec![Value::Nil]);
                 };
@@ -564,7 +1152,7 @@ impl ScriptBridge {
         self.vm.register_in(
             "string",
             "len",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let len = match args.first() {
                     Some(Value::Str(text)) => text.len() as f32,
                     _ => 0.0,
@@ -575,7 +1163,7 @@ impl ScriptBridge {
         self.vm.register_in(
             "string",
             "format",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 // Formatting over the MiniJ values; reuse the kernel by mapping
                 // numbers/strings positionally after the format string.
                 let Some(Value::Str(format)) = args.first() else {
@@ -627,10 +1215,203 @@ impl ScriptBridge {
                 Ok(vec![vh::str_value(&out)])
             }),
         );
+        // C/wide-string helpers over raw byte strings (the platform's
+        // pointer-style string handling).
+        let c_string_len = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(bytes.len())
+        };
+        let wide_string_len = |bytes: &[u8]| {
+            let mut length = 0usize;
+            while length + 2 <= bytes.len() {
+                if bytes[length] == 0 && bytes[length + 1] == 0 {
+                    return length;
+                }
+                length += 2;
+            }
+            bytes.len()
+        };
+        self.vm.register_in(
+            "string",
+            "cstr",
+            Rc::new(move |_vm, args| {
+                let bytes = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                Ok(vec![vh::str_value(&bytes[..c_string_len(&bytes)])])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "wstr",
+            Rc::new(move |_vm, args| {
+                let bytes = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                Ok(vec![vh::str_value(&bytes[..wide_string_len(&bytes)])])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "clen",
+            Rc::new(move |_vm, args| {
+                let bytes = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                Ok(vec![vh::num_value(c_string_len(&bytes) as f32)])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "wlen",
+            Rc::new(move |_vm, args| {
+                let bytes = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                Ok(vec![vh::num_value(wide_string_len(&bytes) as f32)])
+            }),
+        );
+        // GBK ↔ UTF-16LE conversion (the platform's c2u/u2c pair).
+        self.vm.register_in(
+            "string",
+            "c2u",
+            Rc::new(|_vm, args| {
+                let bytes = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let (decoded, _, _) = encoding_rs::GBK.decode(&bytes);
+                let mut units = Vec::with_capacity(decoded.len() * 2);
+                for unit in decoded.encode_utf16() {
+                    units.extend_from_slice(&unit.to_le_bytes());
+                }
+                Ok(vec![vh::str_value(&units)])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "u2c",
+            Rc::new(|_vm, args| {
+                let bytes = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
+                for pair in bytes.windows(2).step_by(2) {
+                    let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                    if unit == 0 {
+                        break;
+                    }
+                    units.push(unit);
+                }
+                let decoded = String::from_utf16_lossy(&units);
+                let (encoded, _, _) = encoding_rs::GBK.encode(&decoded);
+                Ok(vec![vh::str_value(&encoded)])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "find",
+            Rc::new(|_vm, args| {
+                let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let pattern = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                let init = args
+                    .get(2)
+                    .and_then(vh::as_num)
+                    .map(|value| value as i32)
+                    .unwrap_or(1);
+                let init = if init > 0 { (init - 1) as usize } else { 0 };
+                let plain = args.get(3).map(Value::is_false_y) == Some(false);
+                match crate::lua_pattern::find(&text, &pattern, init, plain) {
+                    Some((start, end)) => Ok(vec![
+                        vh::num_value(start as f32 + 1.0),
+                        vh::num_value(end as f32),
+                    ]),
+                    None => Ok(vec![Value::Nil]),
+                }
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "gsub",
+            Rc::new(|_vm, args| {
+                let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let pattern = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                let replacement = args.get(2).map(vh::to_string_bytes).unwrap_or_default();
+                let limit = args.get(3).and_then(vh::as_num).map(|value| value as usize);
+                Ok(vec![vh::str_value(&crate::lua_pattern::gsub(
+                    &text,
+                    &pattern,
+                    &replacement,
+                    limit,
+                ))])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "rep",
+            Rc::new(|_vm, args| {
+                let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let count = args.get(1).and_then(vh::as_num).unwrap_or(0.0).max(0.0) as usize;
+                let mut out = Vec::with_capacity(text.len() * count);
+                for _ in 0..count {
+                    out.extend_from_slice(&text);
+                }
+                Ok(vec![vh::str_value(&out)])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "byte",
+            Rc::new(|_vm, args| {
+                let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let start = args
+                    .get(1)
+                    .and_then(vh::as_num)
+                    .map(|value| value.max(1.0) as usize - 1)
+                    .unwrap_or(0);
+                Ok(text
+                    .get(start..)
+                    .map(|slice| {
+                        slice
+                            .iter()
+                            .take(args.get(2).and_then(vh::as_num).unwrap_or(1.0) as usize)
+                            .map(|&byte| vh::num_value(byte as f32))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![Value::Nil]))
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "char",
+            Rc::new(|_vm, args| {
+                let bytes: Vec<u8> = args
+                    .iter()
+                    .filter_map(vh::as_num)
+                    .map(|value| value as u8)
+                    .collect();
+                Ok(vec![vh::str_value(&bytes)])
+            }),
+        );
+        for (name, mapper) in [
+            (
+                "reverse",
+                Rc::new(|bytes: &[u8]| bytes.iter().rev().copied().collect::<Vec<u8>>())
+                    as std::rc::Rc<dyn Fn(&[u8]) -> Vec<u8>>,
+            ),
+            (
+                "upper",
+                Rc::new(|bytes: &[u8]| bytes.iter().map(|byte| byte.to_ascii_uppercase()).collect())
+                    as std::rc::Rc<dyn Fn(&[u8]) -> Vec<u8>>,
+            ),
+            (
+                "lower",
+                Rc::new(|bytes: &[u8]| bytes.iter().map(|byte| byte.to_ascii_lowercase()).collect())
+                    as std::rc::Rc<dyn Fn(&[u8]) -> Vec<u8>>,
+            ),
+        ] {
+            self.vm.register_in(
+                "string",
+                name,
+                Rc::new(move |_vm, args| {
+                    let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                    Ok(vec![vh::str_value(&mapper(&text))])
+                }),
+            );
+        }
         self.vm.register_in(
             "math",
             "floor",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 Ok(vec![vh::num_value(
                     args.first().and_then(vh::as_num).unwrap_or(0.0).floor(),
                 )])
@@ -639,7 +1420,7 @@ impl ScriptBridge {
         self.vm.register_in(
             "math",
             "abs",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 Ok(vec![vh::num_value(
                     args.first().and_then(vh::as_num).unwrap_or(0.0).abs(),
                 )])
@@ -648,7 +1429,7 @@ impl ScriptBridge {
         self.vm.register_in(
             "math",
             "random",
-            Box::new(|_vm, args| {
+            Rc::new(|_vm, args| {
                 let value = {
                     let mut state = 0x1234_5678u32;
                     state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
@@ -670,28 +1451,109 @@ impl ScriptBridge {
             }),
         );
         self.vm
-            .register_in("math", "randomseed", Box::new(|_vm, _args| Ok(vec![])));
+            .register_in("math", "randomseed", Rc::new(|_vm, _args| Ok(vec![])));
 
         // The `file` library: package-backed reads plus guest handles.
         self.vm.register_in(
             "file",
             "open",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let path = args.first().map(vh::to_string_bytes).unwrap_or_default();
                 let name = String::from_utf8_lossy(&path).to_string();
                 let Some(guest) = vm.guest.as_mut() else {
-                    return Ok(vec![vh::num_value(0.0)]);
+                    return Ok(vec![Value::Nil]);
                 };
                 match guest.file_open(&name) {
-                    Some(handle) => Ok(vec![vh::num_value(handle as f32)]),
-                    None => Ok(vec![vh::num_value(0.0)]),
+                    Some(handle) => {
+                        // The SDK file.open returns an object with methods
+                        // (f:read(len), f:write(s), f:seek(...), f:close()).
+                        let object = match vh::table_value(|table| {
+                            table.set(vh::str_value(b"handle"), vh::num_value(handle as f32));
+                        }) {
+                            Value::Table(table) => table,
+                            _ => unreachable!("table_value builds a table"),
+                        };
+                        for (method, tag) in [
+                            ("read", "__file_read"),
+                            ("write", "__file_write"),
+                            ("seek", "__file_seek"),
+                            ("close", "__file_close"),
+                            ("state", "__file_state"),
+                        ] {
+                            let index = vm
+                                .native_index(tag)
+                                .ok_or_else(|| format!("{tag} missing"))?;
+                            object
+                                .borrow_mut()
+                                .set(vh::str_value(method.as_bytes()), Value::Native(index));
+                        }
+                        Ok(vec![Value::Table(object)])
+                    }
+                    None => Ok(vec![Value::Nil]),
                 }
             }),
+        );
+        self.vm.register(
+            "__file_read",
+            Rc::new(|vm, args| {
+                let handle = file_handle(args)?;
+                let len = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as usize;
+                let Some(guest) = vm.guest.as_mut() else {
+                    return Ok(vec![Value::Nil]);
+                };
+                match guest.file_read(handle, len) {
+                    Some(bytes) => Ok(vec![vh::str_value(&bytes)]),
+                    None => Ok(vec![Value::Nil]),
+                }
+            }),
+        );
+        self.vm.register(
+            "__file_write",
+            Rc::new(|vm, args| {
+                let handle = file_handle(args)?;
+                let data = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                let Some(guest) = vm.guest.as_mut() else {
+                    return Ok(vec![vh::num_value(0.0)]);
+                };
+                Ok(vec![vh::num_value(if guest.file_write(handle, &data) {
+                    1.0
+                } else {
+                    0.0
+                })])
+            }),
+        );
+        self.vm.register(
+            "__file_seek",
+            Rc::new(|vm, args| {
+                let handle = file_handle(args)?;
+                let offset = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as i32;
+                let whence = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as i32;
+                let Some(guest) = vm.guest.as_mut() else {
+                    return Ok(vec![vh::num_value(0.0)]);
+                };
+                Ok(vec![vh::num_value(
+                    guest.file_seek(handle, offset, whence) as f32
+                )])
+            }),
+        );
+        self.vm.register(
+            "__file_close",
+            Rc::new(|vm, args| {
+                let handle = file_handle(args)?;
+                if let Some(guest) = vm.guest.as_mut() {
+                    guest.file_close(handle);
+                }
+                Ok(vec![])
+            }),
+        );
+        self.vm.register(
+            "__file_state",
+            Rc::new(|_vm, _args| Ok(vec![vh::num_value(1.0)])),
         );
         self.vm.register_in(
             "file",
             "read",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let handle = args.first().and_then(vh::as_num).unwrap_or(0.0) as usize;
                 let len = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as usize;
                 let Some(guest) = vm.guest.as_mut() else {
@@ -706,7 +1568,7 @@ impl ScriptBridge {
         self.vm.register_in(
             "file",
             "close",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let handle = args.first().and_then(vh::as_num).unwrap_or(0.0) as usize;
                 if let Some(guest) = vm.guest.as_mut() {
                     guest.file_close(handle);
@@ -717,7 +1579,7 @@ impl ScriptBridge {
         self.vm.register_in(
             "file",
             "getLen",
-            Box::new(|vm, args| {
+            Rc::new(|vm, args| {
                 let handle = args.first().and_then(vh::as_num).unwrap_or(0.0) as usize;
                 let len = vm
                     .guest
@@ -742,6 +1604,295 @@ impl ScriptBridge {
     }
 }
 
+/// Builds the platform system-info table (`GetSysInfo` / `sys.getInfo`).
+fn sysinfo_value(vm: &Vm) -> Value {
+    let (imei, imsi, vendor, device) = vm
+        .guest
+        .as_ref()
+        .map(|guest| guest.sysinfo_strings())
+        .unwrap_or_default();
+    let scrw = vm.screen.width();
+    let scrh = vm.screen.height();
+    // Glyph metrics the scripts read for text layout: the first CJK sample
+    // character and a Latin sample digit.
+    let dims = |ch| {
+        unifont::get_glyph(ch)
+            .map(|glyph| (glyph.get_width() as i32, 16))
+            .unwrap_or((8, 16))
+    };
+    let (chw, chh) = dims('\u{70b9}');
+    let (ascw, asch) = dims('2');
+    vh::table_value(|table| {
+        // Platform field names (short forms plus the legacy aliases older
+        // applications expect).
+        table.set(vh::str_value(b"vmver"), vh::num_value(1968.0));
+        table.set(vh::str_value(b"scrw"), vh::num_value(scrw as f32));
+        table.set(vh::str_value(b"scrh"), vh::num_value(scrh as f32));
+        table.set(vh::str_value(b"ScreenW"), vh::num_value(scrw as f32));
+        table.set(vh::str_value(b"ScreenH"), vh::num_value(scrh as f32));
+        table.set(vh::str_value(b"chw"), vh::num_value(chw as f32));
+        table.set(vh::str_value(b"chh"), vh::num_value(chh as f32));
+        table.set(vh::str_value(b"ChineseWidth"), vh::num_value(chw as f32));
+        table.set(vh::str_value(b"ChineseHigh"), vh::num_value(chh as f32));
+        table.set(vh::str_value(b"ascw"), vh::num_value(ascw as f32));
+        table.set(vh::str_value(b"asch"), vh::num_value(asch as f32));
+        table.set(vh::str_value(b"EnglishWidth"), vh::num_value(ascw as f32));
+        table.set(vh::str_value(b"EnglishHigh"), vh::num_value(asch as f32));
+        table.set(vh::str_value(b"packname"), vh::str_value(b""));
+        table.set(vh::str_value(b"hsman"), vh::str_value(&vendor));
+        table.set(vh::str_value(b"hstype"), vh::str_value(&device));
+        table.set(vh::str_value(b"hsver"), vh::num_value(0.0));
+        table.set(vh::str_value(b"IMEI"), vh::str_value(&imei));
+        table.set(vh::str_value(b"IMSI"), vh::str_value(&imsi));
+        table.set(vh::str_value(b"manufactory"), vh::str_value(&vendor));
+        table.set(vh::str_value(b"type"), vh::str_value(&device));
+    })
+}
+
+/// Builds the platform datetime table (`GetDatetime` / `sys.datetime`).
+fn datetime_value() -> Value {
+    let now = crate::cfunction::local_datetime();
+    vh::table_value(|table| {
+        table.set(vh::str_value(b"year"), vh::num_value(now.0 as f32));
+        table.set(vh::str_value(b"mon"), vh::num_value(now.1 as f32));
+        table.set(vh::str_value(b"day"), vh::num_value(now.2 as f32));
+        table.set(vh::str_value(b"hour"), vh::num_value(now.3 as f32));
+        table.set(vh::str_value(b"min"), vh::num_value(now.4 as f32));
+        table.set(vh::str_value(b"sec"), vh::num_value(now.5 as f32));
+    })
+}
+
+/// The generic-for iterator registered for `iPairs`.
+const IPAIRS_ITER_NAME: &str = "ipairs_iter";
+
+/// Extracts the handle from a file-object method call (`args[0].handle`).
+fn file_handle(args: &[Value]) -> Result<usize, String> {
+    let Some(Value::Table(object)) = args.first() else {
+        return Err("file method called on a non-object".to_string());
+    };
+    let handle = object.borrow().get(&vh::str_value(b"handle"));
+    let handle = handle.as_num().unwrap_or(0.0) as usize;
+    if handle == 0 {
+        return Err("file handle is closed".to_string());
+    }
+    Ok(handle)
+}
+
+/// The mythroad base64 alphabet mapping (encode direction).
+fn mr_encode_table(value: u8) -> Option<u8> {
+    match value {
+        7 => Some(b'D'),
+        14 => Some(b'h'),
+        59 => Some(b'/'),
+        62 => Some(b'+'),
+        63 => Some(b'x'),
+        0..=10 => Some(value + b'a'),
+        11..=36 => Some(value - 11 + b'A'),
+        37..=46 => Some(value - 37 + b'0'),
+        47..=61 => Some(value - 47 + b'l'),
+        _ => None,
+    }
+}
+
+fn mr_decode_table(value: u8) -> Option<u8> {
+    match value {
+        b'D' => Some(7),
+        b'h' => Some(14),
+        b'x' => Some(63),
+        b'+' => Some(62),
+        b'/' => Some(59),
+        b'=' => Some(64),
+        b'A'..=b'Z' => Some(value - b'A' + 11),
+        b'a'..=b'k' => Some(value - b'a'),
+        b'l'..=b'z' => Some(value - b'l' + 47),
+        b'0'..=b'9' => Some(value - b'0' + 37),
+        _ => None,
+    }
+}
+
+/// `_mr_encode`: the platform's base64 variant.
+pub fn mr_encode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4 + 1);
+    let chunks = input.len() / 3;
+    for chunk in 0..chunks {
+        let base = chunk * 3;
+        let (b0, b1, b2) = (input[base], input[base + 1], input[base + 2]);
+        out.push(mr_encode_table(b0 >> 2)?);
+        out.push(mr_encode_table((b0 & 0x03) << 4 | b1 >> 4)?);
+        out.push(mr_encode_table((b1 & 0x0F) << 2 | b2 >> 6)?);
+        out.push(mr_encode_table(b2 & 0x3F)?);
+    }
+    let rest = input.len() % 3;
+    if rest != 0 {
+        let base = chunks * 3;
+        let mut buf = [0u8; 3];
+        buf[..rest].copy_from_slice(&input[base..base + rest]);
+        out.push(mr_encode_table(buf[0] >> 2)?);
+        out.push(mr_encode_table((buf[0] & 0x03) << 4 | buf[1] >> 4)?);
+        out.push(mr_encode_table((buf[1] & 0x0F) << 2 | buf[2] >> 6)?);
+        out.push(mr_encode_table(buf[2] & 0x3F)?);
+        let len = out.len();
+        for pad in 0..3 - rest {
+            out[len - pad - 1] = b'=';
+        }
+    }
+    out.push(0);
+    Some(out)
+}
+
+/// `_mr_decode`: the matching decoder; returns the payload bytes.
+pub fn mr_decode(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let blocks = (input.len() - 4) / 4;
+    let mut cursor = 0usize;
+    for _ in 0..blocks {
+        let mut group = [0u8; 4];
+        for slot in &mut group {
+            *slot = mr_decode_table(input[cursor])?;
+            cursor += 1;
+        }
+        out.push(group[0] << 2 | (group[1] & 0x30) >> 4);
+        out.push((group[1] & 0x0F) << 4 | (group[2] & 0x3C) >> 2);
+        out.push((group[2] & 0x03) << 6 | (group[3] & 0x3F));
+    }
+    let mut group = [0u8; 4];
+    for slot in &mut group {
+        *slot = mr_decode_table(input[cursor])?;
+        cursor += 1;
+    }
+    let padding = if input.len() >= 2 && input[input.len() - 2] == b'=' {
+        2
+    } else if input.last() == Some(&b'=') {
+        1
+    } else {
+        0
+    };
+    for slot in group.iter_mut().skip(4 - padding) {
+        *slot = 0;
+    }
+    out.push(group[0] << 2 | (group[1] & 0x30) >> 4);
+    out.push((group[1] & 0x0F) << 4 | (group[2] & 0x3C) >> 2);
+    out.push((group[2] & 0x03) << 6 | (group[3] & 0x3F));
+    out.truncate(out.len() - padding);
+    Some(out)
+}
+
+/// The `next` native shared by the global and the `table.next` member.
+fn next_native_ref() -> Native {
+    Rc::new(|_vm, args| {
+        let Some(Value::Table(table)) = args.first() else {
+            return Ok(vec![Value::Nil]);
+        };
+        let current = args.get(1).cloned().unwrap_or(Value::Nil);
+        let table = table.borrow();
+        let entries: Vec<Value> = table
+            .array
+            .iter()
+            .enumerate()
+            .flat_map(|(index, value)| [vh::num_value(index as f32 + 1.0), value.clone()])
+            .chain(
+                table
+                    .snapshot_map()
+                    .iter()
+                    .flat_map(|(key, value)| [vh::key_to_value(key), value.clone()]),
+            )
+            .collect();
+        let position = if matches!(current, Value::Nil) {
+            0
+        } else {
+            entries
+                .iter()
+                .step_by(2)
+                .position(|key| vh::values_equal(key, &current))
+                .map(|pair| pair * 2 + 2)
+                .unwrap_or(entries.len())
+        };
+        match entries.get(position..position + 2) {
+            Some([key, value]) => Ok(vec![key.clone(), value.clone()]),
+            _ => Ok(vec![Value::Nil]),
+        }
+    })
+}
+
+/// `rawequal(a, b)`: identity-free value comparison.
+fn raw_equal_native(_vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
+    let equal = match (args.first(), args.get(1)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    Ok(vec![vh::num_value(if equal { 1.0 } else { 0.0 })])
+}
+
+/// `rawget(table, key)`: plain table lookup (no metatables in the VM).
+fn raw_get_native(_vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Some(Value::Table(table)) = args.first() else {
+        return Err("attempt to index a non-table value".to_string());
+    };
+    let key = args.get(1).cloned().unwrap_or(Value::Nil);
+    Ok(vec![table.borrow().get(&key)])
+}
+
+/// `unpack(table)`: the array part as multiple results.
+fn unpack_native(_vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Some(Value::Table(table)) = args.first() else {
+        return Err("bad argument #1 to 'unpack' (table expected)".to_string());
+    };
+    Ok(table.borrow().array.clone())
+}
+
+/// `table.insert(t, [pos,] value)`: appends or inserts into the array part.
+fn table_insert_native(_vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Some(Value::Table(table)) = args.first() else {
+        return Err("bad argument #1 to 'insert' (table expected)".to_string());
+    };
+    let mut table = table.borrow_mut();
+    match (args.get(1), args.get(2)) {
+        (Some(value), None) => table.array.push(value.clone()),
+        (Some(Value::Num(pos)), Some(value)) => {
+            let pos = (*pos as usize).saturating_sub(1).min(table.array.len());
+            table.array.insert(pos, value.clone());
+        }
+        _ => return Err("wrong number of arguments to 'insert'".to_string()),
+    }
+    Ok(vec![])
+}
+
+/// `table.remove(t [, pos])`: removes and returns the array-part element.
+fn table_remove_native(_vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
+    let Some(Value::Table(table)) = args.first() else {
+        return Err("bad argument #1 to 'remove' (table expected)".to_string());
+    };
+    let mut table = table.borrow_mut();
+    let pos = match args.get(1).and_then(vh::as_num) {
+        Some(value) => (value as usize).saturating_sub(1),
+        None => table.array.len().saturating_sub(1),
+    };
+    if pos < table.array.len() {
+        Ok(vec![table.array.remove(pos)])
+    } else {
+        Ok(vec![Value::Nil])
+    }
+}
+
+/// Loads a packaged `.mr` member as a callable MiniJ closure. The loader
+/// alias `_loadFile` shares this path.
+fn load_package_chunk(vm: &mut Vm, name: &str) -> Result<Value, String> {
+    let data = vm
+        .package
+        .as_ref()
+        .and_then(|package| package.read_entry(name).ok())
+        .ok_or_else(|| format!("cannot open {name:?}"))?;
+    let chunk = crate::undump::Chunk::parse(&data)
+        .map_err(|error| format!("cannot load {name:?}: {error}"))?;
+    Ok(Value::Closure(Rc::new(crate::vm::LuaClosure {
+        proto: Rc::new(chunk.proto),
+        upvals: Vec::new(),
+    })))
+}
+
 /// `_com(input0, input1, [len], [code])`: the script → runtime bridge.
 /// 800 loads an ext image (input1 = the ext bytes as a string), 801 calls
 /// the registered handler with (code, input bytes).
@@ -760,6 +1911,33 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
             }
             Ok(vec![vh::num_value(0.0)])
         }
+        // Handler registrations and platform queries (the vmrp TestCom
+        // contract): 1 = uptime, 2-6 = event/timer/stop/pause/resume.
+        1 => Ok(vec![vh::num_value(
+            vm.guest
+                .as_ref()
+                .map(|guest| guest.uptime_ms())
+                .unwrap_or(0) as f32,
+        )]),
+        2..=4 => {
+            let global = match input0 {
+                2 => "__event_cb",
+                3 => "__timer_cb",
+                _ => "__stop_cb",
+            };
+            let value = args.get(1).cloned().unwrap_or(Value::Nil);
+            vm.globals
+                .borrow_mut()
+                .set(vh::str_value(global.as_bytes()), value);
+            Ok(vec![vh::num_value(0.0)])
+        }
+        5 | 6 => Ok(vec![vh::num_value(0.0)]),
+        100 => Ok(vec![vh::num_value(4.0)]),
+        101 | 102 => Ok(vec![vh::num_value(1024.0 * 1024.0)]),
+        300 => Ok(vec![vh::num_value(1.0)]),
+        301 => Ok(vec![vh::num_value(1.0)]),
+        400 => Ok(vec![vh::num_value(0.0)]),
+        401 => Ok(vec![vh::num_value(240.0)]),
         // setgcthreshold: the interpreter has no incremental GC to tune.
         403 => Ok(vec![vh::num_value(0.0)]),
         800 | 802 => {
@@ -971,7 +2149,7 @@ fn register_stub_group(vm: &mut Vm, names: &[&'static str]) {
         let key = *name;
         vm.register(
             key,
-            Box::new(move |_vm, _args| {
+            Rc::new(move |_vm, _args| {
                 {
                     use std::collections::HashSet;
                     use std::sync::Mutex;

@@ -22,6 +22,8 @@ pub mod error;
 pub mod fmt;
 pub mod format;
 pub mod input;
+pub mod lua_pattern;
+pub mod md5;
 pub mod opcodes;
 pub mod package;
 pub mod script;

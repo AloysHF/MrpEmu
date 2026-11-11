@@ -229,19 +229,31 @@ impl MrpMachine {
             })
             .unwrap_or_default();
         for id in due {
-            if let Some(guest) = bridge.vm.guest.as_mut() {
-                if let Some(timer) = guest.timers.iter_mut().find(|timer| timer.id == id) {
-                    timer.next_fire = now + timer.interval;
+            let ext_driven = bridge
+                .vm
+                .guest
+                .as_ref()
+                .map(|guest| guest.c_function != 0)
+                .unwrap_or(false);
+            if ext_driven {
+                if let Some(guest) = bridge.vm.guest.as_mut() {
+                    if let Some(timer) = guest.timers.iter_mut().find(|timer| timer.id == id) {
+                        timer.next_fire = now + timer.interval;
+                    }
+                    let mut screen = std::mem::replace(
+                        &mut bridge.vm.screen,
+                        crate::display::Screen::new(
+                            crate::display::DEFAULT_WIDTH,
+                            crate::display::DEFAULT_HEIGHT,
+                        ),
+                    );
+                    let _ = guest.fire_timer(&mut screen);
+                    bridge.vm.screen = screen;
                 }
-                let mut screen = std::mem::replace(
-                    &mut bridge.vm.screen,
-                    crate::display::Screen::new(
-                        crate::display::DEFAULT_WIDTH,
-                        crate::display::DEFAULT_HEIGHT,
-                    ),
-                );
-                let _ = guest.fire_timer(&mut screen);
-                bridge.vm.screen = screen;
+            } else {
+                // Script-level timers route through `_com(3, fn)` /
+                // `dealtimer` instead of the guest engine.
+                let _ = bridge.fire_script_timer();
             }
         }
 
@@ -267,13 +279,17 @@ impl MrpMachine {
                 .expect("package parsed at load"),
         );
         bridge.create_guest();
-        let script_ok = bridge.run_start_script().is_ok()
-            && bridge
-                .vm
-                .guest
-                .as_ref()
-                .map(|guest| guest.c_function != 0)
-                .unwrap_or(false);
+        // Pure-script applications never register an ext handler, so the
+        // script itself completing is the only success criterion here; a
+        // script that also loaded an ext simply keeps that handler live.
+        let script_result = bridge.run_start_script();
+        if let Err(error) = &script_result {
+            log::warn!(
+                "start.mr failed: {error}; missing globals: {:?}",
+                bridge.vm.missing_globals.borrow()
+            );
+        }
+        let script_ok = script_result.is_ok();
         if script_ok {
             self.screen = std::mem::replace(
                 &mut bridge.vm.screen,
@@ -282,11 +298,11 @@ impl MrpMachine {
             self.script = Some(bridge);
             return;
         }
-        // Direct ext path: try every .ext member in package order until one
-        // registers an event handler. Self-registering images (hello) work
-        // on the first try; stub loaders (test.mrp/mpc.mrp) need a later
-        // member such as game.ext.
-        let ext_files: Vec<(String, Vec<u8>)> = package
+        // Direct ext path: try every .ext member until one registers.
+        // Loader-stub images (a few hundred bytes whose only job is to be
+        // driven by the script chain) register but idle, so order by size —
+        // the real application image is always the largest member.
+        let mut ext_files: Vec<(String, Vec<u8>)> = package
             .entries()
             .iter()
             .filter(|entry| entry.name.to_lowercase().ends_with(".ext"))
@@ -297,6 +313,7 @@ impl MrpMachine {
                 )
             })
             .collect();
+        ext_files.sort_by_key(|(_, data)| std::cmp::Reverse(data.len()));
         if ext_files.is_empty() {
             log::info!("pure-script package: no ext to load");
             return;

@@ -2205,6 +2205,81 @@ impl Guest {
     pub fn file_len(&self, handle: usize) -> Option<usize> {
         Some(self.open_files.get(handle.wrapping_sub(1))?.data.len())
     }
+
+    /// Writes bytes at the current position; returns whether it landed.
+    pub fn file_write(&mut self, handle: usize, data: &[u8]) -> bool {
+        let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) else {
+            return false;
+        };
+        if file.closed {
+            return false;
+        }
+        let end = file.pos + data.len();
+        if end > file.data.len() {
+            file.data.resize(end, 0);
+        }
+        file.data[file.pos..end].copy_from_slice(data);
+        file.pos = end;
+        true
+    }
+
+    /// Seeks like `mr_seek`: whence 0 = set, 1 = current, 2 = end. Returns
+    /// the resulting position (MR_FAILED as -1).
+    pub fn file_seek(&mut self, handle: usize, offset: i32, whence: i32) -> i32 {
+        let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) else {
+            return -1;
+        };
+        if file.closed {
+            return -1;
+        }
+        let len = file.data.len() as i64;
+        let base = match whence {
+            0 => 0,
+            1 => file.pos as i64,
+            _ => len,
+        };
+        let target = (base + i64::from(offset)).clamp(0, len);
+        file.pos = target as usize;
+        file.pos as i32
+    }
+
+    /// Milliseconds since the guest engine started (`mr_getTime` base).
+    pub fn uptime_ms(&self) -> u32 {
+        self.started_at.elapsed().as_millis() as u32
+    }
+
+    /// Bresenham line into the screen buffer (clipped per pixel).
+    pub fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: u16) {
+        let width = u32::from(self.config.screen_width);
+        let height = u32::from(self.config.screen_height);
+        let plot = |guest: &mut Self, x: i32, y: i32| {
+            if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
+                let (x, y) = (x as u32, y as u32);
+                guest.w16(SCREENBUF + (y * width + x) * 2, color);
+            }
+        };
+        let dx = (x2 - x1).abs();
+        let dy = -(y2 - y1).abs();
+        let (mut x, mut y) = (x1, y1);
+        let step_x = if x1 < x2 { 1 } else { -1 };
+        let step_y = if y1 < y2 { 1 } else { -1 };
+        let mut error = dx + dy;
+        loop {
+            plot(self, x, y);
+            if x == x2 && y == y2 {
+                break;
+            }
+            let doubled = error * 2;
+            if doubled >= dy {
+                error += dy;
+                x += step_x;
+            }
+            if doubled <= dx {
+                error += dx;
+                y += step_y;
+            }
+        }
+    }
 }
 
 /// Adapter implementing `armv4t_emu::Memory` over the guest memory vector.
@@ -2440,6 +2515,142 @@ mod tests {
             "✓ drawText rendered: {} colors (black bg + white text)",
             unique.len()
         );
+    }
+
+    /// Writes the machine screen as a 24-bit BMP for visual inspection.
+    fn write_screen_bmp(machine: &crate::emulator::MrpMachine, path: &str) {
+        let screen = machine.screen();
+        let pixels = screen.pixels();
+        let (width, height) = (screen.width() as u32, screen.height() as u32);
+        let row_size = width * 3;
+        let padding = (4 - (row_size % 4)) % 4;
+        let pixel_bytes = (row_size + padding) * height;
+        let mut bmp = Vec::with_capacity(54 + pixel_bytes as usize);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(54 + pixel_bytes).to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&width.to_le_bytes());
+        bmp.extend_from_slice(&height.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&24u16.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&pixel_bytes.to_le_bytes());
+        bmp.extend_from_slice(&2835u32.to_le_bytes());
+        bmp.extend_from_slice(&2835u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        for y in (0..height).rev() {
+            for x in 0..width {
+                let pixel = pixels[(y * width + x) as usize];
+                let red = ((pixel >> 11) & 0x1F) as u8;
+                let green = ((pixel >> 5) & 0x3F) as u8;
+                let blue = (pixel & 0x1F) as u8;
+                bmp.extend_from_slice(&[
+                    (blue << 3) | (blue >> 2),
+                    (green << 2) | (green >> 4),
+                    (red << 3) | (red >> 2),
+                ]);
+            }
+            bmp.resize(bmp.len() + padding as usize, 0);
+        }
+        let _ = std::fs::write(path, &bmp);
+    }
+
+    /// Survey: run every reference sample through 240 frames with periodic
+    /// input, then dump per-sample diagnostics (boot path, screen histogram,
+    /// top slots, missing globals) and a BMP snapshot each.
+    #[test]
+    #[ignore = "requires the local reference corpus under tmp/"]
+    fn samples_runtime_survey() {
+        let _ = env_logger::try_init();
+        let samples = [
+            "../../tmp/mrpemu/sdcard/mythroad/hello.mrp",
+            "../../tmp/mrpemu/sdcard/mythroad/gymls.mrp",
+            "../../tmp/mrpemu/sdcard/mythroad/test.mrp",
+            "../../tmp/vmrp/wasm/dist/fs/mythroad/dsm_gm.mrp",
+            "../../tmp/vmrp/wasm/dist/fs/mythroad/mpc.mrp",
+            "../../tmp/scratch/Maze.mrp",
+            "../../tmp/vmrp/mrc/asm/asm.mrp",
+            "../../tmp/vmrp/wasm/dist/fs/mythroad/ydqtwo.mrp",
+        ];
+        let _ = std::fs::create_dir_all("../../tmp/scratch/survey");
+        // SURVEY_ONLY=<substring> restricts the run to matching samples.
+        let only = std::env::var("SURVEY_ONLY").ok();
+        for sample in &samples {
+            let name = sample.rsplit('/').next().unwrap_or(sample);
+            let stem = name.trim_end_matches(".mrp");
+            if let Some(only) = &only {
+                if !name.contains(only.as_str()) {
+                    continue;
+                }
+            }
+            let Ok(mut machine) = crate::emulator::MrpMachine::from_path(sample) else {
+                eprintln!("=== {name}: LOAD FAILED ===");
+                continue;
+            };
+            for frame in 0..240 {
+                machine.run_frame();
+                for (press_frame, key) in [
+                    (40u32, crate::input::MrpKey::Down),
+                    (60, crate::input::MrpKey::Down),
+                    (80, crate::input::MrpKey::Ok),
+                    (120, crate::input::MrpKey::Ok),
+                    (160, crate::input::MrpKey::Right),
+                    (180, crate::input::MrpKey::Up),
+                ] {
+                    if frame == press_frame {
+                        machine.input_mut().press(key);
+                    }
+                    if frame == press_frame + 3 {
+                        machine.input_mut().release(key);
+                    }
+                }
+            }
+            let screen = machine.screen();
+            let pixels = screen.pixels();
+            let mut histogram: std::collections::HashMap<u16, usize> =
+                std::collections::HashMap::new();
+            for &pixel in pixels {
+                *histogram.entry(pixel).or_insert(0) += 1;
+            }
+            let mut colors: Vec<_> = histogram.iter().collect();
+            colors.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+            let top: Vec<String> = colors
+                .iter()
+                .take(5)
+                .map(|(color, count)| {
+                    format!(
+                        "{color:04x}:{:.1}%",
+                        **count as f64 / pixels.len() as f64 * 100.0
+                    )
+                })
+                .collect();
+            let mut slots: Vec<String> = machine
+                .guest_ref()
+                .map(|guest| {
+                    guest
+                        .slot_calls
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, count)| **count > 0)
+                        .map(|(slot, count)| format!("{slot}:{count}"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            slots.truncate(12);
+            let missing = machine.missing_globals().len();
+            eprintln!(
+                "=== {name}: ext={} colors={} top=[{}] slots=[{}] missing={} ===",
+                machine.ext_handler_registered(),
+                histogram.len(),
+                top.join(" "),
+                slots.join(" "),
+                missing
+            );
+            write_screen_bmp(&machine, &format!("../../tmp/scratch/survey/{stem}.bmp"));
+        }
     }
 
     /// Diagnostic: boot Maze.mrp, run 60 frames, dump all slot calls with

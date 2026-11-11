@@ -204,7 +204,7 @@ impl Table {
 // Interpreter state
 // ---------------------------------------------------------------------------
 
-type Native = Box<dyn FnMut(&mut Vm, &[Value]) -> Result<Vec<Value>, String>>;
+pub type Native = Rc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, String>>;
 
 /// Errors surfaced by the interpreter (script `error()` and internal faults).
 #[derive(Debug, Clone)]
@@ -310,6 +310,30 @@ impl Vm {
             .set(Value::str_from(name.as_bytes()), Value::Native(index));
     }
 
+    /// Exposes an already-registered native under an additional global name
+    /// (the platform's `_lowerCamel` aliases, e.g. `_num` for `tonumber`).
+    pub fn alias(&mut self, existing: &'static str, alias: &'static str) {
+        if let Some((index, _)) = self
+            .native_names
+            .iter()
+            .enumerate()
+            .find(|(_, name)| **name == existing)
+        {
+            self.globals.borrow_mut().set(
+                Value::str_from(alias.as_bytes()),
+                Value::Native(index as u16),
+            );
+        }
+    }
+
+    /// Looks up a native's index by registration name.
+    pub fn native_index(&self, name: &str) -> Option<u16> {
+        self.native_names
+            .iter()
+            .position(|entry| *entry == name)
+            .map(|index| index as u16)
+    }
+
     /// Runs a parsed chunk as the main function with no arguments.
     pub fn run_chunk(&mut self, proto: Rc<Proto>) -> Result<(), VmError> {
         let closure = Rc::new(LuaClosure {
@@ -355,7 +379,9 @@ impl Vm {
         self.stack[index] = value;
     }
 
-    fn call_closure(
+    /// Calls a closure with the given arguments. Public so that native
+    /// functions (e.g. `pcall`) can re-enter the interpreter.
+    pub fn call_closure(
         &mut self,
         closure: Rc<LuaClosure>,
         args: &[Value],
@@ -391,7 +417,15 @@ impl Vm {
             Ok(results) => results,
             Err(error) => {
                 self.stack.truncate(base);
-                return Err(error);
+                // Prepend this frame's chunk name so the error carries the
+                // full chunk chain from the innermost frame outward.
+                let source = closure
+                    .proto
+                    .source
+                    .as_deref()
+                    .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                    .unwrap_or_else(|| "<anon>".to_string());
+                return Err(format!("{source} -> {error}"));
             }
         };
         self.stack.truncate(base);
@@ -451,24 +485,30 @@ impl Vm {
                 Op::GetGlobal => {
                     let name = constant_value(&proto, bx as usize)?;
                     let value = self.globals.borrow().get(&name);
-                    let value = if matches!(value, Value::Nil) {
-                        if let Some(stub) = self.stub_native {
-                            if let Value::Str(text) = &name {
-                                let mut missing = self.missing_globals.borrow_mut();
-                                if !missing
-                                    .iter()
-                                    .any(|entry| entry.as_bytes() == text.as_slice())
-                                {
-                                    missing.push(String::from_utf8_lossy(text).to_string());
-                                }
+                    if matches!(value, Value::Nil) {
+                        if let Value::Str(text) = &name {
+                            let mut missing = self.missing_globals.borrow_mut();
+                            if !missing
+                                .iter()
+                                .any(|entry| entry.as_bytes() == text.as_slice())
+                            {
+                                let source = closure
+                                    .proto
+                                    .source
+                                    .as_deref()
+                                    .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                                    .unwrap_or_default();
+                                log::warn!(
+                                    "global `{}` missed in {source} at pc {}",
+                                    String::from_utf8_lossy(text),
+                                    pc
+                                );
+                                missing.push(String::from_utf8_lossy(text).to_string());
                             }
-                            Value::Native(stub)
-                        } else {
-                            value
                         }
-                    } else {
-                        value
-                    };
+                    }
+                    // Lua semantics: a missing global reads as nil. The old
+                    // stub substitution broke  checks in scripts.
                     self.set_stack(base + a, value);
                 }
                 Op::SetGlobal => {
@@ -479,7 +519,9 @@ impl Vm {
                 Op::GetTable => {
                     let table = self.stack[base + b].clone();
                     let key = self.rk(&proto, base, c)?;
-                    let result = self.table_get(&table, &key)?;
+                    let result = self
+                        .table_get(&table, &key)
+                        .map_err(|error| format!("{error} (gettable at pc {pc})"))?;
                     self.set_stack(base + a, result);
                 }
                 Op::SetTable => {
@@ -574,7 +616,8 @@ impl Vm {
                     } else {
                         Some(c.saturating_sub(1))
                     };
-                    self.call_value_in_place(&func, &args, nresults, func_reg)?;
+                    self.call_value_in_place(&func, &args, nresults, func_reg)
+                        .map_err(|error| format!("{error} (call at pc {pc})"))?;
                     pc += 0;
                 }
                 Op::Tailcall => {
@@ -790,19 +833,17 @@ impl Vm {
         }
     }
 
-    fn call_native(&mut self, index: u16, args: &[Value]) -> Result<Vec<Value>, String> {
-        if index as usize >= self.natives.len() {
-            return Err("native index out of range".to_string());
-        }
-        // Take the native out so it can borrow `self` mutably; natives do
-        // not re-enter their own slot.
-        let mut native = std::mem::replace(
-            &mut self.natives[index as usize],
-            Box::new(|_, _| unreachable!("vacant native slot")),
-        );
-        let result = native(self, args);
-        self.natives[index as usize] = native;
-        result
+    /// Calls a registered native by index. Public so `pcall`-style natives
+    /// can invoke function values.
+    pub fn call_native(&mut self, index: u16, args: &[Value]) -> Result<Vec<Value>, String> {
+        let native = self
+            .natives
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(|| "native index out of range".to_string())?;
+        // The native is shared through an Rc and never borrows the VM, so
+        // re-entrant calls (nested dofile/pcall) are safe.
+        native(self, args)
     }
 
     /// RK field: registers below MAXSTACK, constants above.
@@ -842,12 +883,18 @@ fn constant_value(proto: &Proto, index: usize) -> Result<Value, String> {
 }
 
 fn arith(op: Op, lhs: &Value, rhs: &Value) -> Result<Value, String> {
-    let lhs = lhs
-        .as_num()
-        .ok_or_else(|| format!("attempt to perform arithmetic on a {}", lhs.type_name()))?;
-    let rhs = rhs
-        .as_num()
-        .ok_or_else(|| format!("attempt to perform arithmetic on a {}", rhs.type_name()))?;
+    let lhs = lhs.as_num().ok_or_else(|| {
+        format!(
+            "attempt to perform arithmetic on a {} ({lhs:?})",
+            lhs.type_name()
+        )
+    })?;
+    let rhs = rhs.as_num().ok_or_else(|| {
+        format!(
+            "attempt to perform arithmetic on a {} ({rhs:?})",
+            rhs.type_name()
+        )
+    })?;
     let result = match op {
         Op::Add => lhs + rhs,
         Op::Sub => lhs - rhs,
@@ -935,6 +982,34 @@ mod tests {
             protos: vec![],
             code,
         })
+    }
+
+    #[test]
+    fn multi_result_call_overwrites_callee_slot() {
+        // Mirrors ydqtwo start.mr: a one-result native called with two
+        // requested results must overwrite both destination slots.
+        let mut vm = Vm::new();
+        vm.register("_textWidth", Rc::new(|_vm, _args| Ok(vec![Value::Nil])));
+        let proto = proto(
+            vec![
+                Constant::Str(b"_textWidth".to_vec()),
+                Constant::Str(b"x".to_vec()),
+                Constant::Str(b"ChWordW".to_vec()),
+            ],
+            vec![
+                inst_bx(Op::GetGlobal, 0, 0), // r0 = _textWidth (stub)
+                inst_bx(Op::LoadK, 1, 1),     // r1 = "x"
+                inst(Op::Call, 0, 2, 3),      // r0, r1 = f("x") (2 results)
+                inst_bx(Op::SetGlobal, 0, 2), // ChWordW = r0
+                inst(Op::Return, 0, 1, 0),
+            ],
+        );
+        vm.run_chunk(proto).expect("chunk must run");
+        let value = vm.globals.borrow().get(&Value::str_from(b"ChWordW"));
+        assert!(
+            matches!(value, Value::Nil),
+            "ChWordW must be the call result, got {value:?}"
+        );
     }
 
     #[test]
