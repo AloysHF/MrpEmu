@@ -34,6 +34,8 @@ pub struct MrpMachine {
     last_keys: BTreeSet<MrpKey>,
     /// Directory for guest-created file persistence.
     persist_dir: Option<std::path::PathBuf>,
+    /// Screen resolution (detected from the corpus directory or default).
+    resolution: (u16, u16),
 }
 
 impl MrpMachine {
@@ -51,6 +53,7 @@ impl MrpMachine {
             boot_error: None,
             last_keys: BTreeSet::new(),
             persist_dir: None,
+            resolution: (240, 320),
         };
         machine.draw_placeholder();
         Ok(machine)
@@ -149,6 +152,12 @@ impl MrpMachine {
         } else {
             Ok(0)
         }
+    }
+
+    /// Sets the screen resolution. Call before the first `run_frame`.
+    pub fn set_resolution(&mut self, width: u16, height: u16) {
+        self.resolution = (width, height);
+        self.screen = crate::display::Screen::new(width, height);
     }
 
     /// The boot failure reason, once a boot was attempted and failed.

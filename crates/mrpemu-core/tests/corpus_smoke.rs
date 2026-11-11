@@ -3,6 +3,9 @@
 //! (`-- --ignored`) because it needs the local corpus; CI runs it nightly.
 
 use mrpemu_core::emulator::MrpMachine;
+use mrpemu_core::MrpKey;
+
+use std::collections::BTreeMap;
 
 /// How many packages one survey pass samples.
 const SAMPLE_SIZE: usize = 200;
@@ -29,6 +32,18 @@ fn collect_mrps(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Detects the screen resolution from the corpus directory name.
+fn detect_resolution(path: &std::path::Path) -> (u16, u16) {
+    let text = path.to_string_lossy();
+    if text.contains("240x400") || text.contains("240×400") {
+        (240, 400)
+    } else if text.contains("320x480") || text.contains("320×480") {
+        (320, 480)
+    } else {
+        (240, 320)
+    }
+}
+
 fn classify(machine: &MrpMachine, pixels_nonzero: usize, total: usize) -> &'static str {
     if machine.boot_error().is_some() {
         return "boot-failed";
@@ -44,7 +59,7 @@ fn classify(machine: &MrpMachine, pixels_nonzero: usize, total: usize) -> &'stat
 }
 
 /// Samples the corpus and prints one classification line per package plus a
-/// summary tally. `CORPUS_SAMPLE` overrides the deterministic sample.
+/// summary tally with resolution and miss-classification breakdowns.
 #[test]
 #[ignore = "requires the local reference corpus under tmp/mrp_game"]
 fn corpus_smoke_sample() {
@@ -57,8 +72,7 @@ fn corpus_smoke_sample() {
         all.len()
     );
 
-    // Deterministic LCG scatter-sample: stride the sorted list with an
-    // odd multiplier so every region contributes without a rand dep.
+    // Deterministic LCG scatter-sample.
     let mut picks: Vec<std::path::PathBuf> = Vec::with_capacity(SAMPLE_SIZE.min(all.len()));
     let stride = (all.len() as u64 / SAMPLE_SIZE.max(1) as u64).max(1) | 1;
     let mut cursor = (stride * 7) % all.len() as u64;
@@ -68,9 +82,9 @@ fn corpus_smoke_sample() {
     }
     picks.sort();
 
-    let mut tally: std::collections::BTreeMap<&'static str, Vec<String>> =
-        std::collections::BTreeMap::new();
-    // CORPUS_ONLY=<substring> restricts the run to matching packages.
+    let mut tally: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    let mut miss_tally: BTreeMap<String, usize> = BTreeMap::new();
+    let mut res_tally: BTreeMap<String, BTreeMap<&'static str, usize>> = BTreeMap::new();
     let only = std::env::var("CORPUS_ONLY").ok();
     for path in &picks {
         let name = path
@@ -83,34 +97,61 @@ fn corpus_smoke_sample() {
                 continue;
             }
         }
-        // A guest panicking inside the ARM core must not abort the whole
-        // sweep; classify it and keep walking the corpus.
-        let outcome = std::panic::catch_unwind(|| -> &'static str {
+        let (res_w, res_h) = detect_resolution(path);
+        let res_key = format!("{res_w}x{res_h}");
+        let (outcome, misses) = std::panic::catch_unwind(|| -> (&'static str, Vec<String>) {
             let Ok(mut machine) = MrpMachine::from_path(path) else {
-                return "load-failed";
+                return ("load-failed", Vec::new());
             };
+            machine.set_resolution(res_w, res_h);
             for frame in 0..FRAMES_PER_SAMPLE {
                 machine.run_frame();
                 if frame == 40 {
-                    machine.input_mut().press(mrpemu_core::MrpKey::Ok);
+                    machine.input_mut().press(MrpKey::Ok);
                 }
                 if frame == 44 {
-                    machine.input_mut().release(mrpemu_core::MrpKey::Ok);
+                    machine.input_mut().release(MrpKey::Ok);
                 }
             }
             let screen = machine.screen();
             let nonzero = screen.pixels().iter().filter(|&&p| p != 0).count();
             let total = screen.pixels().len();
-            classify(&machine, nonzero, total)
+            let outcome = classify(&machine, nonzero, total);
+            let misses = if matches!(outcome, "blank" | "boot-failed") {
+                machine.missing_globals()
+            } else {
+                Vec::new()
+            };
+            (outcome, misses)
         })
-        .unwrap_or("crash");
-        eprintln!("{outcome:12} {name}");
+        .unwrap_or(("crash", Vec::new()));
+        for miss in &misses {
+            *miss_tally.entry(format!("global:{miss}")).or_default() += 1;
+        }
+        eprintln!("{outcome:12} [{res_key}] {name}");
         tally.entry(outcome).or_default().push(name);
+        *res_tally
+            .entry(res_key)
+            .or_default()
+            .entry(outcome)
+            .or_default() += 1;
     }
 
     eprintln!("=== corpus smoke summary ({} sampled) ===", picks.len());
     for (outcome, names) in &tally {
         eprintln!("{outcome:12} {:4}  e.g. {}", names.len(), names[0]);
     }
-    let _ = std::env::var("CORPUS_ONLY");
+    eprintln!("=== by resolution ===");
+    for (res, outcomes) in &res_tally {
+        let parts: Vec<String> = outcomes.iter().map(|(o, n)| format!("{o}:{n}")).collect();
+        eprintln!("  {res}: {}", parts.join(" "));
+    }
+    if !miss_tally.is_empty() {
+        eprintln!("=== top missing globals (blank/boot-failed) ===");
+        let mut sorted: Vec<_> = miss_tally.iter().collect();
+        sorted.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (name, count) in sorted.iter().take(15) {
+            eprintln!("  {name}: {count}");
+        }
+    }
 }
