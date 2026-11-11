@@ -87,6 +87,24 @@ impl ScriptBridge {
             .globals
             .borrow_mut()
             .set(vh::str_value(b"_mr_param"), vh::str_value(b""));
+        // Glyph metrics the shared-library scripts reference before the
+        // game's own _textWidth calibration runs.
+        self.vm
+            .globals
+            .borrow_mut()
+            .set(vh::str_value(b"ChWordW"), vh::num_value(16.0));
+        self.vm
+            .globals
+            .borrow_mut()
+            .set(vh::str_value(b"ChWordH"), vh::num_value(16.0));
+        self.vm
+            .globals
+            .borrow_mut()
+            .set(vh::str_value(b"EngWordW"), vh::num_value(8.0));
+        self.vm
+            .globals
+            .borrow_mut()
+            .set(vh::str_value(b"EngWordH"), vh::num_value(16.0));
         // Platform-visible package identity: the header app id and pack
         // file name back the `o_APPID` / `contentMrp` globals.
         let app_id = package.header().app_id;
@@ -390,6 +408,19 @@ impl ScriptBridge {
                 }),
             );
         }
+        // Audio: no output in the core, but success lets games skip
+        // audio init and proceed to the game loop.
+        for name in [
+            "BgMusicSet",
+            "BgMusicStart",
+            "BgMusicStop",
+            "SoundSet",
+            "SoundPlay",
+            "SoundStop",
+        ] {
+            self.vm
+                .register(name, Rc::new(|_vm, _args| Ok(vec![vh::num_value(0.0)])));
+        }
         register_stub_group(
             &mut self.vm,
             &[
@@ -414,12 +445,6 @@ impl ScriptBridge {
                 "ConnectWAP",
                 "RunFile",
                 "c2u",
-                "BgMusicSet",
-                "BgMusicStart",
-                "BgMusicStop",
-                "SoundSet",
-                "SoundPlay",
-                "SoundStop",
                 "PlatDrawChar",
                 "GetCharBitmap",
             ],

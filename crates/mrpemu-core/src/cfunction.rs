@@ -1278,10 +1278,14 @@ impl Guest {
                 MR_SUCCESS
             }
             55 | 56 => MR_SUCCESS, // shake
-            57 | 58 => MR_FAILED,  // sound: unsupported yet
-            59 | 60 => MR_FAILED,  // SMS/call: never dial out
-            61 => 0,               // network id
-            62 => MR_FAILED,       // connectWAP: offline
+            // mr_playSound(type, data, len, loop) / mr_stopSound():
+            // no audio output in the core, but success lets games skip
+            // audio init instead of erroring out.
+            57 => MR_SUCCESS,
+            58 => MR_SUCCESS,
+            59 | 60 => MR_FAILED, // SMS/call: never dial out
+            61 => 0,              // network id
+            62 => MR_FAILED,      // connectWAP: offline
             // GUI natives: menu/dialog/text/edit/win. Each Create returns a
             // nonzero handle; Set/Show/Refresh return MR_SUCCESS; Release
             // and GetText return success. This lets ext code that builds
