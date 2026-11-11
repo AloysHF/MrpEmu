@@ -32,6 +32,8 @@ pub struct MrpMachine {
     boot_attempted: bool,
     boot_error: Option<String>,
     last_keys: BTreeSet<MrpKey>,
+    /// Directory for guest-created file persistence.
+    persist_dir: Option<std::path::PathBuf>,
 }
 
 impl MrpMachine {
@@ -48,6 +50,7 @@ impl MrpMachine {
             boot_attempted: false,
             boot_error: None,
             last_keys: BTreeSet::new(),
+            persist_dir: None,
         };
         machine.draw_placeholder();
         Ok(machine)
@@ -114,6 +117,38 @@ impl MrpMachine {
             .as_ref()
             .map(|bridge| bridge.missing_globals())
             .unwrap_or_default()
+    }
+
+    /// Sets the persistence directory and loads any previously saved
+    /// guest files into the pending file table.
+    pub fn set_persist_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        let dir = dir.into();
+        self.persist_dir = Some(dir.clone());
+        // Load persisted files into the bridge's pending file table so the
+        // guest sees them at boot. After boot, dirty files sync on close.
+        let dir = dir.clone();
+        if let Some(bridge) = self.script.as_mut() {
+            let _ = bridge.vm.guest.as_mut().map(|guest| {
+                let _ = guest.load_persistence(&dir);
+            });
+        }
+    }
+
+    /// Writes all guest-created/modified files to the persistence
+    /// directory. Returns the number of files written.
+    pub fn flush_persistence(&mut self) -> std::io::Result<usize> {
+        let Some(dir) = self.persist_dir.clone() else {
+            return Ok(0);
+        };
+        if let Some(guest) = self
+            .script
+            .as_ref()
+            .and_then(|bridge| bridge.vm.guest.as_ref())
+        {
+            guest.flush_persistence(&dir)
+        } else {
+            Ok(0)
+        }
     }
 
     /// The boot failure reason, once a boot was attempted and failed.

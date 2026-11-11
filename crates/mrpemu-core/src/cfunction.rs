@@ -350,6 +350,7 @@ pub struct Guest {
     pub slot_calls: [u64; TABLE_SLOTS],
     /// Heap address of the single glyph export buffer (lazily allocated).
     glyph_buf: u32,
+    dirty_files: std::collections::HashSet<String>,
     /// Loaded bitmaps: id → RGB565 pixel data.
     pub bitmaps: std::collections::HashMap<u32, Bitmap>,
     /// Monotonically increasing handle for GUI controls (menu/dialog/text/edit/win).
@@ -415,6 +416,7 @@ impl Guest {
             exit_requested: false,
             slot_calls: [0; TABLE_SLOTS],
             glyph_buf: 0,
+            dirty_files: std::collections::HashSet::new(),
             bitmaps: std::collections::HashMap::new(),
             next_gui_handle: 0,
             menu: None,
@@ -1818,6 +1820,14 @@ impl Guest {
             return -1;
         }
         self.open_files[handle - 1].closed = true;
+        // Sync the (possibly written) data back to the file table so
+        // subsequent mr_open calls see the updated content.
+        let file = &self.open_files[handle - 1];
+        if let Some(entry) = self.files.iter_mut().find(|(name, _)| *name == file.name) {
+            entry.1 = file.data.clone();
+        } else {
+            self.dirty_files.insert(file.name.clone());
+        }
         0
     }
 
@@ -2486,6 +2496,79 @@ impl Guest {
     /// Milliseconds since the guest engine started (`mr_getTime` base).
     pub fn uptime_ms(&self) -> u32 {
         self.started_at.elapsed().as_millis() as u32
+    }
+
+    /// Names of files the guest created or modified (not package members).
+    pub fn dirty_file_names(&self) -> Vec<String> {
+        self.dirty_files.iter().cloned().collect()
+    }
+
+    /// Reads a file's current content from the file table.
+    pub fn file_data(&self, name: &str) -> Option<&[u8]> {
+        self.files
+            .iter()
+            .find(|(entry, _)| entry == name)
+            .map(|(_, data)| data.as_slice())
+    }
+
+    /// Writes all dirty files (guest-created/modified, not package
+    /// members) into `dir`. Creates the directory if needed.
+    pub fn flush_persistence(&self, dir: &std::path::Path) -> std::io::Result<usize> {
+        std::fs::create_dir_all(dir)?;
+        let mut count = 0usize;
+        for name in &self.dirty_files {
+            // Normalize separators to avoid directory escapes.
+            let safe = name.replace('\\', "/");
+            let safe = safe.trim_start_matches('/');
+            if safe.is_empty() || safe.contains("..") {
+                continue;
+            }
+            let Some(data) = self
+                .files
+                .iter()
+                .find(|(entry, _)| entry == name)
+                .map(|(_, d)| d)
+            else {
+                continue;
+            };
+            let path = dir.join(safe);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, data)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Loads files from `dir` into the guest file table (overriding any
+    /// same-named entries). Returns the number of files loaded.
+    pub fn load_persistence(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {
+        let mut count = 0usize;
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(0);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            if let Some(existing) = self.files.iter_mut().find(|(entry, _)| *entry == name) {
+                existing.1 = data;
+            } else {
+                self.files.push((name, data));
+            }
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Screen-buffer plot with clipping.
