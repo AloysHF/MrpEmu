@@ -125,14 +125,12 @@ impl ScriptBridge {
         );
     }
 
-    /// Creates the ext guest with the default platform configuration.
-    pub fn create_guest(&mut self) {
+    /// Creates the ext guest with the platform configuration (the machine's
+    /// resolution flows in so the SDK runtime sees the real screen size).
+    pub fn create_guest_with(&mut self, config: crate::cfunction::GuestConfig) {
         if self.vm.guest.is_none() {
             let files = self.pending_files.take().unwrap_or_default();
-            self.vm.guest = Some(crate::cfunction::Guest::new(
-                crate::cfunction::GuestConfig::default(),
-                files,
-            ));
+            self.vm.guest = Some(crate::cfunction::Guest::new(config, files));
         }
     }
 

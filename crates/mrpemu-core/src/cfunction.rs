@@ -1717,6 +1717,103 @@ impl Guest {
                 self.next_gui_handle as i32
             }
             79 => MR_SUCCESS, // winRelease
+            // mr_drawRegion(gContext, src, sx, sy, w, h, transform, x, y,
+            // anchor): the J2ME-graphics blit. gContext's fields: clipX(0)
+            // clipY(4) clipXRight(16) clipYBottom(20) translateX(24)
+            // translateY(28); the shadow buffer at +44 with its width at
+            // +48. mr_jImageSt: data(0) width(4) height(6) trans(8)
+            // transcolor(10). Ported from the reference mr_graphics.c.
+            148 => {
+                let g = self.cpu.reg_get(self.cpu.mode(), R0);
+                let src = self.cpu.reg_get(self.cpu.mode(), R1);
+                let sx = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
+                let sy = self.cpu.reg_get(self.cpu.mode(), R3) as i32;
+                let w = self.stack_arg(0) as i32;
+                let h = self.stack_arg(1) as i32;
+                let transform = self.stack_arg(2) as i32;
+                let mut x = self.stack_arg(3) as i32;
+                let mut y = self.stack_arg(4) as i32;
+                let anchor = self.stack_arg(5) as i32;
+                if g == 0 || src == 0 || w <= 0 || h <= 0 {
+                    return MR_SUCCESS;
+                }
+                let src_data = self.r32(src);
+                let src_width = self.r16(src + 4) as i32;
+                let src_height = self.r16(src + 6) as i32;
+                let trans = self.r16(src + 8) as i32;
+                let transcolor = self.r16(src + 10);
+                let clip_x = self.r32(g) as i32;
+                let clip_y = self.r32(g + 4) as i32;
+                let clip_x_right = self.r32(g + 16) as i32;
+                let clip_y_bottom = self.r32(g + 20) as i32;
+                let translate_x = self.r32(g + 24) as i32;
+                let translate_y = self.r32(g + 28) as i32;
+                let dst_buf = self.r32(g + 44);
+                let dst_width = self.r32(g + 48) as i32;
+                // The destination dimensions swap for the 90-degree family.
+                let (dw, dh) = if transform >> 2 != 0 { (h, w) } else { (w, h) };
+                // Anchoring: 0 and 20 apply the translate; the rest use the
+                // 9-point anchor constants (V: TOP=16 BOTTOM=32 BASELINE=64
+                // VCENTER=2; H: LEFT=4 HCENTER=1 RIGHT=8).
+                if anchor == 0 || anchor == 20 {
+                    x += translate_x;
+                    y += translate_y;
+                } else {
+                    let (aw, ah) = if transform >> 2 != 0 { (h, w) } else { (w, h) };
+                    match anchor & 0x72 {
+                        16 | 0 => {}
+                        32 => y -= ah,         // BOTTOM
+                        64 => y -= ah / 2 - 3, // BASELINE
+                        2 => y -= ah / 2,      // VCENTER
+                        _ => {}
+                    }
+                    match anchor & 0x0D {
+                        4 | 0 => {}
+                        8 => x -= aw,     // RIGHT
+                        1 => x -= aw / 2, // HCENTER
+                        _ => {}
+                    }
+                }
+                let min_x = x.max(clip_x);
+                let min_y = y.max(clip_y);
+                let max_x = (x + dw).min(clip_x_right);
+                let max_y = (y + dh).min(clip_y_bottom);
+                if min_x >= max_x || min_y >= max_y {
+                    return MR_SUCCESS;
+                }
+                for dy in min_y..max_y {
+                    for dx in min_x..max_x {
+                        let (i, j) = match transform & 7 {
+                            0 => ((dx - x), (dy - y)),
+                            1 => ((dx - x), (h - 1 - (dy - y))),
+                            2 => ((w - 1 - (dx - x)), (dy - y)),
+                            3 => ((w - 1 - (dx - x)), (h - 1 - (dy - y))),
+                            4 => ((h - 1 - (dy - y)), (h - 1 - (dx - x))),
+                            5 => ((dy - y), (h - 1 - (dx - x))),
+                            6 => ((w - 1 - (dy - y)), (dx - x)),
+                            _ => ((dy - y), (dx - x)),
+                        };
+                        let px = sx + i;
+                        let py = sy + j;
+                        if px < 0 || py < 0 || px >= src_width || py >= src_height {
+                            continue;
+                        }
+                        let value = self.r16(src_data + (py * src_width + px) as u32 * 2);
+                        if trans != 0 {
+                            let key = if trans == 1 {
+                                self.r16(src_data)
+                            } else {
+                                transcolor
+                            };
+                            if value == key {
+                                continue;
+                            }
+                        }
+                        self.w16(dst_buf + (dy * dst_width + dx) as u32 * 2, value);
+                    }
+                }
+                MR_SUCCESS
+            }
             80 => {
                 // mr_getScreenInfo(struct)
                 let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
@@ -1846,13 +1943,6 @@ impl Guest {
                 // screen buffer rect through this slot.
                 self.refresh_screen(screen);
                 MR_SUCCESS
-            }
-            148 => {
-                warn_once(
-                    "bitmap",
-                    format!("mr_table slot {slot} (bitmap variant) is not implemented yet"),
-                );
-                0
             }
             124 => 0, // mr_bitmapCheck
             125 => self.swi_read_file(),

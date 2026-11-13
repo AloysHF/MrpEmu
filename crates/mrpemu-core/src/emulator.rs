@@ -163,6 +163,17 @@ impl MrpMachine {
         self.screen = crate::display::Screen::new(width, height);
     }
 
+    /// The guest platform configuration for the machine's resolution: the
+    /// SDK runtime reads the screen size from the table's data slots, so
+    /// every guest creation must carry `set_resolution`'s values.
+    fn guest_config(&self) -> crate::cfunction::GuestConfig {
+        crate::cfunction::GuestConfig {
+            screen_width: self.resolution.0,
+            screen_height: self.resolution.1,
+            ..Default::default()
+        }
+    }
+
     /// Installs the audio sink used by the guest's `mr_playSound` /
     /// `mr_stopSound` calls. Applies to the live guest when one exists;
     /// otherwise the sink is parked until the next boot creates a guest.
@@ -371,7 +382,7 @@ impl MrpMachine {
             crate::package::MrpPackage::parse(self.package.clone())
                 .expect("package parsed at load"),
         );
-        bridge.create_guest();
+        bridge.create_guest_with(self.guest_config());
         if let Some(sink) = self.pending_audio_sink.take() {
             if let Some(guest) = bridge.vm.guest.as_mut() {
                 guest.audio_sink = sink;
@@ -447,10 +458,8 @@ impl MrpMachine {
             // A fresh guest per attempt: a failed boot can leave the heap
             // drained (the SDK init allocates large pools before failing),
             // which would poison every later attempt.
-            let mut guest = crate::cfunction::Guest::new(
-                crate::cfunction::GuestConfig::default(),
-                packaged_files.clone(),
-            );
+            let mut guest =
+                crate::cfunction::Guest::new(self.guest_config(), packaged_files.clone());
             if let Some(sink) = self.pending_audio_sink.take() {
                 guest.audio_sink = sink;
             }
