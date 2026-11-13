@@ -35,24 +35,27 @@ use crate::fmt::{self, Arg};
 // Guest memory layout
 // ---------------------------------------------------------------------------
 
+/// Guest memory geometry — mirrors the reference firmware map (ext code
+/// 0x80000-0x180000, stack 0x180000-0x280000 growing down from 0x280000,
+/// bridge/tables at 0x280000, heap above). The SDK runtime derives its
+/// shell/control placements from LG_mem_end and the stack region, so the
+/// compressed layouts we tried before collided with them.
+///
 /// `mr_func_tab`: one pointer per table slot (149 slots).
-pub const TABLE_BASE: u32 = 0x0010_0000;
+pub const TABLE_BASE: u32 = 0x0028_0000;
 pub const TABLE_SLOTS: usize = 149;
 /// One bridge word per slot; guest calls into these addresses are
 /// intercepted before execution.
-pub const BRIDGE_BASE: u32 = 0x0010_1000;
+pub const BRIDGE_BASE: u32 = 0x0028_0400;
 /// The `sendAppEvent` callback bridge just past the function table: the
 /// chunk descriptor points here so the ext's timer wrappers reach the
 /// platform (code 0 = start, 1 = stop; `(ext, chunk, code, p0, p1)`).
 pub const SEND_APP_EVENT_ADDR: u32 = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4 + 8;
 /// Data variables referenced by the pointer-valued table slots.
-pub const DATA_BASE: u32 = 0x0010_2000;
-/// The guest-visible screen buffer, RGB565.
-pub const SCREENBUF: u32 = 0x0010_4000;
-pub const SCREENBUF_SIZE: u32 = 240 * 320 * 2;
+pub const DATA_BASE: u32 = 0x0028_0800;
 /// Where the ext image is loaded.
-pub const EXT_BASE: u32 = 0x0020_0000;
-pub const EXT_MAX_SIZE: u32 = 512 * 1024;
+pub const EXT_BASE: u32 = 0x0008_0000;
+pub const EXT_MAX_SIZE: u32 = 0x0010_0000;
 /// Region backing the `mr_lg_mem` "large memory" pool. In the reference
 /// runtime `mr_malloc` *is* the large-memory allocator: the exported
 /// LG_mem_* slots describe this pool and guests walk its free list
@@ -62,13 +65,17 @@ pub const LG_MEM_BASE: u32 = HEAP_BASE;
 pub const LG_MEM_LEN: u32 = HEAP_LEN;
 /// First-fit heap used by `mr_malloc`/`mr_free`. 8 MB: the SDK runtime's
 /// init asks for a 4 MB large-memory pool in one block.
-pub const HEAP_BASE: u32 = 0x0040_0000;
+pub const HEAP_BASE: u32 = 0x0028_2000;
 pub const HEAP_LEN: u32 = 8 * 1024 * 1024;
-/// The guest stack grows down from here (the pool's top — the SDK runtime
-/// computes its shell/control placements from LG_mem_end, so the stack
-/// head is that region).
-pub const STACK_TOP: u32 = 0x00C0_0000;
-pub const MEM_SIZE: u32 = STACK_TOP;
+/// The guest-visible screen buffer, RGB565 — above the heap (the reference
+/// runtime allocates it from the SDK's own pool; a dedicated region keeps
+/// guest allocations from colliding with presented frames).
+pub const SCREENBUF: u32 = HEAP_BASE + HEAP_LEN;
+pub const SCREENBUF_SIZE: u32 = 240 * 320 * 2;
+/// The guest stack grows down from here (the real firmware's stack region
+/// 0x180000-0x280000, sitting between the ext code area and the tables).
+pub const STACK_TOP: u32 = 0x0028_0000;
+pub const MEM_SIZE: u32 = SCREENBUF + 512 * 1024;
 
 /// Largest single allocation accepted from the heap.
 const HEAP_MAX_ALLOC: u32 = HEAP_LEN - 16;
