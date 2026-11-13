@@ -389,6 +389,12 @@ pub struct Guest {
     /// Total guest instructions executed across all calls; the corpus gate
     /// sets a budget so a guest stuck in an infinite loop classifies fast.
     pub total_instructions: u64,
+    /// Snapshot of the helper dispatch shell the SDK runtime copies below
+    /// its own init frame. Captured after the boot handshake and restored
+    /// before every later helper call: a dispatched callback's deeper
+    /// frame writes over the shell's dispatch-target cell, and without the
+    /// restore every second call jumps to garbage.
+    stub_snapshot: Option<Vec<u8>>,
     /// Guest file handles opened through `mr_open`.
     pub open_files: Vec<OpenFile>,
     /// Package/virtual-file contents readable through `mr_readFile`,
@@ -461,6 +467,7 @@ impl Guest {
             timers: Vec::new(),
             next_timer_id: 1,
             total_instructions: 0,
+            stub_snapshot: None,
             open_files: Vec::new(),
             files,
             exit_requested: false,
@@ -1377,14 +1384,20 @@ impl Guest {
         }
         self.w32(scratch1, 0);
         self.w32(scratch2, 0);
-        // NOTE: the SDK runtime copies a dispatch shell (its helper entry
-        // stub) to `SP - 0x4C` of the init call — observed at
-        // HANDLER_SP - 0x4C for several ext versions. Handler frames at
-        // this SP can clobber that shell; attempts to run events at a
-        // deeper SP regressed working titles, so the plain ABI stays for
-        // now and the shell interaction needs the real firmware map to
-        // resolve.
+        // The SDK runtime copies a dispatch shell (its helper entry stub,
+        // holding the real-handler pointer cell) to `SP - 0x4C` of the call
+        // that runs the init — observed at HANDLER_SP - 0x4C for several
+        // ext versions. The dispatched callbacks' deeper frames write
+        // stack addresses over that shell, so the second call through it
+        // reads a garbage target. Capture the shell region after the boot
+        // handshake and restore it before every later call.
         const HANDLER_SP: u32 = STACK_TOP - 0x200;
+        const SHELL_SPAN: usize = 0x400;
+        let shell_start = (HANDLER_SP - SHELL_SPAN as u32) as usize;
+        if let Some(snapshot) = &self.stub_snapshot {
+            let base = (STACK_TOP - SHELL_SPAN as u32) as usize;
+            self.mem[base..base + SHELL_SPAN].copy_from_slice(snapshot);
+        }
         self.w32(HANDLER_SP, scratch1);
         self.w32(HANDLER_SP + 4, scratch2);
         self.cpu.reg_set(self.cpu.mode(), R0, self.c_function_p);
@@ -1397,9 +1410,11 @@ impl Guest {
         self.cpu.reg_set(self.cpu.mode(), R1, code as u32);
         self.cpu.reg_set(self.cpu.mode(), R2, input);
         self.cpu.reg_set(self.cpu.mode(), R3, input_len as u32);
-        let result = self.run_guest_with_sp(self.c_function, HANDLER_SP, limit, screen)?;
+        let result = self.run_guest_with_sp(self.c_function, HANDLER_SP, limit, screen);
+        self.stub_snapshot = Some(self.mem[shell_start..shell_start + SHELL_SPAN].to_vec());
         let output_ptr = self.r32(scratch1);
         let output_len = self.r32(scratch2);
+        let result = result?;
         Ok((result as i32, (output_ptr, output_len)))
     }
 
