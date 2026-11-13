@@ -449,6 +449,11 @@ impl Vm {
             if pc >= code_len {
                 return Ok(vec![Value::Nil]);
             }
+            // Shared survey budget: an infinite script loop must exhaust it
+            // instead of running forever.
+            if crate::cfunction::charge_instruction() {
+                return Err("instruction budget exceeded (script loop?)".to_string());
+            }
             let inst = proto.code[pc];
             pc += 1;
             let op = Op::from_u8(inst.op())

@@ -41,6 +41,10 @@ pub const TABLE_SLOTS: usize = 149;
 /// One bridge word per slot; guest calls into these addresses are
 /// intercepted before execution.
 pub const BRIDGE_BASE: u32 = 0x0010_1000;
+/// The `sendAppEvent` callback bridge just past the function table: the
+/// chunk descriptor points here so the ext's timer wrappers reach the
+/// platform (code 0 = start, 1 = stop; `(ext, chunk, code, p0, p1)`).
+pub const SEND_APP_EVENT_ADDR: u32 = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4 + 8;
 /// Data variables referenced by the pointer-valued table slots.
 pub const DATA_BASE: u32 = 0x0010_2000;
 /// The guest-visible screen buffer, RGB565.
@@ -49,14 +53,19 @@ pub const SCREENBUF_SIZE: u32 = 240 * 320 * 2;
 /// Where the ext image is loaded.
 pub const EXT_BASE: u32 = 0x0020_0000;
 pub const EXT_MAX_SIZE: u32 = 512 * 1024;
-/// Region backing the `mr_lg_mem` "large memory" pool.
-pub const LG_MEM_BASE: u32 = 0x0030_0000;
-pub const LG_MEM_LEN: u32 = 256 * 1024;
-/// First-fit heap used by `mr_malloc`/`mr_free`.
+/// Region backing the `mr_lg_mem` "large memory" pool. In the reference
+/// runtime `mr_malloc` *is* the large-memory allocator: the exported
+/// LG_mem_* slots describe this pool and guests walk its free list
+/// (`{next, len}` nodes relative to the base), so the heap and the pool are
+/// the same region.
+pub const LG_MEM_BASE: u32 = HEAP_BASE;
+pub const LG_MEM_LEN: u32 = HEAP_LEN;
+/// First-fit heap used by `mr_malloc`/`mr_free`. 8 MB: the SDK runtime's
+/// init asks for a 4 MB large-memory pool in one block.
 pub const HEAP_BASE: u32 = 0x0040_0000;
-pub const HEAP_LEN: u32 = 1024 * 1024;
+pub const HEAP_LEN: u32 = 8 * 1024 * 1024;
 /// The guest stack grows down from here.
-pub const STACK_TOP: u32 = 0x0060_0000;
+pub const STACK_TOP: u32 = 0x00C0_0000;
 pub const MEM_SIZE: u32 = STACK_TOP;
 
 /// Largest single allocation accepted from the heap.
@@ -67,6 +76,34 @@ const HEAP_MIN_PIECE: u32 = 8;
 /// Cap on guest instructions per host call, so runaway ext code surfaces as
 /// an error instead of a hang.
 pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 20_000_000;
+
+/// Cross-call instruction budget (0 = unlimited) shared by the MiniJ VM and
+/// the ARM guest engine. The corpus gate sets a finite value so a guest or
+/// script stuck in an infinite loop classifies as hung instead of burning
+/// minutes per package.
+static INSTRUCTION_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INSTRUCTIONS_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the total instruction budget for subsequently executed script and
+/// guest code (0 = unlimited). Intended for headless survey gates.
+pub fn set_instruction_budget(budget: u64) {
+    INSTRUCTION_BUDGET.store(budget, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Clears the shared instruction counter (the budget itself is unchanged).
+pub fn reset_instruction_counter() {
+    INSTRUCTIONS_USED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Charges one instruction against the shared budget; returns `true` when
+/// the budget is finite and exhausted.
+pub(crate) fn charge_instruction() -> bool {
+    let budget = INSTRUCTION_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+    if budget == 0 {
+        return false;
+    }
+    INSTRUCTIONS_USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= budget
+}
 
 // ---------------------------------------------------------------------------
 // Function table description (slot order from the reference loader)
@@ -340,6 +377,9 @@ pub struct Guest {
     pub bi: u32,
     pub timers: Vec<GuestTimer>,
     pub next_timer_id: i32,
+    /// Total guest instructions executed across all calls; the corpus gate
+    /// sets a budget so a guest stuck in an infinite loop classifies fast.
+    pub total_instructions: u64,
     /// Guest file handles opened through `mr_open`.
     pub open_files: Vec<OpenFile>,
     /// Package/virtual-file contents readable through `mr_readFile`,
@@ -411,6 +451,7 @@ impl Guest {
             bi: 0,
             timers: Vec::new(),
             next_timer_id: 1,
+            total_instructions: 0,
             open_files: Vec::new(),
             files,
             exit_requested: false,
@@ -450,7 +491,7 @@ impl Guest {
         self.set_data(DataSlot::LgMemLeft, LG_MEM_LEN);
         self.set_data(DataSlot::LgMemMin, LG_MEM_LEN);
         self.set_data(DataSlot::LgMemTop, 0);
-        self.set_data(DataSlot::LgMemFree, 0);
+        self.sync_lg_slots();
         self.set_data(DataSlot::SoundOn, 0);
         self.set_data(DataSlot::ShakeOn, 0);
         self.set_data(DataSlot::RamFile, 0);
@@ -528,6 +569,21 @@ impl Guest {
     fn set_data(&mut self, slot: DataSlot, value: u32) {
         let address = self.data_slot_address(slot);
         self.w32(address, value);
+    }
+
+    /// Mirrors the allocator bookkeeping into the exported `LG_mem_*` data
+    /// slots. The reference runtime's `mr_malloc` pool *is* the large-memory
+    /// pool, and guests walk its free list through these slots, so they must
+    /// track the live allocator state.
+    fn sync_lg_slots(&mut self) {
+        self.set_data(DataSlot::LgMemLeft, self.heap_left);
+        self.set_data(DataSlot::LgMemMin, self.heap_min);
+        self.set_data(DataSlot::LgMemTop, self.heap_top);
+        // Slot 146 exports a pointer to the free-list head struct
+        // (`{next, len}`), mirroring the reference `&LG_mem_free`.
+        let cell = self.data_slot_address(DataSlot::LgMemFree);
+        self.set_data(DataSlot::LgMemFree, cell);
+        self.w32(cell, self.heap_free_head);
     }
 
     fn get_data(&self, slot: DataSlot) -> u32 {
@@ -609,7 +665,7 @@ impl Guest {
 
     // -- Heap (first-fit free list, reference layout) ------------------------
 
-    fn heap_malloc(&mut self, requested: u32) -> u32 {
+    pub fn heap_malloc(&mut self, requested: u32) -> u32 {
         if requested == 0 || requested > HEAP_MAX_ALLOC {
             return 0;
         }
@@ -620,10 +676,18 @@ impl Guest {
         // Walk the free list: head sentinel lives at HEAP_BASE in the sense
         // that `heap_free_head` is the offset of the first free block, and
         // each free block stores {next: u32, size: u32} at its start.
+        // Guest use-after-free or interior frees can corrupt the list into
+        // a cycle, so the walk is bounded and charged against the survey
+        // budget; a corrupt list fails the allocation.
         let end = HEAP_LEN;
         let mut prev_next: Option<u32> = None;
         let mut cursor = self.heap_free_head;
+        let mut steps = 0u32;
         while cursor < end {
+            steps += 1;
+            if steps > HEAP_LEN / HEAP_MIN_PIECE || charge_instruction() {
+                return 0;
+            }
             let next = self.r32(HEAP_BASE + cursor);
             let size = self.r32(HEAP_BASE + cursor + 4);
             if size >= len {
@@ -651,6 +715,7 @@ impl Guest {
                 self.heap_left = self.heap_left.saturating_sub(len);
                 self.heap_min = self.heap_min.min(self.heap_left);
                 self.heap_top = self.heap_top.max(self.heap_left);
+                self.sync_lg_slots();
                 return address;
             }
             prev_next = Some(cursor);
@@ -668,12 +733,49 @@ impl Guest {
             return;
         }
         let cursor = address - HEAP_BASE;
-        // Insert at the head of the free list; coalescing is skipped because
-        // MRP allocation patterns are short-lived and the heap is large.
-        self.w32(HEAP_BASE + cursor, self.heap_free_head);
-        self.w32(HEAP_BASE + cursor + 4, len);
-        self.heap_free_head = cursor;
+        // Insert in address order and coalesce with both neighbours — the
+        // reference allocator's layout, which probing guests depend on when
+        // they walk the exported pool state.
+        let end = HEAP_LEN;
+        let mut prev: Option<u32> = None;
+        let mut node = self.heap_free_head;
+        let mut steps = 0u32;
+        while node < end && node < cursor {
+            steps += 1;
+            if steps > HEAP_LEN / HEAP_MIN_PIECE || charge_instruction() {
+                return; // corrupt list: refuse the free
+            }
+            prev = Some(node);
+            node = self.r32(HEAP_BASE + node);
+        }
+        // Merge with the next node when adjacent, then with the previous —
+        // both merges compose into one node (the reference allocator's
+        // my_free does the same two-step coalesce).
+        let mut merged_len = len;
+        let mut next_node = node;
+        if node < end && cursor + len == node {
+            merged_len += self.r32(HEAP_BASE + node + 4);
+            next_node = self.r32(HEAP_BASE + node);
+        }
+        let mut prev_merged = false;
+        if let Some(p) = prev {
+            let prev_size = self.r32(HEAP_BASE + p + 4);
+            if p + prev_size == cursor {
+                self.w32(HEAP_BASE + p, next_node);
+                self.w32(HEAP_BASE + p + 4, prev_size + merged_len);
+                prev_merged = true;
+            }
+        }
+        if !prev_merged {
+            match prev {
+                Some(p) => self.w32(HEAP_BASE + p, cursor),
+                None => self.heap_free_head = cursor,
+            }
+            self.w32(HEAP_BASE + cursor, next_node);
+            self.w32(HEAP_BASE + cursor + 4, merged_len);
+        }
         self.heap_left = self.heap_left.saturating_add(len);
+        self.sync_lg_slots();
     }
 
     // -- Guest execution -----------------------------------------------------
@@ -771,6 +873,20 @@ impl Guest {
         }
     }
 
+    /// Enters a guest function pointer: bit0 carries the ARM/Thumb
+    /// interworking state (the universal `bx` calling convention), so it is
+    /// mirrored into CPSR.T and masked out of PC.
+    fn enter_function(&mut self, entry: u32) {
+        let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+        let cpsr = if entry & 1 != 0 {
+            cpsr | (1 << 5)
+        } else {
+            cpsr & !(1 << 5)
+        };
+        self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
+        self.cpu.reg_set(self.cpu.mode(), reg::PC, entry & !1);
+    }
+
     /// Runs guest code from `entry` until it returns through LR==0 or jumps
     /// back to zero, intercepting bridge calls. Returns the guest's r0.
     /// SP starts at `STACK_TOP`, LR at 0.
@@ -793,7 +909,7 @@ impl Guest {
         limit: u64,
         screen: &mut crate::display::Screen,
     ) -> Result<u32, MrpError> {
-        self.cpu.reg_set(self.cpu.mode(), reg::PC, entry);
+        self.enter_function(entry);
         self.cpu.reg_set(self.cpu.mode(), reg::SP, sp);
         self.cpu.reg_set(self.cpu.mode(), reg::LR, 0);
         let bridge_end = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4;
@@ -805,6 +921,7 @@ impl Guest {
             if trace {
                 let pc_now = self.cpu.reg_get(self.cpu.mode(), reg::PC);
                 if executed > 0
+                    && pc_now != prev_pc.wrapping_add(2)
                     && pc_now != prev_pc.wrapping_add(4)
                     && pc_now != prev_pc.wrapping_add(8)
                     && !(BRIDGE_BASE..BRIDGE_BASE + (TABLE_SLOTS as u32) * 4).contains(&pc_now)
@@ -831,6 +948,11 @@ impl Guest {
                 log::info!("guest still running: {executed} instructions, pc={pc:#010x}");
             }
             let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+            if charge_instruction() {
+                return Err(MrpError::Unsupported(format!(
+                    "instruction budget exceeded (stuck loop at pc {pc:#010x}?)"
+                )));
+            }
             if pc == 0 {
                 if trace {
                     let r9 = self.cpu.reg_get(self.cpu.mode(), 9);
@@ -860,6 +982,35 @@ impl Guest {
                     (self.cpu.reg_get(self.cpu.mode(), reg::CPSR) >> 29) & 1,
                 );
             }
+            if pc == SEND_APP_EVENT_ADDR {
+                // The chunk's sendAppEvent callback: (ext, chunk, code,
+                // timer, param1-on-stack) — code 0 starts the platform timer
+                // with the stack argument as the interval, code 1 stops it.
+                let code = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
+                let interval = self.stack_arg(0) as i32;
+                if std::env::var("MRP_TRACE").is_ok() {
+                    eprintln!("[sendAppEvent] code={code} interval={interval}");
+                }
+                match code {
+                    0 => {
+                        let interval = interval.max(1) as u64;
+                        self.timers.retain(|timer| timer.id != 0);
+                        self.timers.push(GuestTimer {
+                            id: 0,
+                            interval: Duration::from_millis(interval),
+                            next_fire: Instant::now() + Duration::from_millis(interval),
+                        });
+                    }
+                    1 => {
+                        self.timers.retain(|timer| timer.id != 0);
+                    }
+                    _ => {}
+                }
+                let lr = self.cpu.reg_get(self.cpu.mode(), reg::LR);
+                self.enter_function(lr);
+                self.cpu.reg_set(self.cpu.mode(), R0, 0);
+                continue;
+            }
             if (BRIDGE_BASE..bridge_end).contains(&pc) {
                 let slot = ((pc - BRIDGE_BASE) / 4) as usize;
                 if slot >= TABLE_SLOTS || SLOTS[slot] != Slot::Func {
@@ -880,8 +1031,11 @@ impl Guest {
                 }
                 let result = self.dispatch(slot, screen);
                 self.cpu.reg_set(self.cpu.mode(), R0, result as u32);
+                // Return through LR with `bx lr` semantics: bit0 selects
+                // Thumb, so a Thumb `bl`/`blx` into the bridge resumes in
+                // Thumb after the host call.
                 let lr = self.cpu.reg_get(self.cpu.mode(), reg::LR);
-                self.cpu.reg_set(self.cpu.mode(), reg::PC, lr);
+                self.enter_function(lr);
                 continue;
             }
             if trace && executed < 80 {
@@ -895,7 +1049,9 @@ impl Guest {
                     self.cpu.reg_get(self.cpu.mode(), reg::SP),
                 );
             }
-            if pc >= MEM_SIZE || (pc & 3) != 0 {
+            // Thumb fetches are halfword aligned; ARM fetches word aligned.
+            let thumb = self.cpu.thumb_mode();
+            if pc >= MEM_SIZE || if thumb { (pc & 1) != 0 } else { (pc & 3) != 0 } {
                 return Err(MrpError::Unsupported(format!(
                     "guest PC out of range: {pc:#010x}"
                 )));
@@ -918,7 +1074,7 @@ impl Guest {
             // `cmp r0, #0; blxne r0`, so a failed condition must skip the
             // call instead of branching through a null pointer.
             let inst = self.r32(pc);
-            if (inst & 0x0FFF_FFF0) == 0x012F_FF30 {
+            if !thumb && (inst & 0x0FFF_FFF0) == 0x012F_FF30 {
                 if self.arm_cond_passed(inst >> 28) {
                     let target = self.cpu.reg_get(self.cpu.mode(), (inst & 0xF) as reg::Reg);
                     self.cpu
@@ -943,7 +1099,7 @@ impl Guest {
             // emulator in debug builds. Encoding:
             // cond 000 P U I W L Rn Rd imm4H 1101 imm4L.
             let inst = self.r32(pc);
-            if (inst & 0x0E00_00F0) == 0x0000_00D0 {
+            if !thumb && (inst & 0x0E00_00F0) == 0x0000_00D0 {
                 let cond_ok = self.arm_cond_passed(inst >> 28);
                 if cond_ok {
                     let pre_index = inst & 0x0200_0000 != 0; // P
@@ -1002,7 +1158,7 @@ impl Guest {
                 0x12 => (dsp_bits74 & 0b1000) == 0b1000,
                 _ => false,
             };
-            if (inst & 0x0F00_0000) == 0x0100_0000 && dsp_match {
+            if !thumb && (inst & 0x0F00_0000) == 0x0100_0000 && dsp_match {
                 if self.arm_cond_passed(inst >> 28) {
                     self.dsp_multiply(inst, dsp_op);
                 }
@@ -1010,6 +1166,120 @@ impl Guest {
                 self.cpu
                     .reg_set(self.cpu.mode(), reg::PC, pc.wrapping_add(4));
                 continue;
+            }
+            // ARMv5 `BLX <label>` (1111 101H imm24): the crate decodes the
+            // encoding as a plain BL without switching state, so the loop
+            // decodes the interworking branch itself. BLX immediate always
+            // enters Thumb state; the H bit only contributes bit[1] of the
+            // target address.
+            let inst = self.r32(pc);
+            if !thumb && (inst & 0xFE00_0000) == 0xFA00_0000 {
+                let h = (inst >> 24) & 1;
+                let imm24 = inst & 0x00FF_FFFF;
+                let combined = ((imm24 << 1) | h) as i32;
+                let offset = if combined & 0x0100_0000 != 0 {
+                    combined - 0x0200_0000
+                } else {
+                    combined
+                };
+                self.cpu
+                    .reg_set(self.cpu.mode(), reg::LR, pc.wrapping_add(4));
+                let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+                self.cpu
+                    .reg_set(self.cpu.mode(), reg::CPSR, cpsr | (1 << 5));
+                let target = pc.wrapping_add(8).wrapping_add((offset << 1) as u32);
+                self.cpu.reg_set(self.cpu.mode(), reg::PC, target & !1);
+                continue;
+            }
+            // Thumb decodes the crate gets wrong: `BL`/`BLX` long-branch
+            // pairs never set the interworking bit in the link register
+            // (so a later `bx lr` would return into ARM mode), the BLX
+            // variant's second halfword is decoded as a plain conditional
+            // branch, and `BLX register` is decoded as plain `BX` without
+            // writing the link register at all.
+            if thumb {
+                let half = self.r16(pc);
+                if (half & 0xF800) == 0xF000 {
+                    // First halfword of a long-branch pair (11110 S
+                    // imm10H). The second halfword selects the variant:
+                    // 11111 … = BL (stay Thumb), 11101 … = BLX (switch to
+                    // ARM, imm10L in bits 10-1 and the target bit1 in
+                    // bit0). The link register takes the address after the
+                    // pair with bit0 set — the return stays in Thumb.
+                    let second = self.r16(pc.wrapping_add(2));
+                    let offset_high = (((half & 0x7FF) as u32) << 12) as i32;
+                    let offset_high = if offset_high & 0x0040_0000 != 0 {
+                        offset_high - 0x0080_0000
+                    } else {
+                        offset_high
+                    };
+                    let base = pc.wrapping_add(4);
+                    let raw = base
+                        .wrapping_add(offset_high as u32)
+                        .wrapping_add(((second & 0x7FF) << 1) as u32);
+                    let target = if (second & 0xF800) == 0xF800 {
+                        // BL: the target stays halfword aligned in Thumb.
+                        raw
+                    } else {
+                        // BLX: the target is ARM code — word aligned.
+                        raw & !3
+                    };
+                    self.cpu.reg_set(self.cpu.mode(), reg::LR, base | 1);
+                    let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+                    let cpsr = if (second & 0xF800) == 0xF800 {
+                        cpsr | (1 << 5)
+                    } else {
+                        cpsr & !(1 << 5)
+                    };
+                    self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
+                    self.cpu.reg_set(self.cpu.mode(), reg::PC, target & !1);
+                    continue;
+                }
+                if (half & 0xFF00) == 0xBD00 {
+                    // Thumb POP with PC (1011 1101 rlist): ARMv5T makes the
+                    // loaded bit0 select the return state; the crate keeps
+                    // the CPU in Thumb, which corrupts interworking returns.
+                    let rlist = half & 0xFF;
+                    let count = rlist.count_ones() + 1;
+                    let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+                    let mut addr = sp;
+                    for reg_index in 0..8u32 {
+                        if rlist & (1 << reg_index) != 0 {
+                            let value = self.r32(addr);
+                            self.cpu
+                                .reg_set(self.cpu.mode(), reg_index as reg::Reg, value);
+                            addr += 4;
+                        }
+                    }
+                    let pc_value = self.r32(addr);
+                    self.cpu.reg_set(self.cpu.mode(), reg::SP, sp + count * 4);
+                    let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+                    let cpsr = if pc_value & 1 != 0 {
+                        cpsr | (1 << 5)
+                    } else {
+                        cpsr & !(1 << 5)
+                    };
+                    self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
+                    self.cpu.reg_set(self.cpu.mode(), reg::PC, pc_value & !1);
+                    continue;
+                }
+                if (half & 0xFF80) == 0x4780 {
+                    // Thumb BLX register (0100 0111 1 Rm 000): switch state
+                    // from Rm[0] and write the link register with bit0 set.
+                    let rm = ((half >> 3) & 0xF) as reg::Reg;
+                    let target = self.cpu.reg_get(self.cpu.mode(), rm);
+                    self.cpu
+                        .reg_set(self.cpu.mode(), reg::LR, pc.wrapping_add(2) | 1);
+                    let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+                    let cpsr = if target & 1 != 0 {
+                        cpsr | (1 << 5)
+                    } else {
+                        cpsr & !(1 << 5)
+                    };
+                    self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
+                    self.cpu.reg_set(self.cpu.mode(), reg::PC, target & !1);
+                    continue;
+                }
             }
             // A guest-triggered debug_assert inside armv4t_emu (e.g. a
             // misidentified ARMv5TE encoding reaching the ARMv4 decoder)
@@ -1022,6 +1292,22 @@ impl Guest {
                     "guest step panicked at pc {pc:#010x} inst {:#010x}",
                     self.r32(pc)
                 )));
+            }
+            // ARMv5 PC-write interworking: LDM/LDR/MOV-to-PC and the second
+            // BL halfword carry the new Thumb state in bit0 of the written
+            // PC. The crate keeps the bit in the register instead of
+            // updating CPSR, so mirror it here and mask it out before the
+            // next fetch.
+            let pc_after = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+            if pc_after & 1 != 0 {
+                let cpsr = self.cpu.reg_get(self.cpu.mode(), reg::CPSR);
+                let cpsr = if self.cpu.thumb_mode() {
+                    cpsr
+                } else {
+                    cpsr | (1 << 5)
+                };
+                self.cpu.reg_set(self.cpu.mode(), reg::CPSR, cpsr);
+                self.cpu.reg_set(self.cpu.mode(), reg::PC, pc_after & !1);
             }
         }
         let hot: Vec<String> = self
@@ -2073,8 +2359,11 @@ impl Guest {
 
     /// Loads an ext image at `addr` (script-driven flow): writes the
     /// `mr_table` pointer at base+0 and calls `mr_c_function_load` with the
-    /// script-supplied mode selector. The caller drives any further
-    /// handshake through `call_c_function`.
+    /// script-supplied mode selector. After the ext registers its handler,
+    /// the platform builds the `mrc_extChunk` descriptor in the ext's P
+    /// block (mirroring the reference shell's `mrc_extLoad`): it carries the
+    /// `sendAppEvent` callback the ext's timer wrappers call, so timer
+    /// traffic reaches the platform instead of dying on a null pointer.
     pub fn load_ext_at(
         &mut self,
         ext: &[u8],
@@ -2091,8 +2380,37 @@ impl Guest {
         self.mem[base..base + ext.len()].copy_from_slice(ext);
         self.w32(addr, TABLE_BASE);
         self.cpu.reg_set(self.cpu.mode(), R0, code as u32);
-        self.run_guest(addr + 8, DEFAULT_INSTRUCTION_LIMIT, screen)
-            .map(|value| value as i32)
+        let result = self
+            .run_guest(addr + 8, DEFAULT_INSTRUCTION_LIMIT, screen)
+            .map(|value| value as i32)?;
+        self.install_ext_chunk(addr, ext.len() as u32);
+        Ok(result)
+    }
+
+    /// Builds the `mrc_extChunk` descriptor for the ext loaded at `addr`,
+    /// linking it through `P->mrc_extChunk` (offset 12) the way the
+    /// reference loader shell does before the first helper call.
+    fn install_ext_chunk(&mut self, addr: u32, len: u32) {
+        if self.c_function == 0 || self.c_function_p == 0 {
+            return;
+        }
+        let chunk = self.heap_malloc(0x30);
+        if chunk == 0 {
+            return;
+        }
+        self.w32(chunk, 0x7FD8_54EB); // check marker
+        self.w32(chunk + 0x04, addr + 8); // init_func
+        self.w32(chunk + 0x08, self.c_function); // event
+        self.w32(chunk + 0x0c, addr); // code_buf
+        self.w32(chunk + 0x10, len); // code_len
+        self.w32(chunk + 0x14, 0); // var_buf
+        self.w32(chunk + 0x18, 0); // var_len
+        self.w32(chunk + 0x1c, self.c_function_p); // global_p_buf
+        self.w32(chunk + 0x20, 20); // global_p_len
+        self.w32(chunk + 0x24, 1); // timer
+        self.w32(chunk + 0x28, SEND_APP_EVENT_ADDR); // sendAppEvent
+        self.w32(chunk + 0x2c, TABLE_BASE); // extMrTable
+        self.w32(self.c_function_p + 12, chunk);
     }
 
     /// Boot handshake used by the reference loader: register the table,
@@ -2123,6 +2441,7 @@ impl Guest {
         // jump to an alternate entry.
         self.cpu.reg_set(self.cpu.mode(), R0, 1);
         self.run_guest(EXT_BASE + 8, DEFAULT_INSTRUCTION_LIMIT, screen)?;
+        self.install_ext_chunk(EXT_BASE, ext.len() as u32);
         if std::env::var("MRP_TRACE").is_ok() {
             eprintln!(
                 "[boot] load done, c_function={:#010x} p={:#010x}",
@@ -3050,6 +3369,44 @@ mod tests {
         let left_after_alloc = g.heap_left;
         g.heap_free(a, 100);
         assert!(g.heap_left > left_after_alloc);
+    }
+
+    #[test]
+    fn heap_double_coalesce_keeps_total_size() {
+        // Freeing two adjacent blocks must merge all three regions (the two
+        // freed blocks plus any following free node) into one correctly
+        // sized node — the reference allocator's probe pattern depends on it.
+        let mut g = guest();
+        let before = g.heap_left;
+        let a = g.heap_malloc(8);
+        let b = g.heap_malloc(8);
+        let c = g.heap_malloc(8);
+        assert_ne!((a, b, c), (0, 0, 0));
+        let used = before - g.heap_left;
+        g.heap_free(a, 8);
+        g.heap_free(b, 8);
+        g.heap_free(c, 8);
+        assert_eq!(g.heap_left, before);
+        // The whole allocated span must now be one free block: a malloc of
+        // the full used size succeeds and returns the original base.
+        let whole = g.heap_malloc(used);
+        assert_eq!(whole, a);
+    }
+
+    #[test]
+    fn heap_free_before_keeps_list_ordered() {
+        // Freeing in descending address order must keep the list walkable
+        // (guests probe the list expecting address order).
+        let mut g = guest();
+        let a = g.heap_malloc(8);
+        let b = g.heap_malloc(8);
+        let c = g.heap_malloc(8);
+        g.heap_free(c, 8);
+        g.heap_free(b, 8);
+        g.heap_free(a, 8);
+        assert_eq!(g.heap_left, HEAP_LEN);
+        let whole = g.heap_malloc(24);
+        assert_eq!(whole, a);
     }
 
     #[test]
