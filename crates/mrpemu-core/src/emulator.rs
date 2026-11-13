@@ -36,6 +36,8 @@ pub struct MrpMachine {
     persist_dir: Option<std::path::PathBuf>,
     /// Screen resolution (detected from the corpus directory or default).
     resolution: (u16, u16),
+    /// Audio sink parked until a guest exists to receive it.
+    pending_audio_sink: Option<Box<dyn crate::audio::AudioSink>>,
 }
 
 impl MrpMachine {
@@ -54,6 +56,7 @@ impl MrpMachine {
             last_keys: BTreeSet::new(),
             persist_dir: None,
             resolution: (240, 320),
+            pending_audio_sink: None,
         };
         machine.draw_placeholder();
         Ok(machine)
@@ -158,6 +161,19 @@ impl MrpMachine {
     pub fn set_resolution(&mut self, width: u16, height: u16) {
         self.resolution = (width, height);
         self.screen = crate::display::Screen::new(width, height);
+    }
+
+    /// Installs the audio sink used by the guest's `mr_playSound` /
+    /// `mr_stopSound` calls. Applies to the live guest when one exists;
+    /// otherwise the sink is parked until the next boot creates a guest.
+    pub fn set_audio_sink(&mut self, sink: Box<dyn crate::audio::AudioSink>) {
+        if let Some(bridge) = self.script.as_mut() {
+            if let Some(guest) = bridge.vm.guest.as_mut() {
+                guest.audio_sink = sink;
+                return;
+            }
+        }
+        self.pending_audio_sink = Some(sink);
     }
 
     /// The boot failure reason, once a boot was attempted and failed.
@@ -356,6 +372,11 @@ impl MrpMachine {
                 .expect("package parsed at load"),
         );
         bridge.create_guest();
+        if let Some(sink) = self.pending_audio_sink.take() {
+            if let Some(guest) = bridge.vm.guest.as_mut() {
+                guest.audio_sink = sink;
+            }
+        }
         // Pure-script applications never register an ext handler, so the
         // script itself completing is the only success criterion here; a
         // script that also loaded an ext simply keeps that handler live.
@@ -430,6 +451,9 @@ impl MrpMachine {
                 crate::cfunction::GuestConfig::default(),
                 packaged_files.clone(),
             );
+            if let Some(sink) = self.pending_audio_sink.take() {
+                guest.audio_sink = sink;
+            }
             match guest.boot_ext(
                 ext,
                 self.header.build_id,

@@ -392,6 +392,10 @@ pub struct Guest {
     /// Optional value-range write watch (set by boot probes to trace which
     /// store clobbers an ext's dispatch cells).
     pub value_watch: ValueWatch,
+    /// Audio output handed to the guest's `mr_playSound`/`mr_stopSound`
+    /// calls. Defaults to the discarding sink; frontends install a real
+    /// device backend.
+    pub audio_sink: Box<dyn crate::audio::AudioSink>,
     /// Snapshot of the helper dispatch shell the SDK runtime copies below
     /// its own init frame. Captured after the boot handshake and restored
     /// before every later helper call: a dispatched callback's deeper
@@ -471,6 +475,7 @@ impl Guest {
             next_timer_id: 1,
             total_instructions: 0,
             value_watch: ValueWatch::default(),
+            audio_sink: Box::new(crate::audio::NullAudioSink),
             stub_snapshot: None,
             open_files: Vec::new(),
             files,
@@ -1612,11 +1617,34 @@ impl Guest {
                 MR_SUCCESS
             }
             55 | 56 => MR_SUCCESS, // shake
-            // mr_playSound(type, data, len, loop) / mr_stopSound():
-            // no audio output in the core, but success lets games skip
-            // audio init instead of erroring out.
-            57 => MR_SUCCESS,
-            58 => MR_SUCCESS,
+            // mr_playSound(type, data, len, loop): decode the guest's WAV
+            // bytes and hand the PCM clip to the audio sink. Type 1 (MIDI)
+            // is logged and skipped until a synth exists.
+            57 => {
+                let sound_type = self.cpu.reg_get(self.cpu.mode(), R0);
+                let data = self.cpu.reg_get(self.cpu.mode(), R1);
+                let len = self.cpu.reg_get(self.cpu.mode(), R2);
+                let looped = self.cpu.reg_get(self.cpu.mode(), R3) != 0;
+                let bytes = self.guest_bytes(data, len.min(4 * 1024 * 1024) as usize);
+                match sound_type {
+                    0 => match bytes.and_then(|bytes| crate::audio::decode_wav(&bytes).ok()) {
+                        Some(clip) => {
+                            self.audio_sink.play_bgm(clip, looped);
+                        }
+                        None => {
+                            warn_once("audio", "mr_playSound: WAV decode failed".to_string());
+                        }
+                    },
+                    other => {
+                        warn_once("audio", format!("mr_playSound type {other} unsupported"));
+                    }
+                }
+                MR_SUCCESS
+            }
+            58 => {
+                self.audio_sink.stop_bgm();
+                MR_SUCCESS
+            }
             59 | 60 => MR_FAILED, // SMS/call: never dial out
             61 => 0,              // network id
             62 => MR_FAILED,      // connectWAP: offline

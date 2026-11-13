@@ -70,7 +70,7 @@ fn corpus_smoke_sample() {
     // exhausts this and classifies fast instead of burning minutes.
     mrpemu_core::cfunction::set_instruction_budget(20_000_000);
     // CORPUS_HOT=1 restricts to the 热门游戏 directory.
-    let (root, all) = if std::env::var("CORPUS_HOT").is_ok() {
+    let (_root, all) = if std::env::var("CORPUS_HOT").is_ok() {
         let root = std::path::Path::new(HOT_GAMES_ROOT);
         (root, collect_mrps(root))
     } else {

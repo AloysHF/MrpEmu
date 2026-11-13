@@ -15,6 +15,7 @@
 //! yet; [`MrpMachine::run_frame`] is a documented placeholder that keeps the
 //! screen content unchanged.
 
+pub mod audio;
 pub mod cfunction;
 pub mod display;
 pub mod emulator;

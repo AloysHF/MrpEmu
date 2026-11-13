@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use minifb::{Key, Window, WindowOptions};
 
+mod audio;
+
 use mrpemu_core::{MrpKey, MrpMachine};
 
 /// MrpEmu — Sky-mobi mythroad (MRP) feature-phone application emulator.
@@ -56,6 +58,12 @@ fn main() -> Result<()> {
         machine.header().internal_name,
         machine.header().app_id
     );
+
+    // Audio output: open the default device and hand the sink to the core.
+    match audio::CpalSink::open() {
+        Ok(sink) => machine.set_audio_sink(Box::new(sink)),
+        Err(error) => log::warn!("audio disabled: {error:#}"),
+    }
 
     let (width, height) = (
         usize::from(machine.screen().width()),
