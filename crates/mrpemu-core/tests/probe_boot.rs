@@ -46,11 +46,16 @@ fn probe_direct_boot() {
         if result.is_ok() && guest.c_function != 0 {
             // Watch the stack-shell region the helper dispatches through.
             let dump = |tag: &str, guest: &Guest| {
-                let mut line = format!("{tag}: ");
-                for w in 0..20 {
-                    line += &format!("{:08x} ", guest.r32(0xbff960 + w * 4));
+                eprintln!("{tag}:");
+                // The shell region: HANDLER_SP-0x100 .. HANDLER_SP.
+                for row in 0..8 {
+                    let base = 0x0027_fdb0 + row * 16;
+                    let mut line = format!("  {base:08x}: ");
+                    for h in 0..8 {
+                        line += &format!("{:04x} ", guest.r16(base + h * 2));
+                    }
+                    eprintln!("{line}");
                 }
-                eprintln!("{line}");
             };
             dump("after-boot", &guest);
             for round in 0..3 {
