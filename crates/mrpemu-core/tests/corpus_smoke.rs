@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 /// How many packages one survey pass samples.
 const SAMPLE_SIZE: usize = 200;
 /// Frames per package (plus one Ok press mid-run).
-const FRAMES_PER_SAMPLE: u32 = 90;
+const FRAMES_PER_SAMPLE: u32 = 200;
 
 fn collect_mrps(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
@@ -106,11 +106,21 @@ fn corpus_smoke_sample() {
             machine.set_resolution(res_w, res_h);
             for frame in 0..FRAMES_PER_SAMPLE {
                 machine.run_frame();
-                if frame == 40 {
-                    machine.input_mut().press(MrpKey::Ok);
-                }
-                if frame == 44 {
-                    machine.input_mut().release(MrpKey::Ok);
+                // richer input: dismiss splash, navigate menus, confirm
+                for (press_frame, key) in [
+                    (40u32, MrpKey::Ok),
+                    (44, MrpKey::Ok),
+                    (80, MrpKey::Ok),
+                    (84, MrpKey::Ok),
+                    (120, MrpKey::Ok),
+                    (124, MrpKey::Ok),
+                ] {
+                    if frame == press_frame {
+                        machine.input_mut().press(key);
+                    }
+                    if frame == press_frame + 4 {
+                        machine.input_mut().release(key);
+                    }
                 }
             }
             let screen = machine.screen();
