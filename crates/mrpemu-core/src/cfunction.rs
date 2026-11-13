@@ -402,6 +402,11 @@ pub struct Guest {
     /// frame writes over the shell's dispatch-target cell, and without the
     /// restore every second call jumps to garbage.
     stub_snapshot: Option<Vec<u8>>,
+    /// Execution watch: when the pc enters `[lo, hi)` the loop dumps the
+    /// branch ring and registers once (boot probes use this to catch the
+    /// jump into a region being executed as code).
+    pub exec_watch: Option<(u32, u32)>,
+    pub exec_watch_fired: bool,
     /// Guest file handles opened through `mr_open`.
     pub open_files: Vec<OpenFile>,
     /// Package/virtual-file contents readable through `mr_readFile`,
@@ -477,6 +482,8 @@ impl Guest {
             value_watch: ValueWatch::default(),
             audio_sink: Box::new(crate::audio::NullAudioSink),
             stub_snapshot: None,
+            exec_watch: None,
+            exec_watch_fired: false,
             open_files: Vec::new(),
             files,
             exit_requested: false,
@@ -973,6 +980,28 @@ impl Guest {
                 log::info!("guest still running: {executed} instructions, pc={pc:#010x}");
             }
             let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+            if let Some((lo, hi)) = self.exec_watch {
+                if pc >= lo && pc < hi && !self.exec_watch_fired {
+                    self.exec_watch_fired = true;
+                    eprintln!("[exec-watch] pc entered {lo:#010x}..{hi:#010x} at step {executed}");
+                    eprintln!(
+                        "  r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} r4={:#010x} r9={:#010x} lr={:#010x} sp={:#010x}",
+                        self.cpu.reg_get(self.cpu.mode(), R0),
+                        self.cpu.reg_get(self.cpu.mode(), R1),
+                        self.cpu.reg_get(self.cpu.mode(), R2),
+                        self.cpu.reg_get(self.cpu.mode(), R3),
+                        self.cpu.reg_get(self.cpu.mode(), 4),
+                        self.cpu.reg_get(self.cpu.mode(), 9),
+                        self.cpu.reg_get(self.cpu.mode(), reg::LR),
+                        self.cpu.reg_get(self.cpu.mode(), reg::SP),
+                    );
+                    for (index, (rpc, rinst, rr0)) in ring.iter().enumerate() {
+                        eprintln!(
+                            "[exec-watch ring {index}] pc={rpc:#010x} inst={rinst:#010x} r9={rr0:#010x}"
+                        );
+                    }
+                }
+            }
             if charge_instruction() {
                 return Err(MrpError::Unsupported(format!(
                     "instruction budget exceeded (stuck loop at pc {pc:#010x}?)"

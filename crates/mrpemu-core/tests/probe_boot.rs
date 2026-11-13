@@ -41,11 +41,13 @@ fn probe_direct_boot() {
     guest.value_watch = mrpemu_core::cfunction::ValueWatch {
         lo: 0x0028_2000,
         hi: 0x00A8_2000,
-        addrs: vec![0x0028_20a4, 0x0028_20b0],
+        addrs: vec![0x0028_2048, 0x0028_20a4, 0x0028_20b0],
         hits: Vec::new(),
     };
     for (name, ext) in &exts {
         eprintln!("booting {name} ({} bytes)", ext.len());
+        guest.exec_watch = Some((0x0028_2060, 0x0028_20b0));
+        guest.exec_watch_fired = false;
         let result = guest.boot_ext(ext, 0, 0, &mut screen);
         eprintln!(
             "  -> {:?}",
