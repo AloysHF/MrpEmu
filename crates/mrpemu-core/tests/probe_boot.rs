@@ -36,6 +36,13 @@ fn probe_direct_boot() {
     files.push(("app.mrp".to_string(), package.raw_data().to_vec()));
     let mut guest = Guest::new(GuestConfig::default(), files);
     let mut screen = Screen::new(240, 320);
+    // The first ext attempt allocates P at the heap base; watch the
+    // function-pointer-array region the init builds there.
+    guest.value_watch = mrpemu_core::cfunction::ValueWatch {
+        lo: 0x0028_2050,
+        hi: 0x0028_20b0,
+        hits: Vec::new(),
+    };
     for (name, ext) in &exts {
         eprintln!("booting {name} ({} bytes)", ext.len());
         let result = guest.boot_ext(ext, 0, 0, &mut screen);

@@ -389,6 +389,9 @@ pub struct Guest {
     /// Total guest instructions executed across all calls; the corpus gate
     /// sets a budget so a guest stuck in an infinite loop classifies fast.
     pub total_instructions: u64,
+    /// Optional value-range write watch (set by boot probes to trace which
+    /// store clobbers an ext's dispatch cells).
+    pub value_watch: ValueWatch,
     /// Snapshot of the helper dispatch shell the SDK runtime copies below
     /// its own init frame. Captured after the boot handshake and restored
     /// before every later helper call: a dispatched callback's deeper
@@ -467,6 +470,7 @@ impl Guest {
             timers: Vec::new(),
             next_timer_id: 1,
             total_instructions: 0,
+            value_watch: ValueWatch::default(),
             stub_snapshot: None,
             open_files: Vec::new(),
             files,
@@ -1301,13 +1305,24 @@ impl Guest {
             // misidentified ARMv5TE encoding reaching the ARMv4 decoder)
             // must not abort the emulator.
             let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.cpu.step(&mut GuestMem(&mut self.mem))
+                self.cpu
+                    .step(&mut GuestMem(&mut self.mem, &mut self.value_watch))
             }));
             if step.is_err() {
                 return Err(MrpError::Unsupported(format!(
                     "guest step panicked at pc {pc:#010x} inst {:#010x}",
                     self.r32(pc)
                 )));
+            }
+            // Value-watch hits: the guest wrote a pointer inside the
+            // watched range while running at `pc`.
+            if (self.value_watch.lo != 0 || self.value_watch.hi != 0)
+                && !self.value_watch.hits.is_empty()
+            {
+                let hits = std::mem::take(&mut self.value_watch.hits);
+                for (addr, val) in hits {
+                    eprintln!("[watch] pc={pc:#010x} wrote {val:#010x} -> {addr:#010x}");
+                }
             }
             // ARMv5 PC-write interworking: LDM/LDR/MOV-to-PC and the second
             // BL halfword carry the new Thumb state in bit0 of the written
@@ -3245,8 +3260,27 @@ impl Guest {
     }
 }
 
+/// Value-range write watch: captures guest word stores whose value falls
+/// in `[lo, hi)`. Used to trace which store clobbers an ext's dispatch
+/// cells with pointers into its own function-pointer tables.
+#[derive(Default)]
+pub struct ValueWatch {
+    pub lo: u32,
+    pub hi: u32,
+    /// `(address, value)` pairs, oldest first; drained by the step loop.
+    pub hits: Vec<(u32, u32)>,
+}
+
+impl ValueWatch {
+    fn note(&mut self, addr: u32, val: u32) {
+        if (self.lo != 0 || self.hi != 0) && val >= self.lo && val < self.hi {
+            self.hits.push((addr, val));
+        }
+    }
+}
+
 /// Adapter implementing `armv4t_emu::Memory` over the guest memory vector.
-struct GuestMem<'a>(&'a mut Vec<u8>);
+struct GuestMem<'a>(&'a mut Vec<u8>, &'a mut ValueWatch);
 
 impl Memory for GuestMem<'_> {
     fn r8(&mut self, addr: u32) -> u8 {
@@ -3278,6 +3312,7 @@ impl Memory for GuestMem<'_> {
     }
 
     fn w32(&mut self, addr: u32, val: u32) {
+        self.1.note(addr, val);
         self.w8(addr, val as u8);
         self.w8(addr.wrapping_add(1), (val >> 8) as u8);
         self.w8(addr.wrapping_add(2), (val >> 16) as u8);
