@@ -64,7 +64,9 @@ pub const LG_MEM_LEN: u32 = HEAP_LEN;
 /// init asks for a 4 MB large-memory pool in one block.
 pub const HEAP_BASE: u32 = 0x0040_0000;
 pub const HEAP_LEN: u32 = 8 * 1024 * 1024;
-/// The guest stack grows down from here.
+/// The guest stack grows down from here (the pool's top — the SDK runtime
+/// computes its shell/control placements from LG_mem_end, so the stack
+/// head is that region).
 pub const STACK_TOP: u32 = 0x00C0_0000;
 pub const MEM_SIZE: u32 = STACK_TOP;
 
@@ -1037,7 +1039,7 @@ impl Guest {
                 self.enter_function(lr);
                 continue;
             }
-            if trace && executed < 3000 {
+            if trace && executed < 80000 {
                 eprintln!(
                     "[step {executed}] pc={pc:#010x} inst={:08x} r0={:#010x} r1={:#010x} r4={:#010x} r9={:#010x} lr={:#010x} sp={:#010x}",
                     self.r32(pc),
@@ -1056,7 +1058,7 @@ impl Guest {
                     "guest PC out of range: {pc:#010x}"
                 )));
             }
-            if std::env::var("MRP_TRACE").is_ok() && executed < 3000 {
+            if std::env::var("MRP_TRACE").is_ok() && executed < 80000 {
                 let inst = self.r32(pc);
                 eprintln!(
                     "[trace {executed}] pc={pc:#010x} inst={inst:#010x} r0={:#010x} lr={:#010x} sp={:#010x} mode={:?}",
@@ -1368,6 +1370,13 @@ impl Guest {
         }
         self.w32(scratch1, 0);
         self.w32(scratch2, 0);
+        // NOTE: the SDK runtime copies a dispatch shell (its helper entry
+        // stub) to `SP - 0x4C` of the init call — observed at
+        // HANDLER_SP - 0x4C for several ext versions. Handler frames at
+        // this SP can clobber that shell; attempts to run events at a
+        // deeper SP regressed working titles, so the plain ABI stays for
+        // now and the shell interaction needs the real firmware map to
+        // resolve.
         const HANDLER_SP: u32 = STACK_TOP - 0x200;
         self.w32(HANDLER_SP, scratch1);
         self.w32(HANDLER_SP + 4, scratch2);
@@ -2150,6 +2159,11 @@ impl Guest {
         let file = &mut self.open_files[handle - 1];
         let remaining = file.data.len().saturating_sub(file.pos);
         let count = len.min(remaining);
+        log::info!(
+            "mr_read(handle={handle} {:?} pos={:#x} len={count})",
+            file.name,
+            file.pos
+        );
         let bytes = file.data[file.pos..file.pos + count].to_vec();
         file.pos += count;
         let base = buffer as usize;
@@ -2174,6 +2188,7 @@ impl Guest {
             _ => len,
         };
         let target = (base + i64::from(offset)).clamp(0, len);
+        log::info!("mr_seek(handle={handle} offset={offset} whence={whence} -> {target:#x})",);
         file.pos = target as usize;
         file.pos as i32
     }
