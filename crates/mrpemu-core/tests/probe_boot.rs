@@ -39,8 +39,8 @@ fn probe_direct_boot() {
     // The first ext attempt allocates P at the heap base; watch the
     // function-pointer-array region the init builds there.
     guest.value_watch = mrpemu_core::cfunction::ValueWatch {
-        lo: 0x0028_2050,
-        hi: 0x0028_20b0,
+        lo: 0x0028_2000,
+        hi: 0x00A8_2000,
         addrs: vec![0x0028_20a4, 0x0028_20b0],
         hits: Vec::new(),
     };
