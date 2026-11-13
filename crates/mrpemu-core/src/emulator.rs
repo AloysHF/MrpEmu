@@ -340,6 +340,15 @@ impl MrpMachine {
             self.boot_error = Some("package reparse failed".to_string());
             return;
         };
+        // Direct ext path first: the application image (game.ext /
+        // cfunction.ext) boots straight into its event loop, while the
+        // script chain's SDK wrapper (whose init self-reloads through
+        // platform calls we only partially model) can end up routing events
+        // nowhere. Pure-script packages fall through — no .ext members.
+        let mut direct_error = None;
+        if self.try_direct_ext_boot(&package, &mut direct_error) {
+            return;
+        }
         // Script path: start.mr runs on the VM and drives _com(800).
         let mut bridge = ScriptBridge::new();
         bridge.load_package(
@@ -366,10 +375,21 @@ impl MrpMachine {
             self.script = Some(bridge);
             return;
         }
-        // Direct ext path: try every .ext member until one registers.
-        // Loader-stub images (a few hundred bytes whose only job is to be
-        // driven by the script chain) register but idle, so order by size —
-        // the real application image is always the largest member.
+        self.boot_error = Some(direct_error.unwrap_or_else(|| {
+            script_result
+                .err()
+                .unwrap_or_else(|| "boot failed".to_string())
+        }));
+    }
+
+    /// Tries every .ext member (largest first — loader stubs register but
+    /// idle, the real application image is always the largest) until one
+    /// registers an event handler. Returns `true` on success.
+    fn try_direct_ext_boot(
+        &mut self,
+        package: &crate::package::MrpPackage,
+        last_error: &mut Option<String>,
+    ) -> bool {
         let mut ext_files: Vec<(String, Vec<u8>)> = package
             .entries()
             .iter()
@@ -384,7 +404,7 @@ impl MrpMachine {
         ext_files.sort_by_key(|(_, data)| std::cmp::Reverse(data.len()));
         if ext_files.is_empty() {
             log::info!("pure-script package: no ext to load");
-            return;
+            return false;
         }
         // Seed the guest with the package members so loader-stub exts can
         // read the application resources through mr_readFile, plus the raw
@@ -404,7 +424,6 @@ impl MrpMachine {
         let mut guest =
             crate::cfunction::Guest::new(crate::cfunction::GuestConfig::default(), packaged_files);
         let mut screen = crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-        let mut last_error = None;
         for (name, ext) in &ext_files {
             match guest.boot_ext(
                 ext,
@@ -421,18 +440,17 @@ impl MrpMachine {
                     );
                     self.screen = screen.clone();
                     self.script = Some(ScriptBridge::with_guest(guest, screen));
-                    return;
+                    return true;
                 }
                 Ok(_) => {
                     log::info!("ext {} loaded but did not register; trying next", name);
                 }
                 Err(error) => {
-                    last_error = Some(error.to_string());
+                    *last_error = Some(error.to_string());
                 }
             }
         }
-        self.boot_error =
-            Some(last_error.unwrap_or_else(|| "no ext registered an event handler".to_string()));
+        false
     }
 
     /// MRC key codes expected by guest event handlers.

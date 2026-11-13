@@ -956,11 +956,10 @@ impl Guest {
             if pc == 0 {
                 if trace {
                     let r9 = self.cpu.reg_get(self.cpu.mode(), 9);
-                    let pool = self.r32(EXT_BASE + 0x60e4);
-                    let var_a = self.r32(r9.wrapping_add(0xf9c4).wrapping_add(0x84));
-                    let var_b = self.r32(0x00606144);
+                    let cb44 = self.r32(r9.wrapping_add(44));
+                    let cb40 = self.r32(r9.wrapping_add(40));
                     eprintln!(
-                        "[ret] r9={r9:#x} pool@60e4={pool:#x} rw+fa48={var_a:#x} pc+lit+84={var_b:#x} r0={:#x}",
+                        "[ret] r9={r9:#x} rw+44={cb44:#x} rw+40={cb40:#x} r0={:#x}",
                         self.cpu.reg_get(self.cpu.mode(), R0)
                     );
                 }
@@ -1038,11 +1037,12 @@ impl Guest {
                 self.enter_function(lr);
                 continue;
             }
-            if trace && executed < 80 {
+            if trace && executed < 3000 {
                 eprintln!(
-                    "[step {executed}] pc={pc:#010x} inst={:08x} r0={:#010x} r4={:#010x} r9={:#010x} lr={:#010x} sp={:#010x}",
+                    "[step {executed}] pc={pc:#010x} inst={:08x} r0={:#010x} r1={:#010x} r4={:#010x} r9={:#010x} lr={:#010x} sp={:#010x}",
                     self.r32(pc),
                     self.cpu.reg_get(self.cpu.mode(), R0),
+                    self.cpu.reg_get(self.cpu.mode(), R1),
                     self.cpu.reg_get(self.cpu.mode(), 4),
                     self.cpu.reg_get(self.cpu.mode(), 9),
                     self.cpu.reg_get(self.cpu.mode(), reg::LR),
@@ -1056,7 +1056,7 @@ impl Guest {
                     "guest PC out of range: {pc:#010x}"
                 )));
             }
-            if std::env::var("MRP_TRACE").is_ok() && executed < 400 {
+            if std::env::var("MRP_TRACE").is_ok() && executed < 3000 {
                 let inst = self.r32(pc);
                 eprintln!(
                     "[trace {executed}] pc={pc:#010x} inst={inst:#010x} r0={:#010x} lr={:#010x} sp={:#010x} mode={:?}",
