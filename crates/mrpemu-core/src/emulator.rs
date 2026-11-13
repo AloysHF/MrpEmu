@@ -421,10 +421,15 @@ impl MrpMachine {
             })
             .collect();
         packaged_files.push(("app.mrp".to_string(), self.package.clone()));
-        let mut guest =
-            crate::cfunction::Guest::new(crate::cfunction::GuestConfig::default(), packaged_files);
         let mut screen = crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         for (name, ext) in &ext_files {
+            // A fresh guest per attempt: a failed boot can leave the heap
+            // drained (the SDK init allocates large pools before failing),
+            // which would poison every later attempt.
+            let mut guest = crate::cfunction::Guest::new(
+                crate::cfunction::GuestConfig::default(),
+                packaged_files.clone(),
+            );
             match guest.boot_ext(
                 ext,
                 self.header.build_id,
