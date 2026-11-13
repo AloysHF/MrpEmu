@@ -41,6 +41,7 @@ fn probe_direct_boot() {
     guest.value_watch = mrpemu_core::cfunction::ValueWatch {
         lo: 0x0028_2050,
         hi: 0x0028_20b0,
+        addrs: vec![0x0028_20a4, 0x0028_20b0],
         hits: Vec::new(),
     };
     for (name, ext) in &exts {

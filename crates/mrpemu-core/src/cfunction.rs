@@ -3267,13 +3267,17 @@ impl Guest {
 pub struct ValueWatch {
     pub lo: u32,
     pub hi: u32,
+    /// Exact addresses to watch for any write.
+    pub addrs: Vec<u32>,
     /// `(address, value)` pairs, oldest first; drained by the step loop.
     pub hits: Vec<(u32, u32)>,
 }
 
 impl ValueWatch {
     fn note(&mut self, addr: u32, val: u32) {
-        if (self.lo != 0 || self.hi != 0) && val >= self.lo && val < self.hi {
+        let value_hit = (self.lo != 0 || self.hi != 0) && val >= self.lo && val < self.hi;
+        let addr_hit = self.addrs.contains(&addr);
+        if value_hit || addr_hit {
             self.hits.push((addr, val));
         }
     }
