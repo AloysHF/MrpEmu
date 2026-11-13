@@ -41,7 +41,7 @@ fn probe_direct_boot() {
     guest.value_watch = mrpemu_core::cfunction::ValueWatch {
         lo: 0x0028_2000,
         hi: 0x00A8_2000,
-        addrs: vec![0x0028_2048, 0x0028_20a4, 0x0028_20b0],
+        addrs: vec![0x0027_fdc4, 0x0028_20a4, 0x0028_20b0],
         hits: Vec::new(),
     };
     for (name, ext) in &exts {
@@ -54,10 +54,19 @@ fn probe_direct_boot() {
             result.as_ref().map(|_| "ok").map_err(|e| e.to_string())
         );
         if result.is_err() {
-            // Dump the spin region the budget error reported so the loop
-            // body can be disassembled.
+            // Dump the spin region the budget error reported, plus the
+            // shell stub at HANDLER_SP-0x4C (STACK_TOP - 0x24C).
             for row in 0..6 {
                 let base = 0x0028_2060 + row * 16;
+                let mut line = format!("  {base:08x}: ");
+                for h in 0..8 {
+                    line += &format!("{:04x} ", guest.r16(base + h * 2));
+                }
+                eprintln!("{line}");
+            }
+            eprintln!("  shell stub (0x27fd90..0x27fe00):");
+            for row in 0..7 {
+                let base = 0x0027_fd90 + row * 16;
                 let mut line = format!("  {base:08x}: ");
                 for h in 0..8 {
                     line += &format!("{:04x} ", guest.r16(base + h * 2));
