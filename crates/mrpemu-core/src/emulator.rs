@@ -301,6 +301,30 @@ impl MrpMachine {
             }
         }
 
+        // The reference platform starts its own timer at app start and
+        // forwards ticks to the ext (helper code 2) without waiting for the
+        // ext to call mr_timerStart — drive ext apps on the frame cadence
+        // when they registered no timer of their own.
+        let ext_driven = bridge
+            .vm
+            .guest
+            .as_ref()
+            .map(|guest| guest.c_function != 0 && guest.timers.is_empty())
+            .unwrap_or(false);
+        if ext_driven {
+            if let Some(guest) = bridge.vm.guest.as_mut() {
+                let mut screen = std::mem::replace(
+                    &mut bridge.vm.screen,
+                    crate::display::Screen::new(
+                        crate::display::DEFAULT_WIDTH,
+                        crate::display::DEFAULT_HEIGHT,
+                    ),
+                );
+                let _ = guest.fire_timer(&mut screen);
+                bridge.vm.screen = screen;
+            }
+        }
+
         bridge.present();
         // Sync the presented guest screen into the machine's public screen
         // so frontends and tests observe post-boot drawing.
@@ -363,8 +387,10 @@ impl MrpMachine {
             return;
         }
         // Seed the guest with the package members so loader-stub exts can
-        // read the application resources through mr_readFile.
-        let packaged_files: Vec<(String, Vec<u8>)> = package
+        // read the application resources through mr_readFile, plus the raw
+        // package bytes under `pack_filename` — the SDK runtime's internal
+        // resource loader opens the pack itself and extracts members.
+        let mut packaged_files: Vec<(String, Vec<u8>)> = package
             .entries()
             .iter()
             .map(|entry| {
@@ -374,6 +400,7 @@ impl MrpMachine {
                 )
             })
             .collect();
+        packaged_files.push(("app.mrp".to_string(), self.package.clone()));
         let mut guest =
             crate::cfunction::Guest::new(crate::cfunction::GuestConfig::default(), packaged_files);
         let mut screen = crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);

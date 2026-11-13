@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 /// How many packages one survey pass samples.
 const SAMPLE_SIZE: usize = 200;
+/// Override the corpus root to test only the hot games.
+const HOT_GAMES_ROOT: &str = "../../tmp/mrp_game/热门游戏";
 /// Frames per package (plus one Ok press mid-run).
 const FRAMES_PER_SAMPLE: u32 = 200;
 
@@ -64,19 +66,34 @@ fn classify(machine: &MrpMachine, pixels_nonzero: usize, total: usize) -> &'stat
 #[ignore = "requires the local reference corpus under tmp/mrp_game"]
 fn corpus_smoke_sample() {
     let _ = env_logger::try_init();
-    let root = std::path::Path::new("../../tmp/mrp_game");
-    let all = collect_mrps(root);
-    assert!(
-        all.len() > 1000,
-        "corpus should hold thousands of packages, found {}",
-        all.len()
-    );
+    // Total instruction budget per package (script + guest): a stuck loop
+    // exhausts this and classifies fast instead of burning minutes.
+    mrpemu_core::cfunction::set_instruction_budget(20_000_000);
+    // CORPUS_HOT=1 restricts to the 热门游戏 directory.
+    let (root, all) = if std::env::var("CORPUS_HOT").is_ok() {
+        let root = std::path::Path::new(HOT_GAMES_ROOT);
+        (root, collect_mrps(root))
+    } else {
+        let root = std::path::Path::new("../../tmp/mrp_game");
+        let all = collect_mrps(root);
+        assert!(
+            all.len() > 1000,
+            "corpus should hold thousands of packages, found {}",
+            all.len()
+        );
+        (root, all)
+    };
 
     // Deterministic LCG scatter-sample.
-    let mut picks: Vec<std::path::PathBuf> = Vec::with_capacity(SAMPLE_SIZE.min(all.len()));
-    let stride = (all.len() as u64 / SAMPLE_SIZE.max(1) as u64).max(1) | 1;
+    let sample_count = if std::env::var("CORPUS_HOT").is_ok() {
+        all.len()
+    } else {
+        SAMPLE_SIZE.min(all.len())
+    };
+    let mut picks: Vec<std::path::PathBuf> = Vec::with_capacity(sample_count);
+    let stride = (all.len() as u64 / sample_count.max(1) as u64).max(1) | 1;
     let mut cursor = (stride * 7) % all.len() as u64;
-    for _ in 0..SAMPLE_SIZE.min(all.len()) {
+    for _ in 0..sample_count {
         picks.push(all[cursor as usize].clone());
         cursor = (cursor + stride) % all.len() as u64;
     }
@@ -100,6 +117,7 @@ fn corpus_smoke_sample() {
         let (res_w, res_h) = detect_resolution(path);
         let res_key = format!("{res_w}x{res_h}");
         let (outcome, misses) = std::panic::catch_unwind(|| -> (&'static str, Vec<String>) {
+            mrpemu_core::cfunction::reset_instruction_counter();
             let Ok(mut machine) = MrpMachine::from_path(path) else {
                 return ("load-failed", Vec::new());
             };
@@ -147,7 +165,11 @@ fn corpus_smoke_sample() {
             .or_default() += 1;
     }
 
-    eprintln!("=== corpus smoke summary ({} sampled) ===", picks.len());
+    eprintln!(
+        "=== corpus smoke summary ({} of {} sampled) ===",
+        picks.len(),
+        all.len()
+    );
     for (outcome, names) in &tally {
         eprintln!("{outcome:12} {:4}  e.g. {}", names.len(), names[0]);
     }
