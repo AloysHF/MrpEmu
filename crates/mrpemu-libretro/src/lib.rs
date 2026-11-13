@@ -5,7 +5,7 @@
 //! onto the RetroArch joypad; the mapping is documented through input
 //! descriptors.
 
-mod ffi;
+pub mod ffi;
 
 use std::{
     ffi::{c_char, c_void, CStr, CString},
