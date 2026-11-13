@@ -43,6 +43,18 @@ fn probe_direct_boot() {
             "  -> {:?}",
             result.as_ref().map(|_| "ok").map_err(|e| e.to_string())
         );
+        if result.is_err() {
+            // Dump the spin region the budget error reported so the loop
+            // body can be disassembled.
+            for row in 0..6 {
+                let base = 0x0028_2060 + row * 16;
+                let mut line = format!("  {base:08x}: ");
+                for h in 0..8 {
+                    line += &format!("{:04x} ", guest.r16(base + h * 2));
+                }
+                eprintln!("{line}");
+            }
+        }
         if result.is_ok() && guest.c_function != 0 {
             // Watch the stack-shell region the helper dispatches through.
             let dump = |tag: &str, guest: &Guest| {
