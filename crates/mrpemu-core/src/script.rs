@@ -60,7 +60,7 @@ impl ScriptBridge {
     /// Loads the package into the bridge: guest files, header data, and the
     /// script-visible package handle.
     pub fn load_package(&mut self, package: MrpPackage) {
-        let files: Vec<(String, Vec<u8>)> = package
+        let mut files: Vec<(String, Vec<u8>)> = package
             .entries()
             .iter()
             .map(|entry| {
@@ -70,6 +70,11 @@ impl ScriptBridge {
                 )
             })
             .collect();
+        // The raw package under `pack_filename`: the SDK runtime's internal
+        // resource loader opens the pack itself and extracts members
+        // (sky_cfg.bin, res_lang0.rc, …), so the guest must be able to
+        // `mr_open` it.
+        files.push(("app.mrp".to_string(), package.raw_data().to_vec()));
         if let Some(guest) = self.vm.guest.as_mut() {
             guest.files = files;
         } else {
@@ -1411,6 +1416,130 @@ impl ScriptBridge {
                 Ok(vec![vh::num_value(pack_fmt(&format, args)?.len() as f32)])
             }),
         );
+        // The SDK's raw-buffer string FFI. `subV` escapes a string as
+        // `(pointer, length)`; `new`/`set`/`update`/`pupdate` patch byte
+        // buffers held in guest memory. Buffer-backed strings surface as
+        // `{pointer, size}` tables — the same shape `_strCom` already reads
+        // back as payloads.
+        self.vm.register_in(
+            "string",
+            "subV",
+            Rc::new(|vm, args| {
+                let bytes = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                let length = bytes.len() as f32;
+                let Some(guest) = vm.guest.as_mut() else {
+                    return Ok(vec![vh::num_value(0.0), vh::num_value(length)]);
+                };
+                let block = guest.heap_malloc(bytes.len() as u32 + 1);
+                if block == 0 {
+                    return Ok(vec![vh::num_value(0.0), vh::num_value(length)]);
+                }
+                let base = block as usize;
+                guest.mem[base..base + bytes.len()].copy_from_slice(&bytes);
+                guest.mem[base + bytes.len()] = 0;
+                Ok(vec![vh::num_value(block as f32), vh::num_value(length)])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "new",
+            Rc::new(|vm, args| {
+                let len = args.first().and_then(vh::as_num).unwrap_or(0.0).max(0.0) as u32;
+                let Some(guest) = vm.guest.as_mut() else {
+                    return Ok(vec![Value::Nil]);
+                };
+                let block = guest.heap_malloc(len.max(1));
+                if block == 0 {
+                    return Ok(vec![Value::Nil]);
+                }
+                let base = block as usize;
+                guest.mem[base..base + len as usize].fill(0);
+                Ok(vec![buffer_value(block, len)])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "set",
+            Rc::new(|vm, args| {
+                let offset = args.get(1).and_then(vh::as_num).unwrap_or(1.0) as i32;
+                let value = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as u8;
+                match args.first() {
+                    Some(Value::Table(pair)) => {
+                        let (ptr, size) = buffer_cells(&pair.borrow());
+                        if let Some(index) = buffer_index(ptr, size, offset) {
+                            if let Some(guest) = vm.guest.as_mut() {
+                                guest.mem[index] = value;
+                            }
+                        }
+                    }
+                    Some(Value::Str(_)) => {
+                        // Plain strings are shared values here; the SDK's
+                        // in-place patch only applies to `string.new`
+                        // buffers, so this is a no-op.
+                    }
+                    _ => {}
+                }
+                Ok(vec![])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "update",
+            Rc::new(|vm, args| {
+                let source = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                let offset = args.get(2).and_then(vh::as_num).unwrap_or(1.0) as i32;
+                let start = args.get(3).and_then(vh::as_num).unwrap_or(1.0) as i32;
+                let end = args
+                    .get(4)
+                    .and_then(vh::as_num)
+                    .map(|value| value as i32)
+                    .unwrap_or(source.len() as i32);
+                let slice = slice_range(&source, start, end);
+                match args.first() {
+                    Some(Value::Table(pair)) => {
+                        let (ptr, size) = buffer_cells(&pair.borrow());
+                        if let Some(guest) = vm.guest.as_mut() {
+                            guest_buffer_update(guest, ptr, size, offset, &source[slice]);
+                        }
+                    }
+                    Some(Value::Str(_)) => {
+                        // Plain strings are shared values; see `set`.
+                    }
+                    _ => {}
+                }
+                Ok(vec![])
+            }),
+        );
+        self.vm.register_in(
+            "string",
+            "pupdate",
+            Rc::new(|vm, args| {
+                // pupdate(dst_ptr, dst_len, src_ptr, src_len, [offset, start, end])
+                let (Some(dst), Some(dst_len), Some(src), Some(src_len)) = (
+                    args.first().and_then(vh::as_num),
+                    args.get(1).and_then(vh::as_num),
+                    args.get(2).and_then(vh::as_num),
+                    args.get(3).and_then(vh::as_num),
+                ) else {
+                    return Ok(vec![]);
+                };
+                let (dst, dst_len) = (dst as u32, dst_len as u32);
+                let (src, src_len) = (src as u32, src_len as u32);
+                let offset = args.get(4).and_then(vh::as_num).unwrap_or(1.0) as i32;
+                let start = args.get(5).and_then(vh::as_num).unwrap_or(1.0) as i32;
+                let end = args
+                    .get(6)
+                    .and_then(vh::as_num)
+                    .map(|value| value as i32)
+                    .unwrap_or(src_len as i32);
+                if let Some(guest) = vm.guest.as_mut() {
+                    let source: Vec<u8> = (0..src_len).map(|index| guest.r8(src + index)).collect();
+                    let slice = slice_range(&source, start, end);
+                    guest_buffer_update(guest, dst, dst_len, offset, &source[slice]);
+                }
+                Ok(vec![])
+            }),
+        );
         self.vm.register_in(
             "string",
             "find",
@@ -1449,6 +1578,25 @@ impl ScriptBridge {
                 ))])
             }),
         );
+        // The SDK registers the same substitution under `subEx`/`subex`.
+        for alias in ["subEx", "subex"] {
+            self.vm.register_in(
+                "string",
+                alias,
+                Rc::new(|_vm, args| {
+                    let text = args.first().map(vh::to_string_bytes).unwrap_or_default();
+                    let pattern = args.get(1).map(vh::to_string_bytes).unwrap_or_default();
+                    let replacement = args.get(2).map(vh::to_string_bytes).unwrap_or_default();
+                    let limit = args.get(3).and_then(vh::as_num).map(|value| value as usize);
+                    Ok(vec![vh::str_value(&crate::lua_pattern::gsub(
+                        &text,
+                        &pattern,
+                        &replacement,
+                        limit,
+                    ))])
+                }),
+            );
+        }
         self.vm.register_in(
             "string",
             "rep",
@@ -2255,6 +2403,68 @@ fn str_com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
             Ok(vec![vh::num_value(-1.0)])
         }
     }
+}
+
+/// Builds the `{pointer, size}` table value that represents a guest-side
+/// raw buffer string (the SDK `string.new` shape).
+fn buffer_value(ptr: u32, size: u32) -> Value {
+    let mut table = crate::vm::Table::default();
+    table.array.push(vh::num_value(ptr as f32));
+    table.array.push(vh::num_value(size as f32));
+    Value::Table(Rc::new(std::cell::RefCell::new(table)))
+}
+
+/// Reads the `(pointer, size)` cells out of a buffer-table string.
+fn buffer_cells(table: &crate::vm::Table) -> (u32, u32) {
+    let read = |index: usize| -> u32 {
+        table
+            .array
+            .get(index)
+            .and_then(vh::as_num)
+            .unwrap_or(0.0)
+            .max(0.0) as u32
+    };
+    (read(0), read(1))
+}
+
+/// Resolves a 1-based (negative = from-end) byte offset into a 0-based
+/// index; `None` when out of bounds. Mirrors the SDK's offset arithmetic.
+fn buffer_index(base: u32, size: u32, offset: i32) -> Option<usize> {
+    let index = if offset < 0 {
+        size as i64 + offset as i64
+    } else {
+        offset as i64 - 1
+    };
+    if index < 0 || index >= size as i64 {
+        return None;
+    }
+    Some((base as usize) + index as usize)
+}
+
+/// Clips a 1-based inclusive `start..=end` range against a byte slice
+/// (negative values count from the end), per the SDK's update semantics.
+fn slice_range(data: &[u8], start: i32, end: i32) -> std::ops::Range<usize> {
+    let len = data.len() as i32;
+    let begin = (if start < 0 { len + start } else { start - 1 }).clamp(0, len);
+    let stop = (if end < 0 { len + end } else { end }).clamp(begin, len);
+    begin as usize..stop as usize
+}
+
+/// Copies `source` into a guest buffer at the 1-based offset, clamping to
+/// the buffer's remaining space (`string.update` / `string.pupdate`).
+fn guest_buffer_update(
+    guest: &mut crate::cfunction::Guest,
+    base: u32,
+    size: u32,
+    offset: i32,
+    source: &[u8],
+) {
+    let Some(index) = buffer_index(base, size, offset) else {
+        return;
+    };
+    let remaining = (base + size) as usize - index;
+    let count = source.len().min(remaining);
+    guest.mem[index..index + count].copy_from_slice(&source[..count]);
 }
 
 fn color_args(args: &[Value]) -> (u32, u32, u32) {
