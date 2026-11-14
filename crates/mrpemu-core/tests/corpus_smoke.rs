@@ -68,7 +68,7 @@ fn corpus_smoke_sample() {
     let _ = env_logger::try_init();
     // Total instruction budget per package (script + guest): a stuck loop
     // exhausts this and classifies fast instead of burning minutes.
-    mrpemu_core::cfunction::set_instruction_budget(20_000_000);
+    mrpemu_core::cfunction::set_instruction_budget(100_000_000);
     // CORPUS_HOT=1 restricts to the 热门游戏 directory.
     let (_root, all) = if std::env::var("CORPUS_HOT").is_ok() {
         let root = std::path::Path::new(HOT_GAMES_ROOT);

@@ -540,18 +540,43 @@ impl Guest {
         self.store_guest_string(DataSlot::Entry, "_dsm");
         self.store_guest_string(DataSlot::StartFileParameter, "");
         // Large-memory pool starts untouched.
-        // The internal state table (slot 23): an array of 7 pointers to
-        // live state cells. The helper consults mr_state (index 2) — it
-        // must be MR_STATE_RUN(1) or refresh/timer/event paths early-return.
+        // The internal state table (slot 23): an array of 78 pointers,
+        // mirroring the reference _mr_c_internal_table. The ext reads
+        // entries 0-6 for VM/timer state and 7-11 for gz/SMS state;
+        // 12+ are function pointers the ext checks for NULL.
+        // All state cells live after the pointer array in the same region.
         let table = self.data_slot_address(DataSlot::CInternalTable);
         self.set_data(DataSlot::CInternalTable, table);
-        // m0_files, vm_state, mr_state, bi, timer_p, timer_state,
-        // timer_run_without_pause
-        for (index, value) in [0u32, 0, 1, 0, 0, 0, 0].iter().enumerate() {
-            let cell = table + 64 + index as u32 * 4;
-            self.w32(table + index as u32 * 4, cell);
+        let entry_count = 78u32;
+        let state_base = table + entry_count * 4; // state cells after ptrs
+                                                  // Zero the full table + state region.
+        for i in 0..(entry_count * 4 + 128) {
+            self.w32(table + i * 4, 0);
+        }
+        // Entries 0-6: pointers to state cells.
+        // [0]=m0_files(NULL) [1]=vm_state(0) [2]=mr_state(1=Run)
+        // [3]=bi(0) [4]=timer_p(NULL) [5]=timer_state(0) [6]=no_pause(0)
+        let init_state: [(u32, u32); 7] = [
+            (0, 0), // m0_files: NULL pointer
+            (1, 0), // vm_state: 0
+            (2, 1), // mr_state: 1 = MR_STATE_RUN
+            (3, 0), // bi: 0
+            (4, 0), // timer_p: NULL
+            (5, 0), // timer_state: 0
+            (6, 0), // timer_run_without_pause: 0
+        ];
+        for (index, value) in init_state.iter() {
+            let cell = state_base + index * 4;
+            self.w32(table + index * 4, cell);
             self.w32(cell, *value);
         }
+        // Entries 7-11: gz/SMS state cells (all zero).
+        for index in 7..12u32 {
+            let cell = state_base + index * 4;
+            self.w32(table + index * 4, cell);
+            self.w32(cell, 0);
+        }
+        // Entries 12-77: NULL (function pointers the ext checks for NULL).
         // Port table and SMS config buffer use self-referential scratch.
         for slot in [DataSlot::CPortTable, DataSlot::SmsCfgBuf] {
             let address = self.data_slot_address(slot);
