@@ -2428,18 +2428,21 @@ impl Guest {
     /// `mr_readFile(name, buf, *len, lookfor)` — reads from the running
     /// package first (gzip-aware), then the virtual file system.
     fn swi_read_file(&mut self) -> i32 {
-        // mr_readFile(name, &filelen, lookfor) → malloc'd buffer pointer
-        // (or 0). lookfor 1 asks for the ram file only, which this emulator
-        // does not host; everything else resolves from the package.
+        // mr_readFile(name, &filelen, lookfor): `lookfor` only changes the
+        // result shape, per the reference `_mr_readFile` — 1 is an
+        // existence probe that returns 1 when the pack carries the name
+        // (callers use it to decide whether a resource is bundled), 0 and
+        // 2 return the malloc'd data. Everything resolves from the package.
         let name_addr = self.cpu.reg_get(self.cpu.mode(), R0);
         let len_ptr = self.cpu.reg_get(self.cpu.mode(), R1);
         let lookfor = self.cpu.reg_get(self.cpu.mode(), R2);
         let name = String::from_utf8_lossy(&self.guest_cstring(name_addr, 512)).to_string();
-        let content = if lookfor == 1 {
-            None
-        } else {
-            self.file_lookup(&name)
-        };
+        let content = self.file_lookup(&name);
+        if lookfor == 1 {
+            let found = content.is_some() as i32;
+            log::info!("mr_readFile({name:?}, lookfor={lookfor}) -> {found}");
+            return found;
+        }
         log::info!(
             "mr_readFile({name:?}, lookfor={lookfor}) -> {} bytes",
             content.as_ref().map(|data| data.len()).unwrap_or(0)
@@ -2460,11 +2463,22 @@ impl Guest {
 
     /// Looks up `name` in the file table seeded at boot (package members
     /// and VFS content). Falls back to a basename match so guests opening
-    /// `mythroad/x.png` find the packaged `x.png`.
+    /// `mythroad/x.png` find the packaged `x.png`, and resolves any other
+    /// `<something>.mrp` query to the running package itself (guests open
+    /// the pack under its platform-assigned disk name, which is not a
+    /// member of its own file list).
     pub fn file_lookup(&self, name: &str) -> Option<Vec<u8>> {
-        let name = name.trim_start_matches('/');
+        let name = name.trim_start_matches(['/', '\\']);
+        if name.is_empty() {
+            return None;
+        }
         if let Some((_, data)) = self.files.iter().find(|(entry, _)| entry == name) {
             return Some(data.clone());
+        }
+        if name.to_lowercase().ends_with(".mrp") {
+            if let Some((_, data)) = self.files.iter().find(|(entry, _)| entry == "app.mrp") {
+                return Some(data.clone());
+            }
         }
         let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
         self.files
