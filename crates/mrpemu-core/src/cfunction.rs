@@ -18,6 +18,8 @@
 //! SWI-stub approach of the reference loader without relying on SWI
 //! emulation.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use armv4t_emu::{reg, Cpu, Memory};
@@ -30,6 +32,7 @@ const R3: reg::Reg = 3;
 
 use crate::error::MrpError;
 use crate::fmt::{self, Arg};
+use crate::vm::Value;
 
 // ---------------------------------------------------------------------------
 // Guest memory layout
@@ -53,6 +56,24 @@ pub const BRIDGE_BASE: u32 = 0x0028_0400;
 pub const SEND_APP_EVENT_ADDR: u32 = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4 + 8;
 /// Data variables referenced by the pointer-valued table slots.
 pub const DATA_BASE: u32 = 0x0028_0800;
+/// The internal (VM) table `_mr_c_internal_table`: 78 pointer entries plus
+/// the VM/timer state cells. Sits in the free region between the data-slot
+/// area and the heap — the 128-byte data-slot stride would otherwise place
+/// other slot data inside the table's 312-byte pointer array.
+pub const INTERNAL_TABLE_BASE: u32 = 0x0028_1800;
+/// One dispatch address per `_mr_c_internal_table` entry 16-76 (the
+/// `asm_mrp_*` Lua C API wrappers). Guest calls into these addresses are
+/// intercepted before execution and forwarded to the host Lua state.
+pub const VM_BRIDGE_BASE: u32 = 0x0028_1A00;
+/// Number of Lua C API bridge slots: entries 16..=76 (77 is NULL).
+pub const VM_BRIDGE_COUNT: u32 = 61;
+/// The magic `mrp_State*` the `vm_state` cell exports. Bridge calls accept
+/// this value as `L`; the state itself lives host-side.
+pub const VM_STATE_ADDR: u32 = 0x0028_1C00;
+/// Static strings the Lua bridge hands back to the guest (type names for
+/// `mrp_typename`/`mrp_shorttypename`): name `i` lives at
+/// `VM_STRINGS_BASE + i * 16`, NUL-terminated.
+pub const VM_STRINGS_BASE: u32 = 0x0028_1D00;
 /// Where the ext image is loaded.
 pub const EXT_BASE: u32 = 0x0008_0000;
 pub const EXT_MAX_SIZE: u32 = 0x0010_0000;
@@ -424,6 +445,16 @@ pub struct Guest {
     pub next_gui_handle: u32,
     /// The active platform menu (runtime-rendered, key-driven).
     pub menu: Option<MenuState>,
+    /// The host-side Lua state the ext drives through the internal table's
+    /// `asm_mrp_*` bridge (entries 16-76).
+    pub lua: crate::luastate::LuaState,
+    /// Return value of the last internal-table bridge call.
+    vm_bridge_ret: u32,
+    /// Guest-readable backing for Lua string results: content → heap block.
+    lua_string_ptrs: std::collections::HashMap<Vec<u8>, u32>,
+    /// The MiniJ VM that runs bytecode closures loaded through the Lua
+    /// bridge; created lazily on the first bytecode call.
+    lua_vm: Option<Box<crate::vm::Vm>>,
 }
 
 /// A runtime menu: title, items, and the current selection. The platform
@@ -493,6 +524,10 @@ impl Guest {
             bitmaps: std::collections::HashMap::new(),
             next_gui_handle: 0,
             menu: None,
+            lua: crate::luastate::LuaState::new(),
+            vm_bridge_ret: 0,
+            lua_string_ptrs: std::collections::HashMap::new(),
+            lua_vm: None,
         };
         guest.install_table();
         // The heap starts as one whole free block; the offset `HEAP_LEN`
@@ -541,29 +576,30 @@ impl Guest {
         self.store_guest_string(DataSlot::StartFileParameter, "");
         // Large-memory pool starts untouched.
         // The internal state table (slot 23): an array of 78 pointers,
-        // mirroring the reference _mr_c_internal_table. The ext reads
-        // entries 0-6 for VM/timer state and 7-11 for gz/SMS state;
-        // 12+ are function pointers the ext checks for NULL.
-        // All state cells live after the pointer array in the same region.
-        let table = self.data_slot_address(DataSlot::CInternalTable);
+        // mirroring the reference _mr_c_internal_table, in its own region
+        // (the 128-byte data-slot stride would place other slot data inside
+        // the 312-byte pointer array). The ext reads entries 0-6 for
+        // VM/timer state and 7-11 for gz/SMS state, then 12-76 as function
+        // pointers (SMS helpers, `mr_isMr`, and the Lua C API bridges).
+        let table = INTERNAL_TABLE_BASE;
         self.set_data(DataSlot::CInternalTable, table);
         let entry_count = 78u32;
         let state_base = table + entry_count * 4; // state cells after ptrs
-                                                  // Zero the full table + state region.
-        for i in 0..(entry_count * 4 + 128) {
+                                                  // Zero the full table + state region (440 bytes).
+        for i in 0..(entry_count + 32) {
             self.w32(table + i * 4, 0);
         }
         // Entries 0-6: pointers to state cells.
-        // [0]=m0_files(NULL) [1]=vm_state(0) [2]=mr_state(1=Run)
+        // [0]=m0_files(NULL) [1]=vm_state(non-NULL magic) [2]=mr_state(1=Run)
         // [3]=bi(0) [4]=timer_p(NULL) [5]=timer_state(0) [6]=no_pause(0)
         let init_state: [(u32, u32); 7] = [
-            (0, 0), // m0_files: NULL pointer
-            (1, 0), // vm_state: 0
-            (2, 1), // mr_state: 1 = MR_STATE_RUN
-            (3, 0), // bi: 0
-            (4, 0), // timer_p: NULL
-            (5, 0), // timer_state: 0
-            (6, 0), // timer_run_without_pause: 0
+            (0, 0),             // m0_files: NULL pointer
+            (1, VM_STATE_ADDR), // vm_state: the host Lua state magic
+            (2, 1),             // mr_state: 1 = MR_STATE_RUN
+            (3, 0),             // bi: 0
+            (4, 0),             // timer_p: NULL
+            (5, 0),             // timer_state: 0
+            (6, 0),             // timer_run_without_pause: 0
         ];
         for (index, value) in init_state.iter() {
             let cell = state_base + index * 4;
@@ -576,7 +612,37 @@ impl Guest {
             self.w32(table + index * 4, cell);
             self.w32(cell, 0);
         }
-        // Entries 12-77: NULL (function pointers the ext checks for NULL).
+        // Entries 12-15: the SMS/isMr helper bridges, sitting just below
+        // the Lua C API dispatch range.
+        for index in 12..16u32 {
+            self.w32(table + index * 4, VM_BRIDGE_BASE - 0x10 + (index - 12) * 4);
+        }
+        // Entries 16-76: the Lua C API bridge (`asm_mrp_*` in the
+        // reference). Each gets its own interceptable address; the host
+        // dispatch decodes the operation from the address.
+        for index in 16..77u32 {
+            self.w32(table + index * 4, VM_BRIDGE_BASE + (index - 16) * 4);
+        }
+        // Entry 77 stays NULL, mirroring the reference table.
+        // Static strings for the Lua bridge: the full and short type names,
+        // in `crate::luastate` type-code order (NONE first).
+        const TYPE_NAMES: [&str; 9] = [
+            "no value", "nil", "boolean", "userdata", "number", "string", "table", "function",
+            "userdata",
+        ];
+        const SHORT_NAMES: [&str; 9] = [
+            "no ", "nil", "boo", "uda", "num", "str", "tab", "fun", "uda",
+        ];
+        for (index, name) in TYPE_NAMES.iter().enumerate() {
+            let base = (VM_STRINGS_BASE + index as u32 * 16) as usize;
+            self.mem[base..base + name.len()].copy_from_slice(name.as_bytes());
+            self.mem[base + name.len()] = 0;
+        }
+        for (index, name) in SHORT_NAMES.iter().enumerate() {
+            let base = (VM_STRINGS_BASE + 9 * 16 + index as u32 * 16) as usize;
+            self.mem[base..base + name.len()].copy_from_slice(name.as_bytes());
+            self.mem[base + name.len()] = 0;
+        }
         // Port table and SMS config buffer use self-referential scratch.
         for slot in [DataSlot::CPortTable, DataSlot::SmsCfgBuf] {
             let address = self.data_slot_address(slot);
@@ -1093,6 +1159,18 @@ impl Guest {
                 let lr = self.cpu.reg_get(self.cpu.mode(), reg::LR);
                 self.enter_function(lr);
                 self.cpu.reg_set(self.cpu.mode(), R0, 0);
+                continue;
+            }
+            if (VM_BRIDGE_BASE - 0x10..VM_BRIDGE_BASE + VM_BRIDGE_COUNT * 4).contains(&pc) {
+                // Internal-table bridge: entries 12-15 (SMS/isMr helpers,
+                // mapped just below the base) and 16-76 (the Lua C API).
+                let slot = ((pc - (VM_BRIDGE_BASE - 0x10)) / 4) as usize + 12;
+                let result = self.dispatch_vm_bridge(slot, screen);
+                self.cpu.reg_set(self.cpu.mode(), R0, result as u32);
+                // Return through LR with `bx lr` semantics, mirroring the
+                // function-table bridge above.
+                let lr = self.cpu.reg_get(self.cpu.mode(), reg::LR);
+                self.enter_function(lr);
                 continue;
             }
             if (BRIDGE_BASE..bridge_end).contains(&pc) {
@@ -2485,6 +2563,643 @@ impl Guest {
             .iter()
             .find(|(entry, _)| entry.ends_with(base))
             .map(|(_, data)| data.clone())
+    }
+
+    /// Internal-table bridge entry points, indexed by `_mr_c_internal_table`
+    /// slot. Entries 12-15 are the SMS/isMr helpers; 16-76 are the Lua C API
+    /// (`asm_mrp_*` in the reference runtime); 77 is NULL.
+    const VM_BRIDGE_NAMES: [&str; 65] = [
+        // 12-15: SMS/isMr helpers.
+        "smsSetBytes",
+        "smsAddNum",
+        "newSIMInd",
+        "isMr",
+        // 16-76: the Lua C API, in reference table order.
+        "mrp_gettop",            // 16
+        "mrp_settop",            // 17
+        "mrp_pushvalue",         // 18
+        "mrp_remove",            // 19
+        "mrp_insert",            // 20
+        "mrp_replace",           // 21
+        "mrp_isnumber",          // 22
+        "mrp_isstring",          // 23
+        "mrp_iscfunction",       // 24
+        "mrp_isuserdata",        // 25
+        "mrp_type",              // 26
+        "mrp_typename",          // 27
+        "mrp_shorttypename",     // 28
+        "mrp_equal",             // 29
+        "mrp_rawequal",          // 30
+        "mrp_lessthan",          // 31
+        "mrp_tonumber",          // 32
+        "mrp_toboolean",         // 33
+        "mrp_tostring",          // 34
+        "mrp_strlen",            // 35
+        "mrp_tostring_t",        // 36
+        "mrp_strlen_t",          // 37
+        "mrp_tocfunction",       // 38
+        "mrp_touserdata",        // 39
+        "mrp_tothread",          // 40
+        "mrp_topointer",         // 41
+        "mrp_pushnil",           // 42
+        "mrp_pushnumber",        // 43
+        "mrp_pushlstring",       // 44
+        "mrp_pushstring",        // 45
+        "mrp_pushvfstring",      // 46
+        "mrp_pushfstring",       // 47
+        "mrp_pushboolean",       // 48
+        "mrp_pushcclosure",      // 49
+        "mrp_gettable",          // 50
+        "mrp_rawget",            // 51
+        "mrp_rawgeti",           // 52
+        "mrp_newtable",          // 53
+        "mrp_getmetatable",      // 54
+        "mrp_settable",          // 55
+        "mrp_rawset",            // 56
+        "mrp_rawseti",           // 57
+        "mrp_call",              // 58
+        "mrp_pcall",             // 59
+        "mrp_load",              // 60
+        "mrp_getgcthreshold",    // 61
+        "mrp_setgcthreshold",    // 62
+        "mrp_error",             // 63
+        "mrp_checkstack",        // 64
+        "mrp_newuserdata",       // 65
+        "mrp_getfenv",           // 66
+        "mrp_setfenv",           // 67
+        "mrp_setmetatable",      // 68
+        "mrp_cpcall",            // 69
+        "mrp_next",              // 70
+        "mrp_concat",            // 71
+        "mrp_pushlightuserdata", // 72
+        "mrp_getgccount",        // 73
+        "mrp_dump",              // 74
+        "mrp_yield",             // 75
+        "mrp_resume",            // 76
+    ];
+
+    /// Dispatches one internal-table bridge call. `slot` is the
+    /// `_mr_c_internal_table` index (12-76).
+    fn dispatch_vm_bridge(&mut self, slot: usize, screen: &mut crate::display::Screen) -> i32 {
+        let name = Self::VM_BRIDGE_NAMES
+            .get(slot)
+            .copied()
+            .unwrap_or("<out of range>");
+        if std::env::var("MRP_TRACE").is_ok() {
+            let r0 = self.cpu.reg_get(self.cpu.mode(), R0);
+            let r1 = self.cpu.reg_get(self.cpu.mode(), R1);
+            let r2 = self.cpu.reg_get(self.cpu.mode(), R2);
+            let r3 = self.cpu.reg_get(self.cpu.mode(), R3);
+            eprintln!(
+                "[vmbridge {name}] slot={slot} L={r0:#010x} a1={r1:#010x} a2={r2:#010x} a3={r3:#010x} top={}",
+                self.lua.stack.len()
+            );
+        }
+        self.lua_bridge(slot, screen);
+        self.vm_bridge_ret as i32
+    }
+
+    /// Host implementation of the internal-table bridge (the `asm_mrp_*`
+    /// Lua C API and the SMS helpers). Arguments arrive in r0-r3 plus the
+    /// stack; results are left in [`Self::vm_bridge_ret`].
+    fn lua_bridge(&mut self, slot: usize, screen: &mut crate::display::Screen) {
+        use crate::luastate::*;
+        use crate::vm::Value;
+        let r0 = self.cpu.reg_get(self.cpu.mode(), R0);
+        let r1 = self.cpu.reg_get(self.cpu.mode(), R1);
+        let r2 = self.cpu.reg_get(self.cpu.mode(), R2);
+        let trace = std::env::var("MRP_TRACE").is_ok();
+        let stack_len = self.lua.stack.len();
+        // Most ops answer through this closure over the shared state; a
+        // few (cclosure entry) set the return value themselves.
+        #[allow(unused_assignments)]
+        let mut ret: u32 = 0;
+        match slot {
+            // 12-15: SMS/isMr helpers — unused by game flows so far.
+            12..=15 => {
+                if trace {
+                    eprintln!("[vmbridge] helper slot {slot} args {r0:#x} {r1:#x} {r2:#x}");
+                }
+                ret = 0;
+            }
+            // 16: mrp_gettop
+            16 => {
+                let base = self.lua.frames.last().copied().unwrap_or(0);
+                ret = (stack_len - base) as u32;
+            }
+            // 17: mrp_settop(idx)
+            17 => {
+                self.lua.set_top(r1 as i32);
+                ret = 0;
+            }
+            // 18: mrp_pushvalue(idx)
+            18 => {
+                let value = self.lua.peek(r1 as i32).unwrap_or(Value::Nil);
+                self.lua.push(value);
+                ret = 0;
+            }
+            // 19: mrp_remove(idx) — discards the element, shifting the
+            // elements above it down.
+            19 => {
+                if let Some(pos) = self.lua.abs_index(r1 as i32) {
+                    self.lua.stack.remove(pos);
+                }
+                ret = 0;
+            }
+            // 20: mrp_insert(idx) — moves the top element into `idx`,
+            // shifting the others up.
+            20 => {
+                if let Some(pos) = self.lua.abs_index(r1 as i32) {
+                    let top = stack_len - 1;
+                    if pos < top {
+                        let value = self.lua.stack.remove(top);
+                        self.lua.stack.insert(pos, value);
+                    }
+                }
+                ret = 0;
+            }
+            // 21: mrp_replace(idx) — moves the top element into `idx`.
+            21 => {
+                if let Some(pos) = self.lua.abs_index(r1 as i32) {
+                    let top = self.lua.stack.len() - 1;
+                    if pos != top {
+                        let value = self.lua.stack.pop().unwrap_or(Value::Nil);
+                        self.lua.stack[pos] = value;
+                    }
+                }
+                ret = 0;
+            }
+            // 22: mrp_isnumber(idx)
+            22 => {
+                ret = (self.lua.type_at(r1 as i32) == T_NUMBER) as u32;
+            }
+            // 23: mrp_isstring(idx) — true for strings and numbers
+            // (convertible).
+            23 => {
+                let t = self.lua.type_at(r1 as i32);
+                ret = ((t == T_STRING) || (t == T_NUMBER)) as u32;
+            }
+            // 24: mrp_iscfunction(idx)
+            24 => {
+                let is_c = matches!(self.lua.peek(r1 as i32), Some(Value::Native(_)));
+                ret = is_c as u32;
+            }
+            // 25: mrp_isuserdata(idx)
+            25 => {
+                let t = self.lua.type_at(r1 as i32);
+                ret = ((t == T_USERDATA) || (t == T_LIGHTUSERDATA)) as u32;
+            }
+            // 26: mrp_type(idx)
+            26 => {
+                ret = self.lua.type_at(r1 as i32) as u32;
+            }
+            // 27/28: mrp_typename(t) / mrp_shorttypename(t) — the argument
+            // is a type CODE; the answer is a static guest string.
+            27 | 28 => {
+                let code = r1 as i32;
+                let index = if (0..=8).contains(&code) {
+                    code as u32
+                } else {
+                    0
+                };
+                ret = if slot == 27 {
+                    VM_STRINGS_BASE + index * 16
+                } else {
+                    VM_STRINGS_BASE + 9 * 16 + index * 16
+                };
+            }
+            // 29/30: mrp_equal / mrp_rawequal
+            29 | 30 => {
+                let a = self.lua.peek(r1 as i32);
+                let b = self.lua.peek(r2 as i32);
+                ret = (a.is_some() && a == b) as u32;
+            }
+            // 31: mrp_lessthan
+            31 => {
+                let a = self.lua.peek(r1 as i32);
+                let b = self.lua.peek(r2 as i32);
+                ret = match (a, b) {
+                    (Some(Value::Num(x)), Some(Value::Num(y))) => (x < y) as u32,
+                    (Some(Value::Str(x)), Some(Value::Str(y))) => (x.as_ref() < y.as_ref()) as u32,
+                    _ => 0,
+                };
+            }
+            // 32: mrp_tonumber(idx) — the answer travels as float bits.
+            32 => {
+                ret = match self.lua.peek(r1 as i32) {
+                    Some(value) => value.as_num().map(|n| n.to_bits()).unwrap_or(0),
+                    None => 0,
+                };
+            }
+            // 33: mrp_toboolean(idx)
+            33 => {
+                let truthy = !matches!(
+                    self.lua.peek(r1 as i32),
+                    None | Some(Value::Nil) | Some(Value::Bool(false))
+                );
+                ret = truthy as u32;
+            }
+            // 34/36: mrp_tostring / mrp_tostring_t — convert and return a
+            // guest-readable pointer (interned through the heap).
+            34 | 36 => match self.lua.peek(r1 as i32) {
+                Some(value) => {
+                    let bytes = self.lua_string_bytes(&value);
+                    ret = self.lua_intern_string(&bytes);
+                }
+                None => ret = 0,
+            },
+            // 35/37: mrp_strlen / mrp_strlen_t
+            35 | 37 => {
+                ret = match self.lua.peek(r1 as i32) {
+                    Some(value) => self.lua_string_bytes(&value).len() as u32,
+                    None => 0,
+                };
+            }
+            // 38: mrp_tocfunction(idx)
+            38 => {
+                ret = self
+                    .lua
+                    .peek(r1 as i32)
+                    .and_then(|value| self.lua.cclosure_ptr(&value))
+                    .unwrap_or(0);
+            }
+            // 39/41: mrp_touserdata / mrp_topointer
+            39 | 41 => {
+                ret = self
+                    .lua
+                    .peek(r1 as i32)
+                    .and_then(|value| self.lua.userdata_ptr(&value))
+                    .unwrap_or(0);
+            }
+            // 40: mrp_tothread — no coroutine support.
+            40 => ret = 0,
+            // 42: mrp_pushnil
+            42 => {
+                self.lua.push(Value::Nil);
+                ret = 0;
+            }
+            // 43: mrp_pushnumber(n) — n arrives as float bits in r1.
+            43 => {
+                self.lua.push(Value::Num(f32::from_bits(r1)));
+                ret = 0;
+            }
+            // 44: mrp_pushlstring(s, len)
+            44 => {
+                let bytes = self.guest_bytes(r1, r2 as usize).unwrap_or_default();
+                self.lua.push(Value::str_from(&bytes));
+                ret = 0;
+            }
+            // 45: mrp_pushstring(s)
+            45 => {
+                let bytes = self.guest_cstring(r1, 4096);
+                self.lua.push(Value::str_from(&bytes));
+                ret = 0;
+            }
+            // 46/47: mrp_pushvfstring / mrp_pushfstring(fmt, ...)
+            46 | 47 => {
+                let bytes = self.guest_format(r1, 2);
+                ret = self.lua_intern_string(&bytes);
+            }
+            // 48: mrp_pushboolean(b)
+            48 => {
+                self.lua.push(Value::Bool(r1 != 0));
+                ret = 0;
+            }
+            // 49: mrp_pushcclosure(fn, n)
+            49 => {
+                if r2 > 0 && trace {
+                    eprintln!("[vmbridge] pushcclosure with {r2} upvalues (ignored)");
+                }
+                self.lua.push_cclosure(r1, r2 as i32);
+                ret = 0;
+            }
+            // 50: mrp_gettable(idx), 51: mrp_rawget(idx)
+            50 | 51 => {
+                self.lua.get_table(r1 as i32);
+                ret = 0;
+            }
+            // 52: mrp_rawgeti(idx, n)
+            52 => {
+                self.lua.raw_geti(r1 as i32, r2 as i32);
+                ret = 0;
+            }
+            // 53: mrp_newtable
+            53 => {
+                self.lua.push(Value::Table(Rc::new(RefCell::new(
+                    crate::vm::Table::default(),
+                ))));
+                ret = 0;
+            }
+            // 54: mrp_getmetatable — no metatable support yet.
+            54 => ret = 0,
+            // 55: mrp_settable(idx), 56: mrp_rawset(idx)
+            55 | 56 => {
+                self.lua.set_table(r1 as i32);
+                ret = 0;
+            }
+            // 57: mrp_rawseti(idx, n)
+            57 => {
+                self.lua.raw_seti(r1 as i32, r2 as i32);
+                ret = 0;
+            }
+            // 58: mrp_call(nargs, nresults), 59: mrp_pcall(nargs, nresults, err)
+            58 | 59 => {
+                let nargs = r1 as i32;
+                let nresults = r2 as i32;
+                if nargs < 0 || (stack_len as i32) < nargs + 1 {
+                    if trace {
+                        eprintln!("[vmbridge] call with nargs={nargs} but top={stack_len}");
+                    }
+                    ret = 0;
+                } else {
+                    self.lua_call(nargs, nresults, screen);
+                    ret = 0;
+                }
+            }
+            // 60: mrp_load(reader, data, chunkname) — deferred until the
+            // corpus shows a package reaching it.
+            60 => {
+                if trace {
+                    let r3 = self.cpu.reg_get(self.cpu.mode(), R3);
+                    eprintln!(
+                        "[vmbridge] mrp_load reader={r1:#010x} data={r2:#010x} name={r3:#010x} (unimplemented)"
+                    );
+                }
+                ret = 1; // MRP_ERR_RUN: caller falls back gracefully
+            }
+            // 61/73: gc queries; 62: threshold set; 64: checkstack.
+            61 | 73 => ret = 0,
+            62 => ret = 0,
+            64 => ret = 1,
+            // 63: mrp_error — record and return.
+            63 => {
+                let message = self.lua.peek(-1).map(|value| self.lua_string_bytes(&value));
+                self.lua.error = message.map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+                if trace {
+                    eprintln!("[vmbridge] mrp_error: {:?}", self.lua.error);
+                }
+                ret = 0;
+            }
+            // 65: mrp_newuserdata(size)
+            65 => {
+                let block = self.heap_malloc(r1.max(1));
+                if block != 0 {
+                    for offset in 0..r1 {
+                        self.w8(block + offset, 0);
+                    }
+                    self.lua.new_userdata(block, r1);
+                }
+                ret = block;
+            }
+            // 66-69: fenv/metatable/cpcall — cpcall is a direct guest call.
+            66..=68 => ret = 0,
+            69 => {
+                // mrp_cpcall(func, ud): call func(L, ud); func returns 0 on
+                // success or an error code.
+                ret = self.lua_enter_guest(r1, r2, screen) as u32;
+            }
+            // 70: mrp_next — iteration unimplemented; nil ends the loop.
+            70 => {
+                if trace {
+                    eprintln!("[vmbridge] mrp_next (unimplemented; terminates iteration)");
+                }
+                self.lua.push(Value::Nil);
+                ret = 0;
+            }
+            // 71: mrp_concat(n)
+            71 => {
+                let n = (r1 as i32).max(1) as usize;
+                let top = self.lua.stack.len();
+                if top >= n {
+                    let mut joined: Vec<u8> = Vec::new();
+                    for value in &self.lua.stack[top - n..] {
+                        joined.extend_from_slice(&self.lua_string_bytes(value));
+                    }
+                    self.lua.stack.truncate(top - n + 1);
+                    self.lua.push(Value::str_from(&joined));
+                }
+                ret = 0;
+            }
+            // 72: mrp_pushlightuserdata(p)
+            72 => {
+                self.lua.push_lightuserdata(r1);
+                ret = 0;
+            }
+            // 74: mrp_dump; 75: mrp_yield; 76: mrp_resume.
+            74 => ret = 1,
+            75 | 76 => {
+                if trace {
+                    eprintln!("[vmbridge] coroutine op slot {slot} (unimplemented)");
+                }
+                ret = 0;
+            }
+            _ => {
+                if trace {
+                    eprintln!("[vmbridge] unknown slot {slot}");
+                }
+                ret = 0;
+            }
+        }
+        self.vm_bridge_ret = ret;
+    }
+
+    /// The guest-readable bytes of a value (number → Lua `%.14g` formatting,
+    /// string → its bytes).
+    fn lua_string_bytes(&self, value: &crate::vm::Value) -> Vec<u8> {
+        match value {
+            crate::vm::Value::Str(bytes) => bytes.as_ref().clone(),
+            crate::vm::Value::Num(n) => {
+                let d = *n as f64;
+                if d.fract() == 0.0 && d.abs() < 1e15 {
+                    format!("{}", d as i64).into_bytes()
+                } else {
+                    format!("{:.14}", d)
+                        .trim_end_matches('0')
+                        .trim_end_matches('.')
+                        .as_bytes()
+                        .to_vec()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Interns bytes into guest memory so the Lua bridge can hand back a
+    /// stable `const char*`; equal content shares one block (Lua interning).
+    fn lua_intern_string(&mut self, bytes: &[u8]) -> u32 {
+        if let Some(ptr) = self.lua_string_ptrs.get(bytes) {
+            return *ptr;
+        }
+        let block = self.heap_malloc(bytes.len() as u32 + 1);
+        if block == 0 {
+            return 0;
+        }
+        let base = block as usize;
+        self.mem[base..base + bytes.len()].copy_from_slice(bytes);
+        self.mem[base + bytes.len()] = 0;
+        self.lua_string_ptrs.insert(bytes.to_vec(), block);
+        block
+    }
+
+    /// `mrp_call`/`mrp_pcall`: the function is at `-nargs-1`. Guest C
+    /// closures run re-entrantly on a fresh guest stack region; bytecode
+    /// closures would need the MiniJ VM (deferred until the corpus shows
+    /// `mrp_load` in use).
+    fn lua_call(&mut self, nargs: i32, nresults: i32, screen: &mut crate::display::Screen) {
+        let top = self.lua.stack.len();
+        let fn_pos = top - nargs as usize - 1;
+        let function = self.lua.stack[fn_pos].clone();
+        let trace = std::env::var("MRP_TRACE").is_ok();
+        match function {
+            crate::vm::Value::Native(index) if index >= crate::luastate::CCLOSURE_BASE => {
+                let fn_ptr = self
+                    .lua
+                    .cclosures
+                    .get((index - crate::luastate::CCLOSURE_BASE) as usize)
+                    .copied()
+                    .unwrap_or(0);
+                if fn_ptr == 0 {
+                    self.lua.stack.truncate(fn_pos);
+                    self.lua.push(Value::Nil);
+                    return;
+                }
+                // C-function call frame: args live above the function;
+                // negative indices inside resolve against this base.
+                self.lua.frames.push(fn_pos + 1);
+                let count = self.lua_enter_guest(fn_ptr, 0, screen);
+                self.lua.frames.pop();
+                self.lua_collect_results(fn_pos, count.max(0) as usize, nresults);
+            }
+            crate::vm::Value::Closure(closure) => {
+                // Bytecode: run through the MiniJ VM. Guest cclosure calls
+                // from bytecode would need re-entrant guest entry inside the
+                // VM loop; the corpus has not shown that path yet.
+                let args: Vec<crate::vm::Value> = self.lua.stack[fn_pos + 1..].to_vec();
+                self.lua.stack.truncate(fn_pos);
+                let vm = std::mem::take(&mut self.lua_vm);
+                let mut vm = vm.unwrap_or_default();
+                vm.globals = Rc::clone(&self.lua.globals);
+                let result = vm.call_closure(closure, &args);
+                self.lua_vm = Some(vm);
+                match result {
+                    Ok(results) => {
+                        for value in results {
+                            self.lua.push(value);
+                        }
+                        self.lua_set_results_count(fn_pos, nresults);
+                    }
+                    Err(error) => {
+                        self.lua.error = Some(error);
+                        if trace {
+                            eprintln!("[vmbridge] call error: {:?}", self.lua.error);
+                        }
+                        self.lua.push(Value::Nil);
+                        if nresults >= 0 {
+                            self.lua_set_results_count(fn_pos, nresults);
+                        }
+                    }
+                }
+            }
+            other => {
+                if trace {
+                    eprintln!(
+                        "[vmbridge] call on non-callable ({})",
+                        crate::luastate::type_name(crate::luastate::type_code(&other))
+                    );
+                }
+                self.lua.stack.truncate(fn_pos);
+                self.lua.push(Value::Nil);
+            }
+        }
+    }
+
+    /// Finishes a direct guest-cclosure call: replaces the function and its
+    /// arguments with the `count` results the callee left on the stack,
+    /// padded/truncated to `nresults` when it is non-negative.
+    fn lua_collect_results(&mut self, fn_pos: usize, count: usize, nresults: i32) {
+        let top = self.lua.stack.len();
+        // Results are the top `count` values; drop everything below them.
+        if count < top - fn_pos {
+            let keep_from = top - count;
+            let results: Vec<crate::vm::Value> = self.lua.stack[keep_from..].to_vec();
+            self.lua.stack.truncate(fn_pos);
+            for value in results {
+                self.lua.push(value);
+            }
+        }
+        if nresults < 0 {
+            return;
+        }
+        let want = nresults as usize;
+        let have = self.lua.stack.len() - fn_pos;
+        if have < want {
+            for _ in 0..want - have {
+                self.lua.push(Value::Nil);
+            }
+        } else {
+            self.lua.stack.truncate(fn_pos + want);
+        }
+    }
+
+    /// Applies `nresults` padding/truncation to a results block that the
+    /// caller already pushed above `fn_pos`.
+    fn lua_set_results_count(&mut self, fn_pos: usize, nresults: i32) {
+        if nresults < 0 {
+            return;
+        }
+        let want = nresults as usize;
+        let have = self.lua.stack.len() - fn_pos;
+        if have < want {
+            for _ in 0..want - have {
+                self.lua.push(Value::Nil);
+            }
+        } else {
+            self.lua.stack.truncate(fn_pos + want);
+        }
+    }
+
+    /// Enters a guest C function re-entrantly: suspends the current guest
+    /// state, runs the callee on a fresh stack region below the suspended
+    /// frame, and restores the suspended state afterwards. Returns r0.
+    fn lua_enter_guest(
+        &mut self,
+        fn_ptr: u32,
+        arg1: u32,
+        screen: &mut crate::display::Screen,
+    ) -> i32 {
+        if fn_ptr == 0 {
+            return 0;
+        }
+        // Snapshot the suspended execution: r0-r12, SP, LR, PC, CPSR (the
+        // reg file maps indices 0-16 in the current mode).
+        let mode = self.cpu.mode();
+        let mut snapshot = [0u32; 17];
+        for (index, slot) in snapshot.iter_mut().enumerate() {
+            *slot = self.cpu.reg_get(mode, index as u8);
+        }
+        let suspended_sp = snapshot[13];
+        // The callee's stack grows below the suspended frame; 64 KB keeps
+        // the regions disjoint for any realistic C function depth.
+        let nested_sp = suspended_sp.min(STACK_TOP) - 0x1_0000;
+        // Second argument (cpcall's `ud`); the Lua-stack args are read by
+        // the callee through the bridge, not registers.
+        self.cpu.reg_set(self.cpu.mode(), R1, arg1);
+        let result = self.run_guest_with_sp(fn_ptr, nested_sp, 20_000_000, screen);
+        // Restore the suspended execution regardless of the callee outcome.
+        let mode = self.cpu.mode();
+        for (index, value) in snapshot.iter().enumerate() {
+            self.cpu.reg_set(mode, index as u8, *value);
+        }
+        match result {
+            Ok(value) => value as i32,
+            Err(error) => {
+                let trace = std::env::var("MRP_TRACE").is_ok();
+                if trace {
+                    eprintln!("[vmbridge] guest cclosure failed: {error}");
+                }
+                0
+            }
+        }
     }
 
     fn dispatch_test_com(&mut self, input0: u32, input1: u32) -> i32 {

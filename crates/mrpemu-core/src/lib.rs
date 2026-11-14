@@ -24,6 +24,7 @@ pub mod fmt;
 pub mod format;
 pub mod input;
 pub mod lua_pattern;
+pub mod luastate;
 pub mod md5;
 pub mod opcodes;
 pub mod package;
