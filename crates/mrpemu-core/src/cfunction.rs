@@ -1556,9 +1556,14 @@ impl Guest {
                 MR_SUCCESS
             }
             26 => {
-                // mr_printf(fmt, ...)
-                let message = self.guest_format(self.cpu.reg_get(self.cpu.mode(), R0), 1);
-                log::info!("mr_printf: {}", String::from_utf8_lossy(&message));
+                // mr_printf(fmt, ...): the blank-class exts spam this from
+                // their event loop (407k calls per boot), consuming the
+                // instruction budget before the game rendering can start.
+                // Skip the format parsing unless MRP_TRACE is active.
+                if std::env::var("MRP_TRACE").is_ok() {
+                    let message = self.guest_format(self.cpu.reg_get(self.cpu.mode(), R0), 1);
+                    log::info!("mr_printf: {}", String::from_utf8_lossy(&message));
+                }
                 MR_SUCCESS
             }
             29 => {
