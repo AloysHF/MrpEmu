@@ -277,8 +277,18 @@ pub fn type_code(value: &Value) -> i32 {
         Value::Str(_) => T_STRING,
         Value::Table(_) => T_TABLE,
         Value::Closure(_) => T_FUNCTION,
-        // Both C closures and platform natives surface as functions.
-        Value::Native(_) => T_FUNCTION,
+        // Native indices encode the guest-backed kinds by range: platform
+        // natives and C closures are functions, userdata/userdata-pointer
+        // ranges surface as their Lua kinds.
+        Value::Native(i) => {
+            if *i >= LIGHTUSERDATA_BASE {
+                T_LIGHTUSERDATA
+            } else if *i >= USERDATA_BASE {
+                T_USERDATA
+            } else {
+                T_FUNCTION
+            }
+        }
     }
 }
 
