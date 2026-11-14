@@ -748,6 +748,12 @@ impl Guest {
                 self.heap_min = self.heap_min.min(self.heap_left);
                 self.heap_top = self.heap_top.max(self.heap_left);
                 self.sync_lg_slots();
+                if std::env::var("MRP_TRACE").is_ok() {
+                    eprintln!(
+                        "[malloc] {len} -> {address:#010x} (left {:#x})",
+                        self.heap_left
+                    );
+                }
                 return address;
             }
             prev_next = Some(cursor);
@@ -2188,9 +2194,13 @@ impl Guest {
                 0
             }
             14 => {
-                // memset(dst, ch, len)
+                // memset(dst, ch, len). A NULL destination is a no-op: the
+                // SDK runtime issues memset(0, 0, stack_size) as part of its
+                // startup, which on the real device is a benign write to a
+                // reserved page but here would wipe the function table,
+                // bridge slots, and data slots.
                 let count = r2 as usize;
-                if r0 as usize + count <= self.mem.len() {
+                if r0 != 0 && r0 as usize + count <= self.mem.len() {
                     self.mem[r0 as usize..r0 as usize + count].fill((r1 & 0xFF) as u8);
                 }
                 r0 as i32
