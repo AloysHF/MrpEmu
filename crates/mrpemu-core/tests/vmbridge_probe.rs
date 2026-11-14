@@ -14,12 +14,27 @@ fn probe_vmbridge() {
         .unwrap_or(60);
     let mut nonblank_best = 0usize;
     for frame in 0..frames {
+        let which: usize = std::env::var("PROBE_KEY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let keys = [
+            MrpKey::Ok,
+            MrpKey::LeftSoft,
+            MrpKey::RightSoft,
+            MrpKey::Up,
+            MrpKey::Down,
+        ];
+        let key = keys[which.min(keys.len() - 1)];
         if frame % 20 == 5 {
-            machine.input_mut().press(MrpKey::Ok);
+            machine.input_mut().press(key);
         } else if frame % 20 == 8 {
-            machine.input_mut().release(MrpKey::Ok);
+            machine.input_mut().release(key);
         }
         machine.run_frame();
+        if let Ok(delay) = std::env::var("PROBE_DELAY") {
+            std::thread::sleep(std::time::Duration::from_millis(delay.parse().unwrap_or(0)));
+        }
         let nonblank = machine
             .screen()
             .pixels()
