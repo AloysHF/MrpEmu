@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MrpEmu — 在线试玩</title>
+  <meta name="description" content="在浏览器里加载本地 .mrp 游戏，由 EmulatorJS + WASM 核心运行，文件不上传。">
+  <link rel="icon" type="image/png" href="res/logo.png">
+  <link rel="stylesheet" href="css/style.css">
+  <style>
+    .play-page { max-width: 980px; margin: 0 auto; padding: 28px 22px 60px; }
+    .play-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 34px; }
+    .play-header .back { font-family: var(--mono); font-size: 13px; color: var(--lime); border: 1px solid var(--line); padding: 7px 12px; }
+    .play-header .tools { display: flex; gap: 10px; align-items: center; }
+    .play-logo { width: 34px; height: 34px; object-fit: contain; filter: drop-shadow(0 0 6px rgba(45, 214, 236, .45)); }
+    .play-title { font-size: clamp(30px, 4vw, 46px); margin: 0 0 8px; }
+    .play-subtitle { color: var(--muted); margin: 0 0 26px; max-width: 630px; }
+    .play-stage {
+      position: relative;
+      width: min(100%, 560px);
+      aspect-ratio: 3 / 4;
+      margin: 0 auto;
+      background: var(--ink);
+      border: 3px solid var(--violet);
+      box-shadow: 10px 10px 0 var(--shadow);
+      overflow: hidden;
+    }
+    #game { position: absolute; inset: 0; }
+    .play-overlay {
+      position: absolute; inset: 0; z-index: 5;
+      display: grid; place-items: center; text-align: center;
+      padding: 30px;
+      background: rgba(11, 16, 32, .94);
+    }
+    .play-overlay[hidden] { display: none; }
+    .play-overlay h2 { margin: 0 0 10px; font-size: 22px; }
+    .play-overlay p { color: var(--muted); font-size: 14px; max-width: 380px; margin: 8px auto; }
+    .play-overlay .pick {
+      display: inline-block; margin-top: 14px; padding: 10px 18px;
+      border: 2px solid var(--lime); color: var(--lime);
+      font-family: var(--mono); cursor: pointer;
+    }
+    .play-overlay .pick:hover { background: var(--lime); color: var(--ink); }
+    .play-overlay.is-drop { outline: 4px dashed var(--lime); outline-offset: -14px; }
+    .play-overlay a { color: var(--lime); text-decoration: underline; }
+    .play-status-dot { display: inline-block; width: 9px; height: 9px; background: var(--lime); margin-right: 8px; animation: pulse 1.4s infinite; }
+    @keyframes pulse { 50% { opacity: .25; } }
+    .play-controls { margin: 26px auto 0; max-width: 620px; color: var(--muted); font-size: 13px; }
+    .play-controls h3 { color: var(--text); font-family: var(--mono); font-size: 15px; margin-bottom: 10px; }
+    .play-controls kbd { display: inline-block; padding: 2px 7px; margin: 2px; color: var(--lime); background: var(--ink-3); border: 1px solid var(--line); box-shadow: 2px 2px 0 var(--shadow); }
+    .play-reset { display: block; margin: 20px auto 0; }
+    .play-note { color: var(--muted); font-size: 12px; text-align: center; margin-top: 22px; }
+    @media (max-width: 640px) {
+      .play-stage { aspect-ratio: 3 / 4; }
+      .play-overlay { padding: 18px; }
+      .play-controls { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+  <main class="play-page">
+    <div class="play-header">
+      <a class="back" href="index.html" data-i18n="back">← 返回首页</a>
+      <div class="tools">
+        <img class="play-logo" src="res/logo.png" alt="MrpEmu logo" width="34" height="34">
+        <button class="lang-toggle" id="lang-toggle" type="button">EN</button>
+        <a class="nav-icon" href="https://github.com/AloysHF/MrpEmu" target="_blank" rel="noopener" aria-label="GitHub">GH</a>
+      </div>
+    </div>
+
+    <h1 class="play-title" data-i18n="title">在线试玩</h1>
+    <p class="play-subtitle" data-i18n="subtitle">选择本地 .mrp 文件即可在浏览器里运行。核心仍属实验性，并非所有游戏都能运行；游戏通过 blob URL 加载，不会上传到任何服务器。</p>
+
+    <div class="play-stage" id="stage">
+      <div id="game"></div>
+      <div class="play-overlay" id="play-status"><p><span class="play-status-dot"></span><span data-i18n="loading">正在加载核心…</span></p></div>
+      <div class="play-overlay" id="play-picker" hidden>
+        <div>
+          <h2 data-i18n="pickTitle">选择游戏文件</h2>
+          <p data-i18n="pickBody">把 .mrp 文件拖到这里，或点击下方按钮。文件只在你的浏览器里读取。</p>
+          <label class="pick" for="game-file" data-i18n="pickButton">选择 .mrp 文件</label>
+          <input id="game-file" type="file" accept=".mrp,application/octet-stream" hidden>
+          <p><a href="https://github.com/AloysHF/MrpEmu/blob/master/docs/Game-Compatibility.md" target="_blank" rel="noopener" data-i18n="compatLink">查看已测试的游戏</a></p>
+        </div>
+      </div>
+      <div class="play-overlay" id="play-error" hidden>
+        <div>
+          <h2 data-i18n="errorTitle">运行时不可用</h2>
+          <p data-i18n="errorBody">缺少 data/loader.js。站点需要经过 GitHub Pages 工作流部署，它会抓取 EmulatorJS 运行时和 MrpEmu WASM 核心。</p>
+        </div>
+      </div>
+    </div>
+
+    <button class="btn btn-ghost play-reset" id="play-reset" type="button" hidden data-i18n="reset">重新选择游戏</button>
+
+    <div class="play-controls">
+      <h3 data-i18n="controlsTitle">按键</h3>
+      <p data-i18n="controlsBody">方向键 / WASD 移动，Enter 或 5 确认，Q / E 为左右软键，数字键使用 0–9、* 和 #。</p>
+      <p><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd><kbd>Enter</kbd><kbd>Q</kbd><kbd>E</kbd><kbd>0-9</kbd></p>
+    </div>
+    <p class="play-note" data-i18n="note">浏览器核心来自 nightly 构建；游戏文件版权归各自权利人所有。</p>
+  </main>
+
+  <script>
+  (function () {
+    "use strict";
+    var LANG_KEY = "mrpemu-site-lang";
+    var T = {
+      zh: {
+        back: "← 返回首页", title: "在线试玩",
+        subtitle: "选择本地 .mrp 文件即可在浏览器里运行。核心仍属实验性，并非所有游戏都能运行；游戏通过 blob URL 加载，不会上传到任何服务器。",
+        loading: "正在加载核心…", pickTitle: "选择游戏文件",
+        pickBody: "把 .mrp 文件拖到这里，或点击下方按钮。文件只在你的浏览器里读取。",
+        pickButton: "选择 .mrp 文件", compatLink: "查看已测试的游戏",
+        errorTitle: "运行时不可用", errorBody: "缺少 data/loader.js。站点需要经过 GitHub Pages 工作流部署，它会抓取 EmulatorJS 运行时和 MrpEmu WASM 核心。",
+        reset: "重新选择游戏", controlsTitle: "按键",
+        controlsBody: "方向键 / WASD 移动，Enter 或 5 确认，Q / E 为左右软键，数字键使用 0–9、* 和 #。",
+        note: "浏览器核心来自 nightly 构建；游戏文件版权归各自权利人所有。"
+      },
+      en: {
+        back: "← Back home", title: "Play in browser",
+        subtitle: "Pick a local .mrp file and run it in the browser. The core is experimental and not every game runs; the file is loaded through a blob URL and never uploaded.",
+        loading: "Loading core…", pickTitle: "Choose a game file",
+        pickBody: "Drop an .mrp file here, or use the button below. The file stays inside your browser.",
+        pickButton: "Choose .mrp file", compatLink: "See tested games",
+        errorTitle: "Runtime unavailable", errorBody: "data/loader.js is missing. Deploy the site through the GitHub Pages workflow, which fetches the EmulatorJS runtime and the MrpEmu WASM core.",
+        reset: "Choose another game", controlsTitle: "Controls",
+        controlsBody: "Arrows / WASD move, Enter or 5 confirms, Q / E are the soft keys, and 0–9, * and # enter digits.",
+        note: "The browser core comes from the nightly build; game data remains the property of its owners."
+      }
+    };
+
+    var lang = "zh";
+    try { lang = localStorage.getItem(LANG_KEY) === "en" ? "en" : "zh"; } catch (e) {}
+    function applyLang(next) {
+      lang = next;
+      document.documentElement.lang = next === "zh" ? "zh-CN" : "en";
+      var nodes = document.querySelectorAll("[data-i18n]");
+      for (var i = 0; i < nodes.length; i++) {
+        var key = nodes[i].getAttribute("data-i18n");
+        if (T[next][key] !== undefined) nodes[i].textContent = T[next][key];
+      }
+      document.getElementById("lang-toggle").textContent = next === "zh" ? "EN" : "中文";
+      document.title = next === "zh" ? "MrpEmu — 在线试玩" : "MrpEmu — Play in browser";
+      try { localStorage.setItem(LANG_KEY, next); } catch (e) {}
+    }
+    document.getElementById("lang-toggle").addEventListener("click", function () {
+      applyLang(lang === "zh" ? "en" : "zh");
+    });
+    applyLang(lang);
+
+    var stage = document.getElementById("stage");
+    var statusLayer = document.getElementById("play-status");
+    var pickerLayer = document.getElementById("play-picker");
+    var errorLayer = document.getElementById("play-error");
+    var resetButton = document.getElementById("play-reset");
+    var fileInput = document.getElementById("game-file");
+    var booted = false;
+
+    function show(layer) {
+      [statusLayer, pickerLayer, errorLayer].forEach(function (node) { node.hidden = node !== layer; });
+    }
+
+    function boot(file) {
+      if (!file || booted) return;
+      booted = true;
+      show(statusLayer);
+      window.EJS_player = "#game";
+      window.EJS_core = "mrpemu";
+      window.EJS_gameUrl = URL.createObjectURL(file);
+      window.EJS_gameName = file.name;
+      window.EJS_pathtodata = "data/";
+      window.EJS_startOnLoaded = false;
+      window.EJS_backgroundColor = "#0b1020";
+      if (lang === "zh") window.EJS_language = "zh-CN";
+
+      var loader = document.createElement("script");
+      loader.src = "data/loader.js";
+      loader.onload = function () { resetButton.hidden = false; };
+      loader.onerror = function () { booted = false; show(errorLayer); };
+      document.head.appendChild(loader);
+    }
+
+    fileInput.addEventListener("change", function () { boot(fileInput.files[0]); });
+    resetButton.addEventListener("click", function () {
+      window.location.reload();
+    });
+
+    var dragDepth = 0;
+    stage.addEventListener("dragenter", function (event) {
+      event.preventDefault();
+      dragDepth++;
+      pickerLayer.classList.add("is-drop");
+    });
+    stage.addEventListener("dragover", function (event) { event.preventDefault(); });
+    stage.addEventListener("dragleave", function (event) {
+      event.preventDefault();
+      dragDepth--;
+      if (dragDepth <= 0) { dragDepth = 0; pickerLayer.classList.remove("is-drop"); }
+    });
+    stage.addEventListener("drop", function (event) {
+      event.preventDefault();
+      dragDepth = 0;
+      pickerLayer.classList.remove("is-drop");
+      var file = event.dataTransfer.files[0];
+      if (file && /\.mrp$/i.test(file.name)) boot(file);
+    });
+
+    // Show the picker only when the Pages workflow has supplied the runtime.
+    // A HEAD request avoids loading the EmulatorJS loader twice.
+    fetch("data/loader.js", { method: "HEAD" })
+      .then(function (response) { show(response.ok ? pickerLayer : errorLayer); })
+      .catch(function () { show(errorLayer); });
+  })();
+  </script>
+</body>
+</html>

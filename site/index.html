@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MrpEmu — MRP 游戏，回到桌面</title>
+  <meta name="description" content="MrpEmu 是一款用 Rust 编写的 Mythroad/MRP 功能机应用模拟器，提供确定性无头回放、105 款游戏的截图证据和桌面 / libretro / 浏览器三种前端。">
+  <link rel="icon" type="image/png" href="res/logo.png">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <nav class="nav" id="nav">
+    <div class="nav-inner">
+      <a class="brand" href="#top" aria-label="MrpEmu home">
+        <img class="brand-logo" src="res/logo.png" alt="MrpEmu logo" width="34" height="34">
+        <span class="brand-name">MRP<strong>EMU</strong></span>
+      </a>
+      <button class="burger" id="nav-burger" aria-label="Toggle navigation" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
+      <div class="nav-links" id="nav-links">
+        <a href="#features" data-i18n="nav.features">能力</a>
+        <a href="#gallery" data-i18n="nav.gallery">游戏库</a>
+        <a href="#architecture" data-i18n="nav.architecture">架构</a>
+        <a href="#quickstart" data-i18n="nav.quickstart">快速开始</a>
+        <a class="nav-play" href="play.html" data-i18n="nav.play">在线试玩</a>
+        <button class="lang-toggle" id="lang-toggle" type="button">EN</button>
+        <a class="nav-icon" href="https://github.com/AloysHF/MrpEmu" target="_blank" rel="noopener" aria-label="GitHub">GH</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero" id="top">
+    <div class="hero-grid">
+      <div class="hero-copy">
+        <img class="hero-banner" src="res/logo-banner.png" alt="MrpEmu logo banner">
+        <p class="eyebrow" data-i18n="hero.eyebrow">MYTHROAD / MRP / RUST</p>
+        <h1 data-i18n="hero.title">让功能机游戏<br><span class="accent">重新跑起来</span></h1>
+        <p class="hero-sub" data-i18n="hero.sub">MrpEmu 用 Rust 复刻 Mythroad 运行时。固定时钟回放、可脚本化按键，桌面、libretro 与浏览器共用同一颗核心。</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="play.html" data-i18n="hero.play">体验浏览器核心（实验性）→</a>
+          <a class="btn btn-ghost" href="https://github.com/AloysHF/MrpEmu/blob/master/docs/Game-Compatibility.md" target="_blank" rel="noopener" data-i18n="hero.compat">查看兼容性表</a>
+          <a class="btn btn-ghost" href="https://github.com/AloysHF/MrpEmu/releases/latest" target="_blank" rel="noopener" data-i18n="hero.release">下载发行版</a>
+        </div>
+        <p class="hero-note" data-i18n="hero.note">游戏文件需自行准备并合法获取；本项目不分发任何 .mrp 游戏数据。</p>
+      </div>
+
+      <div class="hero-device" aria-hidden="true">
+        <div class="device-shadow"></div>
+        <div class="phone">
+          <div class="phone-speaker"></div>
+          <div class="phone-screen">
+            <div class="screen-bar"><span>MRP//EMU</span><span>240×320</span></div>
+            <img id="hero-shot" alt="" width="240" height="320">
+            <div class="screen-scan"></div>
+          </div>
+          <div class="phone-keys">
+            <span data-i18n="phone.left">菜单</span>
+            <span class="dpad-mini" aria-hidden="true"><b></b></span>
+            <span data-i18n="phone.right">返回</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <section class="stats" id="stats" aria-label="Project statistics">
+    <div class="stat"><span class="stat-number" data-count="105">0</span><span class="stat-label" data-i18n="stat.titles">款游戏已截图</span></div>
+    <div class="stat"><span class="stat-number" data-count="240">0</span><span class="stat-suffix">×320</span><span class="stat-label" data-i18n="stat.resolution">典型分辨率</span></div>
+    <div class="stat"><span class="stat-number" data-count="3">0</span><span class="stat-label" data-i18n="stat.frontends">套前端</span></div>
+    <div class="stat"><span class="stat-number" data-count="7">0</span><span class="stat-label" data-i18n="stat.targets">个构建目标</span></div>
+  </section>
+
+  <section class="section" id="about">
+    <h2 class="section-title" data-i18n="about.title">一个核心，三种玩法</h2>
+    <p class="section-sub" data-i18n="about.sub">从 .mrp 包到画面输出，路径保持简单可审计。</p>
+    <div class="flow">
+      <div class="flow-node"><span class="flow-tag">01</span><strong>.mrp</strong><small data-i18n="flow.package">资源包 + 设备文件</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-node flow-core"><span class="flow-tag">02</span><strong>mrpemu-core</strong><small>CPU · GDI · Lua · Input</small></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-node"><span class="flow-tag">03</span><strong data-i18n="flow.output">画面与按键</strong><small data-i18n="flow.outputSub">桌面 / 手柄 / 浏览器</small></div>
+    </div>
+  </section>
+
+  <section class="section section-alt" id="features">
+    <h2 class="section-title" data-i18n="features.title">为可复现而设计</h2>
+    <p class="section-sub" data-i18n="features.sub">不是“能打开就算兼容”，而是每次都能跑出同一帧。</p>
+    <div class="feature-grid">
+      <article class="feature-card"><span class="feature-index">01</span><h3 data-i18n="f1.title">确定性回放</h3><p data-i18n="f1.body">固定 30 Hz  guest 时钟，不用墙钟计时；同一个包和同一串按键在任意机器上得到相同帧序列。</p><code>--headless --frames 200</code></article>
+      <article class="feature-card"><span class="feature-index">02</span><h3 data-i18n="f2.title">脚本化按键</h3><p data-i18n="f2.body">按帧注入软键、方向键和数字键，把启动提示一路走到标题、菜单甚至游戏画面。</p><code>--press 30:lsk</code></article>
+      <article class="feature-card"><span class="feature-index">03</span><h3 data-i18n="f3.title">截图即证据</h3><p data-i18n="f3.body">无头截图记录非零像素与颜色数；单色帧直接拒绝，不拿黑屏冒充兼容。</p><code>-S shot.png</code></article>
+      <article class="feature-card"><span class="feature-index">04</span><h3 data-i18n="f4.title">105 款实测</h3><p data-i18n="f4.body">热门游戏语料逐款捕获，状态与采集配方逐条登记；不验证游戏内操作就不标 Playable。</p><code>docs/Game-Compatibility.md</code></article>
+      <article class="feature-card"><span class="feature-index">05</span><h3 data-i18n="f5.title">三端共用核心</h3><p data-i18n="f5.body">桌面前端、libretro 核心与 EmulatorJS 浏览器核心都调用同一套 mrpemu-core 行为。</p><code>mrpemu_libretro</code></article>
+      <article class="feature-card"><span class="feature-index">06</span><h3 data-i18n="f6.title">本地运行</h3><p data-i18n="f6.body">浏览器模式用 blob URL 读取你选中的文件，不上传、不托管任何游戏数据。</p><code>offline by design</code></article>
+    </div>
+  </section>
+
+  <section class="section" id="gallery">
+    <h2 class="section-title" data-i18n="gallery.title">游戏画面库</h2>
+    <p class="section-sub" data-i18n="gallery.sub">105 张真实捕获帧。点开状态标签可以筛选；每张卡片都写明分辨率与采集方式。</p>
+    <div class="gallery-tools">
+      <div class="filters" id="gallery-filters">
+        <button class="chip is-active" data-filter="all" type="button" data-i18n="filter.all">全部</button>
+        <button class="chip" data-filter="Partial" type="button" data-i18n="filter.partial">交互画面</button>
+        <button class="chip" data-filter="Boots only" type="button" data-i18n="filter.boots">启动画面</button>
+        <button class="chip" data-filter="Blocked (network)" type="button" data-i18n="filter.network">网络受限</button>
+      </div>
+      <label class="search-wrap"><span class="sr-only" data-i18n="gallery.search">搜索游戏</span><input id="gallery-search" type="search" placeholder="搜索 / search" autocomplete="off"></label>
+    </div>
+    <div class="gallery-grid" id="gallery-grid"></div>
+    <p class="gallery-empty" id="gallery-empty" hidden data-i18n="gallery.empty">没有匹配的游戏。</p>
+    <div class="gallery-more"><button class="btn btn-ghost" id="gallery-more" type="button" data-i18n="gallery.more">显示更多</button></div>
+    <p class="gallery-foot" data-i18n="gallery.foot">画面说明与完整采集配方见兼容性文档。截图只证明画面被渲染，不代表完整流程或音频已验证。</p>
+  </section>
+
+  <section class="section section-alt" id="architecture">
+    <h2 class="section-title" data-i18n="arch.title">架构一览</h2>
+    <div class="arch-grid">
+      <div class="arch-box"><span class="arch-index">FRONTEND</span><h3 data-i18n="arch.frontend">前端</h3><p>desktop · libretro · EmulatorJS</p></div>
+      <div class="arch-arrow">⇢</div>
+      <div class="arch-box arch-core"><span class="arch-index">CORE</span><h3>mrpemu-core</h3><p>cpu · cfunction · gdi · input · lua</p></div>
+      <div class="arch-arrow">⇢</div>
+      <div class="arch-box"><span class="arch-index">TARGET</span><h3 data-i18n="arch.target">目标平台</h3><p>Windows · macOS · Linux · Android · iOS · webOS · Web</p></div>
+    </div>
+  </section>
+
+  <section class="section" id="quickstart">
+    <h2 class="section-title" data-i18n="quick.title">三步开始</h2>
+    <div class="quick-grid">
+      <article class="quick-card"><span class="quick-num">1</span><h3 data-i18n="quick.build">构建</h3><pre><code>cargo build --release -p mrpemu</code></pre><p data-i18n="quick.buildBody">桌面前端不依赖游戏数据即可编译。</p></article>
+      <article class="quick-card"><span class="quick-num">2</span><h3 data-i18n="quick.run">运行</h3><pre><code>mrpemu game.mrp --scale 2</code></pre><p data-i18n="quick.runBody">传入合法获取的 .mrp 文件；可选 --system-dir 加载设备文件。</p></article>
+      <article class="quick-card"><span class="quick-num">3</span><h3 data-i18n="quick.capture">复现截图</h3><pre><code>mrpemu game.mrp -S shot.png \
+  --screenshot-frames 200 \
+  --press 30:lsk</code></pre><p data-i18n="quick.captureBody">或用批处理脚本一次捕获整个语料库。</p></article>
+    </div>
+  </section>
+
+  <section class="play-cta" id="play">
+    <div>
+      <p class="eyebrow" data-i18n="play.eyebrow">BROWSER MODE</p>
+      <h2 data-i18n="play.title">先试一下，再决定要不要装</h2>
+      <p data-i18n="play.sub">在浏览器里选择本地 .mrp 文件，由 EmulatorJS + WASM 核心直接运行。核心仍属实验性，并非所有游戏都能运行；文件不会离开你的设备。</p>
+    </div>
+    <a class="btn btn-primary" href="play.html" data-i18n="play.button">打开在线试玩 →</a>
+  </section>
+
+  <footer class="footer">
+    <div class="footer-col"><img class="footer-logo" src="res/logo.png" alt="MrpEmu logo" width="44" height="44"><strong>MRP//EMU</strong><p data-i18n="footer.about">用 Rust 写的 Mythroad / MRP 应用模拟器。</p><p>GPL-3.0-or-later</p></div>
+    <div class="footer-col"><strong data-i18n="footer.project">项目</strong><a href="https://github.com/AloysHF/MrpEmu" target="_blank" rel="noopener">GitHub</a><a href="https://github.com/AloysHF/MrpEmu/releases" target="_blank" rel="noopener" data-i18n="footer.releases">发行版</a><a href="play.html" data-i18n="nav.play">在线试玩</a></div>
+    <div class="footer-col"><strong data-i18n="footer.docs">文档</strong><a href="https://github.com/AloysHF/MrpEmu/blob/master/docs/Game-Compatibility.md" target="_blank" rel="noopener" data-i18n="footer.compat">兼容性表</a><a href="https://github.com/AloysHF/MrpEmu/blob/master/docs/Standalone-Emulator.md" target="_blank" rel="noopener" data-i18n="footer.standalone">桌面前端</a><a href="https://github.com/AloysHF/MrpEmu/blob/master/docs/architecture.md" target="_blank" rel="noopener" data-i18n="footer.arch">架构</a></div>
+  </footer>
+  <p class="copyright">© 2026 Aloys · MRP//EMU — <span data-i18n="footer.disclaimer">游戏数据版权归各自权利人所有。</span></p>
+
+  <script src="js/compat-data.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

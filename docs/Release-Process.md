@@ -96,9 +96,14 @@ does not publish a Core Downloader entry.
 Every successful CI run on `master` also refreshes the rolling
 **nightly-build** release: the same artifacts are published under the
 `nightly-build` tag, so users can track progress between versioned releases.
-The [project site](https://aloyshf.github.io/MrpEmu/) deployment downloads the
-`mrpemu-emulatorjs.zip` asset from this rolling release after every
-successful Nightly Build.
+The [project site](https://aloyshf.github.io/MrpEmu/) is deployed by
+`.github/workflows/pages.yml` on every push to `master`, on manual dispatch,
+and after every successful Nightly Build. The workflow fetches the pinned
+EmulatorJS runtime, downloads the `mrpemu-emulatorjs.zip` asset from this
+rolling release, copies `site/` to the repository root (so `docs/images` stays
+reachable) and refuses to deploy when the WASM core bundle is incomplete.
+The gallery manifest is checked in and regenerated with
+`python scripts/generate-site-data.py` after editing the compatibility table.
 
 ## Troubleshooting
 

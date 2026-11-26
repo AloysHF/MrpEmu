@@ -1,7 +1,11 @@
 # MrpEmu — A mythroad/MRP application emulator written in Rust
 
 <p align="center">
-  <a href="https://aloyshf.github.io/MrpEmu/"><img src="https://img.shields.io/badge/Website-MrpEmu-00B8A9?logo=githubpages&logoColor=white" alt="Website"></a>
+  <img src="res/logo-banner.png" alt="MrpEmu" width="600">
+</p>
+
+<p align="center">
+  <a href="https://aloyshf.github.io/MrpEmu/"><img src="https://img.shields.io/badge/Website-MrpEmu-7C5CFF?logo=githubpages&logoColor=white" alt="Website"></a>
   <a href="https://github.com/AloysHF/MrpEmu/actions/workflows/ci.yml"><img src="https://github.com/AloysHF/MrpEmu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://git.libretro.com/libretro/mrpemu/-/pipelines"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgit.libretro.com%2Fapi%2Fv4%2Fprojects%2Flibretro%252Fmrpemu%2Fpipelines%3Fref%3Dmaster%26per_page%3D1&query=%24%5B0%5D.status&label=Pipeline%20Status&logo=gitlab&cacheSeconds=300" alt="Gitlab Pipeline Status" ></a>
   <a href="https://github.com/AloysHF/MrpEmu/releases/latest"><img src="https://img.shields.io/github/v/release/AloysHF/MrpEmu" alt="Release"></a>
@@ -181,6 +185,24 @@ See the [RetroArch Core](docs/RetroArch-Core.md) guide for the RetroPad mapping.
 
 See [Game Compatibility](docs/Game-Compatibility.md) for the verification
 criteria and the captured 105-title hot-game table with screenshots.
+The project website mirrors that table as a filterable gallery at
+<https://AloysHF.github.io/MrpEmu/#gallery>.
+
+## Browser Mode (EmulatorJS)
+
+The website provides an experimental browser player at
+<https://AloysHF.github.io/MrpEmu/play.html>. It loads a local `.mrp` file
+through a blob URL and runs it with the WASM libretro core; no game data is
+uploaded or hosted. Browser application support is still experimental and
+not every package runs. The Pages workflow fetches the pinned EmulatorJS runtime
+and the `mrpemu-emulatorjs.zip` core from the rolling `nightly-build` release,
+so the player tracks `master`. See [EmulatorJS Core](docs/EmulatorJS-Core.md)
+for embedding details.
+
+To regenerate the site's compatibility manifest after editing the table, run
+`python scripts/generate-site-data.py`. The generated
+`site/js/compat-data.js` is checked in so the gallery also works from a local
+checkout.
 
 ## Documentation
 

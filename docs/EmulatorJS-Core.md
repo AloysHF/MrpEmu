@@ -11,6 +11,19 @@ that an EmulatorJS page loads at runtime.
 > yet, so a browser build is not usable today. See
 > [Architecture](architecture.md#current-implementation-status).
 
+## Project player
+
+`site/play.html` is a complete example page. It sets `EJS_core = "mrpemu"`,
+loads a user-selected `.mrp` through a blob URL and uses `data/` as
+`EJS_pathtodata`. The published player lives at
+<https://AloysHF.github.io/MrpEmu/play.html>; the page labels the core
+experimental because application coverage in the browser is still limited.
+
+`.github/workflows/pages.yml` deploys `site/` at the repository root and
+fetches the pinned EmulatorJS runtime plus the `mrpemu-emulatorjs.zip` core
+from the rolling `nightly-build` release. It refuses to deploy when either
+WASM bundle is missing, so `play.html` never ships without its core.
+
 ## What you get
 
 Each nightly publishes a single asset:

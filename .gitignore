@@ -30,6 +30,9 @@ coverage/
 *.tmp
 *.temp
 
+# Site runtime fetched by the Pages deployment (CI-generated)
+site/data/
+
 # Internal project files
 .claude/
 .workbuddy/

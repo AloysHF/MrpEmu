@@ -24,6 +24,12 @@ Reproducible captures use the standalone frontend's headless mode and
 `scripts/batch-screenshots.ps1`. Record the exact `--screenshot-frames` and
 `--press` sequence in the note column so another machine can repeat the run.
 
+The [project gallery](https://aloyshf.github.io/MrpEmu/#gallery) is generated
+from the table below. After changing a row, run
+`python scripts/generate-site-data.py` to refresh `site/js/compat-data.js`;
+the site then picks up new screenshots, statuses and notes on the next Pages
+deployment.
+
 Status levels used in the table:
 
 | Status | Meaning |
