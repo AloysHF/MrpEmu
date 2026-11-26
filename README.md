@@ -69,8 +69,23 @@ cargo run --release -p mrpemu -- path/to/app.mrp
 Use `--system-dir path/to/device-files` to load optional Mythroad plugins
 and fonts. For RetroArch, use its configured System/BIOS directory.
 
+Headless runs and PNG captures do not open a window. The command below runs
+200 deterministic frames and saves the presented frame:
+
+```bash
+mrpemu path/to/app.mrp --screenshot shot.png --screenshot-frames 200 \
+  --press 30:lsk --press 65:ok
+```
+
+`--press` repeats `frame:key` pairs (`up`, `down`, `left`, `right`, `ok`,
+`lsk`, `rsk`, `0`-`9`, `star`, `pound`). To capture a whole corpus, run
+`scripts/batch-screenshots.ps1 -GameDirectory <dir>`; it builds the release
+binary when `-Binary` is omitted and writes PNGs to `docs/images`.
+Add `-Press 30:lsk,60:lsk,90:lsk` to apply one bring-up schedule to every
+package; verified per-title overrides live in the script's `$recipes` table.
+
 See the [Standalone Emulator](docs/Standalone-Emulator.md) guide for the
-command-line options and key mappings.
+full option list and key mappings.
 
 ### RetroArch Mode
 
@@ -165,7 +180,7 @@ See the [RetroArch Core](docs/RetroArch-Core.md) guide for the RetroPad mapping.
 ## Game Compatibility
 
 See [Game Compatibility](docs/Game-Compatibility.md) for the verification
-criteria and the compatibility table template.
+criteria and the captured 105-title hot-game table with screenshots.
 
 ## Documentation
 
