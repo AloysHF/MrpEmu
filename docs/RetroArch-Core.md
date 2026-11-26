@@ -3,10 +3,9 @@
 This guide covers installing and running the MrpEmu libretro core for
 RetroArch, loading content, and the current feature set.
 
-> **Status: experimental.** MrpEmu is in scaffold stage: the core loads
-> `.mrp` content and reports video to the frontend, but guest applications do
-> not execute yet (the MiniJ VM is not implemented). See
-> [Architecture](architecture.md#current-implementation-status).
+> **Status: experimental.** The core executes MRP applications and submits
+> RGB565 video to the frontend. See [Application Compatibility](Game-Compatibility.md)
+> for the verification criteria.
 
 ## Supported Platforms
 
@@ -41,24 +40,31 @@ directory so the frontend can display the core metadata.
 2. Select **Load Content**.
 3. Choose a `.mrp` file.
 
+The core looks for optional device files in RetroArch's **System/BIOS**
+directory and then beside the content. Use the same filenames and directory
+layout as the [standalone emulator](Standalone-Emulator.md#optional-device-files).
+
 ## Current Features
 
 - `.mrp` content loading
-- Video output at the platform's 240×320 resolution using the RGB565 pixel
-  format
+- RGB565 video at 240×320 by default. A file or parent folder labeled
+  `240x400` or `320x480` selects that size. Labels can also use `×`.
+- Content reset with the original screen geometry
+- RetroPad input mapped to the phone keypad
+
+| Phone input | RetroPad |
+| --- | --- |
+| Direction keys | D-pad |
+| OK | A |
+| Left soft key | B |
+| Right soft key | X |
+| Digit 0 | Y |
+| Star | Select |
+| Pound | Start |
 
 ## Planned Features
 
-Not yet implemented — listed so it is clear what is missing:
-
-- Application execution (MiniJ VM) and the `mrc_` service bridge
-- RetroPad and keyboard input mapped to the phone keypad
 - Audio output
-- Save states and reset
+- Save states
 - Core options
 - Guest memory exposure
-
-## Current Limitations
-
-- Applications do not execute; the core is a scaffold
-- The core is experimental and its libretro surface may change

@@ -7,6 +7,15 @@
 
 use std::collections::BTreeMap;
 
+/// Optional device files that frontends can mount from a system directory.
+pub const DEVICE_FILES: &[&str] = &[
+    "plugins/flaengine.mrp",
+    "plugins/netpay.mrp",
+    "system/gb12.uc2",
+    "system/gb12_uc2.adl",
+    "system/gb16.uc2",
+];
+
 /// A memory-backed file tree keyed by guest path (for example
 /// `mythroad/game.dat`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

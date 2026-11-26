@@ -9,20 +9,15 @@ pub mod ffi;
 
 use std::{
     ffi::{c_char, c_void, CStr, CString},
-    fs,
     path::PathBuf,
     ptr,
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
 
 use ffi::*;
+use mrpemu_core::emulator::FRAME_RATE;
 use mrpemu_core::{MrpKey, MrpMachine};
-
-/// Aspect ratio of the default 240×320 portrait screen.
-const ASPECT_RATIO: f32 = 240.0 / 320.0;
-
-/// Frame rate reported until the VM drives real timing.
-const FRAMES_PER_SECOND: f64 = mrpemu_core::emulator::PLACEHOLDER_FPS;
 
 /// Sample rate reported until audio exists.
 const AUDIO_SAMPLE_RATE: f64 = 22_050.0;
@@ -42,6 +37,7 @@ struct Core {
     emulator: Option<MrpMachine>,
     /// Raw bytes of the loaded package, kept so `retro_reset` can reload it.
     content: Vec<u8>,
+    elapsed: Duration,
 }
 
 /// The libretro ABI may invoke callbacks from different threads, but the
@@ -72,6 +68,7 @@ static CORE: Mutex<SendCore> = Mutex::new(SendCore(Core {
     },
     emulator: None,
     content: Vec::new(),
+    elapsed: Duration::ZERO,
 }));
 
 fn core() -> MutexGuard<'static, SendCore> {
@@ -175,7 +172,8 @@ impl log::Log for FrontendLogger {
         // paths have to be escaped before reaching the frontend's printf.
         #[cfg(not(target_os = "emscripten"))]
         {
-            let Ok(message) = CString::new(record.args().to_string().replace('%', "%%")) else {
+            let line = format!("{}\n", record.args()).replace('%', "%%");
+            let Ok(message) = CString::new(line) else {
                 return;
             };
             let callback = *FRONTEND_LOG
@@ -310,10 +308,10 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut SystemAvInfo) {
                 base_height: u32::from(height),
                 max_width: u32::from(width),
                 max_height: u32::from(height),
-                aspect_ratio: ASPECT_RATIO,
+                aspect_ratio: f32::from(width) / f32::from(height),
             },
             timing: SystemTiming {
-                fps: FRAMES_PER_SECOND,
+                fps: FRAME_RATE,
                 sample_rate: AUDIO_SAMPLE_RATE,
             },
         };
@@ -330,11 +328,18 @@ pub extern "C" fn retro_set_controller_port_device(_port: u32, _device: u32) {
 pub extern "C" fn retro_reset() {
     guard((), || {
         let mut core = core();
-        if core.content.is_empty() {
+        let Some(emulator) = core.emulator.as_ref() else {
             return;
-        }
+        };
+        let (width, height) = (emulator.screen().width(), emulator.screen().height());
+        let files = emulator.vfs().clone();
         match MrpMachine::load(core.content.clone()) {
-            Ok(emulator) => core.emulator = Some(emulator),
+            Ok(mut emulator) => {
+                emulator.set_resolution(width, height);
+                *emulator.vfs_mut() = files;
+                core.emulator = Some(emulator);
+                core.elapsed = Duration::ZERO;
+            }
             Err(error) => log::error!("reset failed: {error}"),
         }
     });
@@ -347,11 +352,16 @@ pub extern "C" fn retro_run() {
         let Core {
             callbacks,
             emulator,
+            elapsed,
             ..
         } = &mut core.0;
         let Some(emulator) = emulator.as_mut() else {
             return;
         };
+
+        if let Some(poll) = callbacks.input_poll {
+            unsafe { poll() };
+        }
 
         // Sync the frontend joypad into the guest key state.
         for (id, key, _) in JOYPAD_MAP {
@@ -365,11 +375,8 @@ pub extern "C" fn retro_run() {
             }
         }
 
-        if let Some(poll) = callbacks.input_poll {
-            unsafe { poll() };
-        }
-
-        emulator.run_frame();
+        emulator.run_frame_at(*elapsed);
+        *elapsed += Duration::from_secs_f64(1.0 / FRAME_RATE);
 
         let screen = emulator.screen();
         if let Some(video_refresh) = callbacks.video_refresh {
@@ -404,14 +411,7 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
                 .as_ref(),
         );
 
-        let data = match fs::read(&path) {
-            Ok(data) => data,
-            Err(error) => {
-                log::error!("failed to read {}: {error}", path.display());
-                return false;
-            }
-        };
-        let emulator = match MrpMachine::load(data) {
+        let mut emulator = match MrpMachine::from_path(&path) {
             Ok(emulator) => emulator,
             Err(error) => {
                 log::error!("failed to load {}: {error}", path.display());
@@ -419,18 +419,48 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
             }
         };
 
+        let environment = core().callbacks.environment;
+        let mut system_dir: *const c_char = ptr::null();
+        let directory = if call_environment(
+            environment,
+            ENVIRONMENT_GET_SYSTEM_DIRECTORY,
+            ptr::from_mut(&mut system_dir).cast(),
+        ) && !system_dir.is_null()
+        {
+            Some(PathBuf::from(
+                unsafe { CStr::from_ptr(system_dir) }
+                    .to_string_lossy()
+                    .as_ref(),
+            ))
+        } else {
+            None
+        };
+        for &name in mrpemu_core::vfs::DEVICE_FILES {
+            if let Some(data) = directory
+                .as_deref()
+                .into_iter()
+                .chain(path.parent())
+                .find_map(|root| std::fs::read(root.join(name)).ok())
+            {
+                emulator.vfs_mut().write(name, data);
+            }
+        }
+
         let mut core = core();
-        let pixel_format = PIXEL_FORMAT_RGB565;
-        call_environment(
+        let mut pixel_format = PIXEL_FORMAT_RGB565;
+        if !call_environment(
             core.callbacks.environment,
             ENVIRONMENT_SET_PIXEL_FORMAT,
-            ptr::from_ref(&pixel_format).cast_mut().cast(),
-        );
+            ptr::from_mut(&mut pixel_format).cast(),
+        ) {
+            log::error!("the frontend did not accept RGB565 video");
+            return false;
+        }
         let descriptors = input_descriptors();
         call_environment(
             core.callbacks.environment,
             ENVIRONMENT_SET_INPUT_DESCRIPTORS,
-            ptr::from_ref(&descriptors).cast_mut().cast(),
+            descriptors.as_ptr().cast_mut().cast(),
         );
 
         log::info!(
@@ -442,6 +472,7 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
         );
         core.content = emulator.package().to_vec();
         core.emulator = Some(emulator);
+        core.elapsed = Duration::ZERO;
         true
     })
 }
@@ -486,7 +517,7 @@ pub unsafe extern "C" fn retro_serialize(_data: *mut c_void, _size: usize) -> bo
 #[no_mangle]
 /// # Safety
 /// `data` must be null or point to readable storage of at least `size` bytes.
-pub unsafe extern "C" fn retro_deserialize(_data: *const c_void, _size: usize) -> bool {
+pub unsafe extern "C" fn retro_unserialize(_data: *const c_void, _size: usize) -> bool {
     guard(false, || false)
 }
 

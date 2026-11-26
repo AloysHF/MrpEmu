@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::display::{Screen, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use crate::error::MrpError;
@@ -10,18 +11,13 @@ use crate::input::{InputState, MrpKey};
 use crate::script::ScriptBridge;
 use crate::vfs::MemoryVfs;
 
-/// Frame rate reported to frontends while the VM does not drive real timing.
-pub const PLACEHOLDER_FPS: f64 = 30.0;
+/// Frontend frame cadence for the phone screen and input.
+pub const FRAME_RATE: f64 = 30.0;
 
 const PLACEHOLDER_BACKGROUND: u16 = 0x1082;
 const PLACEHOLDER_FRAME: u16 = 0x39E7;
 
-/// A loaded MRP application: its package data, the phone screen, input
-/// state, and the guest file tree.
-///
-/// The execution environment (MiniJ VM plus the `mrc_` API bridge) is not
-/// implemented yet, so [`MrpMachine::run_frame`] is a placeholder that keeps
-/// the screen content unchanged.
+/// A loaded MRP application with a script VM, a native guest, and a virtual phone.
 pub struct MrpMachine {
     header: MrpHeader,
     package: Vec<u8>,
@@ -64,8 +60,14 @@ impl MrpMachine {
 
     /// Convenience loader that reads the package from `path` first.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, MrpError> {
-        let data = std::fs::read(path.as_ref())?;
-        Self::load(data)
+        let path = path.as_ref();
+        let mut machine = Self::load(std::fs::read(path)?)?;
+        let (width, height) = resolution_from_path(path);
+        if (width, height) != machine.resolution {
+            machine.set_resolution(width, height);
+            machine.draw_placeholder();
+        }
+        Ok(machine)
     }
 
     pub fn header(&self) -> &MrpHeader {
@@ -174,6 +176,22 @@ impl MrpMachine {
         }
     }
 
+    fn prepare_guest(&mut self, guest: &mut crate::cfunction::Guest, elapsed: Option<Duration>) {
+        guest.set_frame_time(elapsed);
+        for (path, bytes) in self
+            .vfs
+            .paths()
+            .filter_map(|path| self.vfs.read(path).map(|bytes| (path, bytes)))
+        {
+            if guest.file_data(path).is_none() {
+                guest.files.push((path.to_string(), bytes.to_vec()));
+            }
+        }
+        if let Some(sink) = self.pending_audio_sink.take() {
+            guest.audio_sink = sink;
+        }
+    }
+
     /// Installs the audio sink used by the guest's `mr_playSound` /
     /// `mr_stopSound` calls. Applies to the live guest when one exists;
     /// otherwise the sink is parked until the next boot creates a guest.
@@ -195,13 +213,29 @@ impl MrpMachine {
     /// Advances the application by one frame: boots through the start.mr
     /// script on first use, then delivers key edges and fires due timers.
     pub fn run_frame(&mut self) {
+        self.run_frame_with_clock(None);
+    }
+
+    /// Advances one frame using a caller-supplied, nondecreasing guest uptime.
+    pub fn run_frame_at(&mut self, elapsed: Duration) {
+        self.run_frame_with_clock(Some(elapsed));
+    }
+
+    fn run_frame_with_clock(&mut self, elapsed: Option<Duration>) {
         if self.script.is_none() && !self.boot_attempted {
             self.boot_attempted = true;
-            self.boot_guest();
+            self.boot_guest(elapsed);
+            if let Some(error) = self.boot_error() {
+                log::error!("guest boot failed: {error}");
+                self.screen.fill(0);
+            }
         }
         let Some(bridge) = self.script.as_mut() else {
             return;
         };
+        if let Some(guest) = bridge.vm.guest.as_mut() {
+            guest.set_frame_time(elapsed);
+        }
         let exit_requested = bridge
             .vm
             .guest
@@ -223,15 +257,10 @@ impl MrpMachine {
         let pump = |bridge: &mut ScriptBridge, event_type: i32, p0: i32| {
             // Try the guest's ext handler first.
             if let Some(guest) = bridge.vm.guest.as_mut() {
-                let mut screen = std::mem::replace(
-                    &mut bridge.vm.screen,
-                    crate::display::Screen::new(
-                        crate::display::DEFAULT_WIDTH,
-                        crate::display::DEFAULT_HEIGHT,
-                    ),
-                );
-                let result = guest.send_event(event_type, p0, 0, &mut screen);
-                bridge.vm.screen = screen;
+                let result = guest.send_event(event_type, p0, 0, &mut bridge.vm.screen);
+                if let Err(error) = &result {
+                    log::debug!("guest event {event_type} failed: {error}");
+                }
                 if !matches!(result, Ok(1)) {
                     return; // handled by the ext
                 }
@@ -285,12 +314,12 @@ impl MrpMachine {
         }
 
         // Timers: restart the interval, then invoke the registered handler.
-        let now = std::time::Instant::now();
         let due: Vec<i32> = bridge
             .vm
             .guest
             .as_ref()
             .map(|guest| {
+                let now = guest.clock_now();
                 guest
                     .timers
                     .iter()
@@ -308,18 +337,13 @@ impl MrpMachine {
                 .unwrap_or(false);
             if ext_driven {
                 if let Some(guest) = bridge.vm.guest.as_mut() {
+                    let now = guest.clock_now();
                     if let Some(timer) = guest.timers.iter_mut().find(|timer| timer.id == id) {
                         timer.next_fire = now + timer.interval;
                     }
-                    let mut screen = std::mem::replace(
-                        &mut bridge.vm.screen,
-                        crate::display::Screen::new(
-                            crate::display::DEFAULT_WIDTH,
-                            crate::display::DEFAULT_HEIGHT,
-                        ),
-                    );
-                    let _ = guest.fire_timer(&mut screen);
-                    bridge.vm.screen = screen;
+                    if let Err(error) = guest.fire_timer(&mut bridge.vm.screen) {
+                        log::debug!("guest timer failed: {error}");
+                    }
                 }
             } else {
                 // Script-level timers route through `_com(3, fn)` /
@@ -340,86 +364,91 @@ impl MrpMachine {
             .unwrap_or(false);
         if ext_driven {
             if let Some(guest) = bridge.vm.guest.as_mut() {
-                let mut screen = std::mem::replace(
-                    &mut bridge.vm.screen,
-                    crate::display::Screen::new(
-                        crate::display::DEFAULT_WIDTH,
-                        crate::display::DEFAULT_HEIGHT,
-                    ),
-                );
-                let _ = guest.fire_timer(&mut screen);
-                bridge.vm.screen = screen;
+                if let Err(error) = guest.fire_timer(&mut bridge.vm.screen) {
+                    log::debug!("guest timer failed: {error}");
+                }
             }
         }
 
         bridge.present();
         // Sync the presented guest screen into the machine's public screen
         // so frontends and tests observe post-boot drawing.
-        self.screen = bridge.vm.screen.clone();
+        self.screen.clone_from(&bridge.vm.screen);
     }
 
     /// Boots the application: runs start.mr on the script bridge first
     /// (the SDK wrapper drives ext loading via `_com(800)`); when the
     /// script fails or does not produce a registered ext handler, falls
     /// back to loading `cfunction.ext` directly through the guest engine.
-    fn boot_guest(&mut self) {
+    fn boot_guest(&mut self, elapsed: Option<Duration>) {
         let Ok(package) = crate::package::MrpPackage::parse(self.package.clone()) else {
             self.boot_error = Some("package reparse failed".to_string());
             return;
         };
-        // Direct ext path first: the application image (game.ext /
-        // cfunction.ext) boots straight into its event loop, while the
-        // script chain's SDK wrapper (whose init self-reloads through
-        // platform calls we only partially model) can end up routing events
-        // nowhere. Pure-script packages fall through — no .ext members.
-        let mut direct_error = None;
-        if self.try_direct_ext_boot(&package, &mut direct_error) {
-            return;
-        }
-        // Script path: start.mr runs on the VM and drives _com(800).
-        let mut bridge = ScriptBridge::new();
-        bridge.load_package(
-            crate::package::MrpPackage::parse(self.package.clone())
-                .expect("package parsed at load"),
-        );
-        bridge.create_guest_with(self.guest_config());
-        if let Some(sink) = self.pending_audio_sink.take() {
+        let has_ext = package
+            .entries()
+            .iter()
+            .any(|entry| entry.name.to_ascii_lowercase().ends_with(".ext"));
+        let mut script_error = None;
+        if package
+            .entries()
+            .iter()
+            .any(|entry| entry.name == "start.mr")
+        {
+            let mut bridge = ScriptBridge::new();
+            bridge.load_package(package.clone());
+            bridge.create_guest_with(self.guest_config());
             if let Some(guest) = bridge.vm.guest.as_mut() {
-                guest.audio_sink = sink;
+                self.prepare_guest(guest, elapsed);
+            }
+            match bridge.run_start_script() {
+                Ok(()) => {
+                    bridge.present();
+                    let pixels = bridge.vm.screen.pixels();
+                    let drew = pixels.iter().any(|&pixel| pixel != pixels[0]);
+                    let scheduled = bridge
+                        .vm
+                        .guest
+                        .as_ref()
+                        .is_some_and(|guest| !guest.timers.is_empty());
+                    if !has_ext || drew || scheduled {
+                        self.screen.clone_from(&bridge.vm.screen);
+                        self.script = Some(bridge);
+                        return;
+                    }
+                    script_error =
+                        Some("start.mr did not produce video or schedule an update".to_string());
+                }
+                Err(error) => {
+                    log::debug!(
+                        "start.mr failed: {error}; missing globals: {:?}",
+                        bridge.missing_globals()
+                    );
+                    script_error = Some(error);
+                }
+            }
+            if let Some(guest) = bridge.vm.guest.as_mut() {
+                self.pending_audio_sink = Some(std::mem::replace(
+                    &mut guest.audio_sink,
+                    Box::new(crate::audio::NullAudioSink),
+                ));
             }
         }
-        // Pure-script applications never register an ext handler, so the
-        // script itself completing is the only success criterion here; a
-        // script that also loaded an ext simply keeps that handler live.
-        let script_result = bridge.run_start_script();
-        if let Err(error) = &script_result {
-            log::warn!(
-                "start.mr failed: {error}; missing globals: {:?}",
-                bridge.vm.missing_globals.borrow()
+        let mut direct_error = None;
+        if !has_ext || !self.try_direct_ext_boot(&package, elapsed, &mut direct_error) {
+            self.boot_error = Some(
+                direct_error
+                    .or(script_error)
+                    .unwrap_or_else(|| "missing application entry".to_string()),
             );
         }
-        let script_ok = script_result.is_ok();
-        if script_ok {
-            self.screen = std::mem::replace(
-                &mut bridge.vm.screen,
-                crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
-            );
-            self.script = Some(bridge);
-            return;
-        }
-        self.boot_error = Some(direct_error.unwrap_or_else(|| {
-            script_result
-                .err()
-                .unwrap_or_else(|| "boot failed".to_string())
-        }));
     }
 
-    /// Tries every .ext member (largest first — loader stubs register but
-    /// idle, the real application image is always the largest) until one
-    /// registers an event handler. Returns `true` on success.
+    /// Tries direct extensions, largest first, when the script did not start.
     fn try_direct_ext_boot(
         &mut self,
         package: &crate::package::MrpPackage,
+        elapsed: Option<Duration>,
         last_error: &mut Option<String>,
     ) -> bool {
         let mut ext_files: Vec<(String, Vec<u8>)> = package
@@ -453,16 +482,14 @@ impl MrpMachine {
             })
             .collect();
         packaged_files.push(("app.mrp".to_string(), self.package.clone()));
-        let mut screen = crate::display::Screen::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         for (name, ext) in &ext_files {
             // A fresh guest per attempt: a failed boot can leave the heap
             // drained (the SDK init allocates large pools before failing),
             // which would poison every later attempt.
             let mut guest =
                 crate::cfunction::Guest::new(self.guest_config(), packaged_files.clone());
-            if let Some(sink) = self.pending_audio_sink.take() {
-                guest.audio_sink = sink;
-            }
+            self.prepare_guest(&mut guest, elapsed);
+            let mut screen = Screen::new(self.resolution.0, self.resolution.1);
             match guest.boot_ext(
                 ext,
                 self.header.build_id,
@@ -484,9 +511,14 @@ impl MrpMachine {
                     log::info!("ext {} loaded but did not register; trying next", name);
                 }
                 Err(error) => {
+                    log::debug!("ext {name} boot failed: {error}");
                     *last_error = Some(error.to_string());
                 }
             }
+            self.pending_audio_sink = Some(std::mem::replace(
+                &mut guest.audio_sink,
+                Box::new(crate::audio::NullAudioSink),
+            ));
         }
         false
     }
@@ -510,8 +542,9 @@ impl MrpMachine {
             MrpKey::Down => 13,
             MrpKey::Left => 14,
             MrpKey::Right => 15,
-            MrpKey::Ok | MrpKey::LeftSoft => 17,
+            MrpKey::LeftSoft => 17,
             MrpKey::RightSoft => 18,
+            MrpKey::Ok => 20,
         }
     }
 
@@ -530,6 +563,22 @@ impl MrpMachine {
             screen.set_pixel(width - 1, y, PLACEHOLDER_FRAME);
         }
     }
+}
+
+fn resolution_from_path(path: &Path) -> (u16, u16) {
+    for component in path.components().rev() {
+        let label = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        if label.contains("240x400") || label.contains("240×400") {
+            return (240, 400);
+        }
+        if label.contains("320x480") || label.contains("320×480") {
+            return (320, 480);
+        }
+        if label.contains("240x320") || label.contains("240×320") {
+            return (240, 320);
+        }
+    }
+    (DEFAULT_WIDTH, DEFAULT_HEIGHT)
 }
 
 #[cfg(test)]

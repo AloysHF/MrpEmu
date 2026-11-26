@@ -5,6 +5,7 @@ members = [
     "crates/mrpemu",
     "crates/mrpemu-libretro",
 ]
+exclude = ["vendor/armv4t_emu"]
 # The libretro buildbot runs a bare `cargo build --release --target <triple>` at
 # the repo root. Restrict the default build set to the libretro core so the CI
 # does not try to cross-compile the standalone GUI binary (minifb, which needs

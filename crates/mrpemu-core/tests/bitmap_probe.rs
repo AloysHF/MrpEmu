@@ -3,7 +3,6 @@
 use mrpemu_core::cfunction::{set_instruction_budget, Guest, GuestConfig};
 use mrpemu_core::display::Screen;
 use mrpemu_core::package::MrpPackage;
-use mrpemu_core::MrpKey;
 
 #[test]
 #[ignore = "manual probe"]

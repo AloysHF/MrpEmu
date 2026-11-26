@@ -2,11 +2,11 @@
 
 ## Current status
 
-**MrpEmu has no verified playable applications yet.** The emulator is in
-scaffold stage: package headers parse and the frontends present a framebuffer,
-but the MiniJ VM and the `mrc_` service bridge are not implemented, so no
-application executes. This page will list tested applications once execution
-lands; until then the table below is the template contributors should fill.
+MrpEmu can execute MRP applications. The headless video test drives startup
+and key input at 30 guest frames per second. The video check requires
+non-uniform RGB565 pixels across at least one eighth of the display rows
+and at least 0.5% of its pixels. Thin strips and uniform frames are reported
+separately. Playability requires a reproducible gameplay sequence.
 
 ## How applications are verified
 
@@ -27,7 +27,7 @@ Status levels used in the table:
 | Playable | Core gameplay entered and operated in scripted runs (not necessarily completed) |
 | Partial | Interactive screens verified; gameplay unverified or only partly verified |
 | Boots only | Renders startup screens; interaction not verified |
-| Blocked (network) | The only entry path is the platform's retired online service |
+| Blocked (network) | The tested entry path requires a network service unavailable in the emulator |
 | Fails to start | Guest execution stops during startup |
 
 ## Application List
@@ -39,11 +39,11 @@ Applications are not included in this repository; supply legally obtained
 | Application | Version | Screen | Status | Notes |
 | --- | --- | --- | --- | --- |
 
-*(empty — no application has been verified yet)*
+Compatibility rows are recorded after the frontend and gameplay checks above.
 
 ## Reporting a Compatibility Issue
 
-Once applications execute, include the package file name, the header version
+Include the package file name, the header version
 and app ID, the screen resolution, the last visible screen, the triggering
 input and the log output. Do not attach copyrighted `.mrp` packages to public
 reports.

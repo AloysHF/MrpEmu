@@ -41,17 +41,14 @@ crates/
 ```
 
 - **`mrpemu-core`** — everything platform-independent: `.mrp` package
-  parsing, the RGB565 framebuffer, the feature-phone keypad input model, and
-  the in-memory guest filesystem. The MiniJ interpreter and the `mrc_` service
-  bridge will live here as well. The core depends on no windowing system and
-  no frontend; frontends drive it through a framebuffer plus a keypad
-  interface.
+  parsing, the MiniJ and ARM/Thumb interpreters, the service bridge, the
+  RGB565 framebuffer, the phone keypad, and guest storage. Frontends drive
+  the machine through its framebuffer and keypad interface.
 - **`mrpemu`** — the standalone desktop frontend built on minifb. It loads an
   `.mrp` path from the command line, presents the core's framebuffer in a
   window, and feeds host keyboard events into the keypad model.
-- **`mrpemu-libretro`** — the libretro core. It loads `.mrp` content and
-  reports the 240×320 RGB565 surface as libretro video; input, audio and save
-  states will follow as the core matures.
+- **`mrpemu-libretro`** — loads content, reports RGB565 game frames and
+  screen geometry, and maps RetroPad input to the phone keypad.
 
 ## Emulation strategy
 
@@ -61,58 +58,48 @@ not by emulating a specific chipset or copying proprietary runtime code.
 
 ### MiniJ interpreter
 
-MRP bytecode is executed by a self-developed MiniJ interpreter inside
-`mrpemu-core`. Interpreting the bytecode in Rust keeps the core portable,
-debuggable and independent of any proprietary runtime. **Not yet implemented**
-— this is the central open work item.
+The MiniJ interpreter loads and executes `start.mr`. Platform natives expose
+package files, input, drawing operations, and ext loading to guest scripts.
 
 ### `mrc_` service bridge
 
 Applications reach the phone through the `mrc_`-prefixed C API: display and
 drawing, GBK text, input, files, timers, and the rest of the platform surface.
-The bridge implements these services natively in Rust against the core's
-framebuffer, input model and VFS. **Not yet implemented.**
+The bridge exposes these services through guest function tables. Open file
+handles share the same virtual files, so an application can generate a
+resource cache and read it later in the same session. Native code can
+register a RAM package and use the file bridge to look up, borrow or
+decompress its members. It can also select a package in guest storage.
+The frontends may seed guest storage with optional device files at load
+time. The framebuffer supports 240×320, 240×400, and 320×480 displays.
+Native drawing follows the current guest framebuffer pointer, and an
+explicit video submission retains its pixels for the frontend. Optional
+platform extended RAM is allocated separately from the SDK's main heap.
 
-### ext (native ARM) libraries — open decision point
+### Native extensions
 
-Some packages ship native ARM code in `ext` entries. Executing that code
-requires an ARM CPU subsystem (an interpreter or a recompiler) and a policy
-for how such code may reach the platform services. How and in what form
-MrpEmu implements this is a deliberate follow-up decision. **Nothing is
-implemented today**; packages that require ext code cannot run until this
-exists.
+The core executes native extensions in a 32-bit ARM/Thumb guest. Library
+entry points register an application handler. The service bridge dispatches
+platform calls and can invoke a secondary ext entry point while preserving
+the suspended ARM caller's registers. MiniJ can send binary strings and
+guest memory buffers to the handler without truncating the payload.
 
 ## Current implementation status
 
-Implemented (0.1.0 scaffold):
-
-- 200-byte `.mrp` header parsing with GBK text decoding: magic, data offset,
-  package size, file-list offset, internal name, display name, IMEI, version,
-  app ID, author and description
-- RGB565 framebuffer at 240×320
-- Feature-phone keypad input model: direction keys, OK, left/right soft keys,
-  number keys
-- In-memory VFS skeleton
-- Desktop frontend (`mrpemu`, minifb): loads an `.mrp` file and opens a window
-- Libretro core (`mrpemu_libretro`): loads content and reports 240×320 RGB565
-  video
-
-Not yet implemented:
-
-- MiniJ VM execution — applications do not run
-- `mrc_` API bridge
-- ext ARM code execution
-- Audio
-- Save states
-- Networking
+The core runs MiniJ and native ARM/Thumb code and exposes display, keypad,
+file, and timer services. The desktop frontend plays supported PCM clips.
+Platform service coverage, libretro audio, save states, and networking are
+ongoing work.
 
 ## Boot flow (today)
 
 1. The frontend receives an `.mrp` path (CLI argument or libretro content).
 2. `mrpemu-core` validates the package header and decodes the GBK metadata
    fields (see [MRP Format](Mrp-Format.md)).
-3. A 240×320 RGB565 framebuffer is created and presented — a desktop window in
-   the standalone frontend, a `video_refresh` callback in the libretro core.
-4. Host input is translated into the keypad model.
-5. Execution ends here for now: bytecode interpretation and `mrc_` service
-   calls are the next milestones.
+3. The core initializes its framebuffer at the detected size. It runs
+   the MiniJ startup script when it initializes a native wrapper, with
+   direct native boot available for packages that use that path.
+4. Both frontends drive frame updates at 30 Hz. The core uses the supplied
+   guest time to deliver key edges and due timers during each update.
+5. The standalone frontend converts RGB565 pixels for its window. The
+   libretro core sends RGB565 pixels to the frontend's `video_refresh` callback.

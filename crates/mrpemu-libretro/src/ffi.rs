@@ -5,6 +5,7 @@ use std::ffi::{c_char, c_void};
 pub const API_VERSION: u32 = 1;
 pub const REGION_NTSC: u32 = 0;
 
+pub const ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;
 pub const ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
 pub const ENVIRONMENT_SET_INPUT_DESCRIPTORS: u32 = 11;
 pub const ENVIRONMENT_SET_SUPPORT_NO_GAME: u32 = 18;

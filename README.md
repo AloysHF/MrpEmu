@@ -24,40 +24,36 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
 
 ## Status
 
-> **Early scaffold (version 0.1.0).** Package header parsing, the RGB565
-> framebuffer, the keypad input model, the in-memory filesystem skeleton, the
-> desktop frontend and the libretro core shell work. Guest applications do
-> **not** execute yet: the MiniJ VM, the `mrc_` service bridge, ext (native
-> ARM library) execution, audio, save states and networking are not
-> implemented. No application has been verified playable — see
-> [Game Compatibility](docs/Game-Compatibility.md).
+> **Experimental (version 0.1.0).** MrpEmu executes MiniJ bytecode and native
+> ARM/Thumb extensions and presents game frames in the desktop frontend and
+> the libretro core. Compatibility varies by application. See
+> [Game Compatibility](docs/Game-Compatibility.md) for the verification criteria.
 
 ## Features
 
 ### Implemented
 
-- **`.mrp` package parsing** — the 200-byte package header: magic, offsets and
-  sizes, internal name, display name, IMEI, version, app ID, author and
-  description fields, with GBK text decoding
-- **RGB565 framebuffer** — 240×320 16-bit (5-6-5) display surface owned by the
-  core
+- **`.mrp` package parsing** — header metadata, the file list, and gzip
+  members, with GBK text decoding
+- **Application execution** — MiniJ interpretation, an ARM/Thumb interpreter,
+  and high-level implementations of phone services
+- **RGB565 framebuffer** — 240×320 by default, with 240×400 and 320×480
+  selected from resolution labels in content paths. Both frontends advance
+  the guest clock at 30 frames per second
 - **Feature-phone keypad model** — direction keys, OK, the left/right soft
   keys, and the number keys
-- **In-memory VFS skeleton** — sandboxed guest filesystem foundation for
-  packaged and guest-created files
+- **In-memory guest filesystem** — packaged and session-created files,
+  including resources from guest-loaded RAM packages and optional device files
 - **Standalone desktop frontend** — the `mrpemu` binary (minifb): loads an
   `.mrp` file and opens a scaled window
-- **Libretro core skeleton** — `mrpemu_libretro` loads content and reports
-  240×320 RGB565 video to the frontend
+- **Libretro core** — `mrpemu_libretro` presents RGB565 game frames and maps
+  RetroPad controls to the phone keypad
+- **Desktop PCM audio** — plays supported WAV clips through the host audio device
 
 ### Planned (Roadmap)
 
-- **MiniJ VM interpreter** — execute the bytecode inside `.mrp` packages
-- **`mrc_` API bridge** — the phone services applications call: display,
-  input, files, timers, and the rest of the platform surface
-- **ext (native ARM library) execution** — an open strategy decision; see
-  [Architecture](docs/architecture.md)
-- **Audio output**
+- **Platform service coverage and game compatibility**
+- **Additional audio formats and libretro audio output**
 - **Save states**
 - **Network services** — the platform's online features
 - **EmulatorJS browser core** — the WebAssembly build of the libretro core
@@ -70,13 +66,13 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
 cargo run --release -p mrpemu -- path/to/app.mrp
 ```
 
+Use `--system-dir path/to/device-files` to load optional Mythroad plugins
+and fonts. For RetroArch, use its configured System/BIOS directory.
+
 See the [Standalone Emulator](docs/Standalone-Emulator.md) guide for the
 command-line options and key mappings.
 
 ### RetroArch Mode
-
-The libretro core can be built and loaded today; it reports video but cannot
-run applications yet.
 
 See the [RetroArch Core](docs/RetroArch-Core.md) guide for installation and
 the current feature set.
@@ -90,9 +86,9 @@ Planned: the same libretro core compiled to WebAssembly for
 ## Building
 
 Requires [Rust](https://www.rust-lang.org/tools/install) (stable); the
-workspace uses edition 2021. The default workspace members are `mrpemu-core`,
-`mrpemu` and `mrpemu-libretro`, so a plain `cargo build` at the repository root
-builds all three.
+workspace uses edition 2021. Use `cargo build --workspace` to build both
+frontends and the shared core. A plain `cargo build` builds the libretro core
+and its dependencies.
 
 ### Standalone Mode
 
@@ -139,14 +135,12 @@ crates/
 └── mrpemu-libretro/     # Libretro core (cdylib: mrpemu_libretro.{dll,so,dylib})
 ```
 
-- **`mrpemu-core`** — package parsing, the RGB565 framebuffer, the keypad
-  input model and the in-memory VFS; the MiniJ interpreter and the `mrc_`
-  service bridge will live here too. The core depends on no windowing system
-  and no frontend.
+- **`mrpemu-core`** — package parsing, MiniJ and ARM/Thumb execution, the
+  `mrc_` service bridge, the framebuffer, the keypad, and guest storage.
 - **`mrpemu`** — the standalone desktop frontend: command line, window loop,
   keyboard input.
-- **`mrpemu-libretro`** — the libretro core shell: content loading and video
-  reporting for RetroArch and other libretro frontends.
+- **`mrpemu-libretro`** — content loading, video, and input for RetroArch
+  and other libretro frontends.
 
 See [Architecture](docs/architecture.md) for the platform background, the
 layered design, and the current implementation status.
@@ -163,14 +157,13 @@ frontend currently binds:
 | OK / confirm | Enter |
 | Left soft key | Z |
 | Right soft key | X |
+| Digits | 0–9 |
 | Exit | Escape |
 
-RetroArch input mapping is not implemented yet; see the
-[RetroArch Core](docs/RetroArch-Core.md) guide for the current state.
+See the [RetroArch Core](docs/RetroArch-Core.md) guide for the RetroPad mapping.
 
 ## Game Compatibility
 
-MrpEmu cannot execute applications yet, so no application has been verified.
 See [Game Compatibility](docs/Game-Compatibility.md) for the verification
 criteria and the compatibility table template.
 
@@ -201,7 +194,7 @@ separately.
 ## Contributing
 
 Contributions are welcome! Whether you're interested in format research, the
-MiniJ VM, the service bridge, documentation, or (once applications run)
+MiniJ VM, the service bridge, documentation, or
 compatibility testing, we'd love your help. See
 [CONTRIBUTING.md](docs/CONTRIBUTING.md) for details.
 

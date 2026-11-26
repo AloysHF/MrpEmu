@@ -2,16 +2,17 @@
 //! each package headlessly, and classifies the outcome. Ignored by default
 //! (`-- --ignored`) because it needs the local corpus; CI runs it nightly.
 
-use mrpemu_core::emulator::MrpMachine;
+use mrpemu_core::emulator::{MrpMachine, FRAME_RATE};
 use mrpemu_core::MrpKey;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// How many packages one survey pass samples.
 const SAMPLE_SIZE: usize = 200;
 /// Override the corpus root to test only the hot games.
 const HOT_GAMES_ROOT: &str = "../../tmp/mrp_game/热门游戏";
-/// Frames per package (plus one Ok press mid-run).
+/// Frames per package with a sequence of confirm and soft-key presses.
 const FRAMES_PER_SAMPLE: u32 = 200;
 
 fn collect_mrps(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -34,30 +35,31 @@ fn collect_mrps(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Detects the screen resolution from the corpus directory name.
-fn detect_resolution(path: &std::path::Path) -> (u16, u16) {
-    let text = path.to_string_lossy();
-    if text.contains("240x400") || text.contains("240×400") {
-        (240, 400)
-    } else if text.contains("320x480") || text.contains("320×480") {
-        (320, 480)
+fn frame_coverage(pixels: &[u16], width: usize) -> u8 {
+    if pixels.iter().all(|&pixel| pixel == pixels[0]) {
+        return 0;
+    }
+    let nonzero = pixels.iter().filter(|&&pixel| pixel != 0).count();
+    let rows = pixels
+        .chunks_exact(width)
+        .filter(|row| row.iter().any(|&pixel| pixel != 0))
+        .count();
+    let height = pixels.len() / width;
+    if nonzero * 200 >= pixels.len() && rows * 8 >= height {
+        2
     } else {
-        (240, 320)
+        1
     }
 }
 
-fn classify(machine: &MrpMachine, pixels_nonzero: usize, total: usize) -> &'static str {
-    if machine.boot_error().is_some() {
-        return "boot-failed";
-    }
-    let ratio = pixels_nonzero as f64 / total.max(1) as f64;
-    if pixels_nonzero == 0 {
-        "blank"
-    } else if ratio < 0.005 {
-        "sparse"
-    } else {
-        "content"
-    }
+#[test]
+fn pixel_strip_does_not_count_as_substantial_video() {
+    let mut pixels = vec![0; 240 * 400];
+    assert_eq!(frame_coverage(&pixels, 240), 0);
+    pixels[..240 * 4].fill(0xffff);
+    assert_eq!(frame_coverage(&pixels, 240), 1);
+    pixels[..240 * 100].fill(0xffff);
+    assert_eq!(frame_coverage(&pixels, 240), 2);
 }
 
 /// Samples the corpus and prints one classification line per package plus a
@@ -68,7 +70,7 @@ fn corpus_smoke_sample() {
     let _ = env_logger::try_init();
     // Total instruction budget per package (script + guest): a stuck loop
     // exhausts this and classifies fast instead of burning minutes.
-    mrpemu_core::cfunction::set_instruction_budget(100_000_000);
+    mrpemu_core::cfunction::set_instruction_budget(512_000_000);
     // CORPUS_HOT=1 restricts to the 热门游戏 directory.
     let (_root, all) = if std::env::var("CORPUS_HOT").is_ok() {
         let root = std::path::Path::new(HOT_GAMES_ROOT);
@@ -85,6 +87,7 @@ fn corpus_smoke_sample() {
     };
 
     // Deterministic LCG scatter-sample.
+    assert!(!all.is_empty(), "no packages found in {}", _root.display());
     let sample_count = if std::env::var("CORPUS_HOT").is_ok() {
         all.len()
     } else {
@@ -103,6 +106,8 @@ fn corpus_smoke_sample() {
     let mut miss_tally: BTreeMap<String, usize> = BTreeMap::new();
     let mut res_tally: BTreeMap<String, BTreeMap<&'static str, usize>> = BTreeMap::new();
     let only = std::env::var("CORPUS_ONLY").ok();
+    let mut tested = 0;
+    let system_dir = std::env::var_os("CORPUS_SYSTEM_DIR").map(std::path::PathBuf::from);
     for path in &picks {
         let name = path
             .file_name()
@@ -114,24 +119,29 @@ fn corpus_smoke_sample() {
                 continue;
             }
         }
-        let (res_w, res_h) = detect_resolution(path);
-        let res_key = format!("{res_w}x{res_h}");
-        let (outcome, misses) = std::panic::catch_unwind(|| -> (&'static str, Vec<String>) {
+        tested += 1;
+        let (outcome, misses, res_key) = std::panic::catch_unwind(|| {
             mrpemu_core::cfunction::reset_instruction_counter();
             let Ok(mut machine) = MrpMachine::from_path(path) else {
-                return ("load-failed", Vec::new());
+                return ("load-failed", Vec::new(), String::new());
             };
-            machine.set_resolution(res_w, res_h);
+            if let Some(directory) = &system_dir {
+                for &name in mrpemu_core::vfs::DEVICE_FILES {
+                    if let Ok(data) = std::fs::read(directory.join(name)) {
+                        machine.vfs_mut().write(name, data);
+                    }
+                }
+            }
+            let res_key = format!("{}x{}", machine.screen().width(), machine.screen().height());
+            let mut best_coverage = 0;
             for frame in 0..FRAMES_PER_SAMPLE {
-                machine.run_frame();
-                // richer input: dismiss splash, navigate menus, confirm
                 for (press_frame, key) in [
-                    (40u32, MrpKey::Ok),
-                    (44, MrpKey::Ok),
-                    (80, MrpKey::Ok),
-                    (84, MrpKey::Ok),
-                    (120, MrpKey::Ok),
-                    (124, MrpKey::Ok),
+                    (30u32, MrpKey::LeftSoft),
+                    (50, MrpKey::Ok),
+                    (85, MrpKey::LeftSoft),
+                    (105, MrpKey::Ok),
+                    (140, MrpKey::LeftSoft),
+                    (160, MrpKey::Ok),
                 ] {
                     if frame == press_frame {
                         machine.input_mut().press(key);
@@ -140,19 +150,33 @@ fn corpus_smoke_sample() {
                         machine.input_mut().release(key);
                     }
                 }
+                machine.run_frame_at(Duration::from_secs_f64(f64::from(frame) / FRAME_RATE));
+                if machine.boot_error().is_some() {
+                    break;
+                }
+                if best_coverage < 2 {
+                    let screen = machine.screen();
+                    best_coverage = best_coverage
+                        .max(frame_coverage(screen.pixels(), usize::from(screen.width())));
+                }
             }
-            let screen = machine.screen();
-            let nonzero = screen.pixels().iter().filter(|&&p| p != 0).count();
-            let total = screen.pixels().len();
-            let outcome = classify(&machine, nonzero, total);
+            let outcome = match best_coverage {
+                _ if machine.boot_error().is_some() => "boot-failed",
+                0 => "blank",
+                1 => "sparse",
+                _ => "content",
+            };
             let misses = if matches!(outcome, "blank" | "boot-failed") {
                 machine.missing_globals()
             } else {
                 Vec::new()
             };
-            (outcome, misses)
+            if let Some(error) = machine.boot_error() {
+                eprintln!("{name}: {error}");
+            }
+            (outcome, misses, res_key)
         })
-        .unwrap_or(("crash", Vec::new()));
+        .unwrap_or(("crash", Vec::new(), String::new()));
         for miss in &misses {
             *miss_tally.entry(format!("global:{miss}")).or_default() += 1;
         }
@@ -167,7 +191,7 @@ fn corpus_smoke_sample() {
 
     eprintln!(
         "=== corpus smoke summary ({} of {} sampled) ===",
-        picks.len(),
+        tested,
         all.len()
     );
     for (outcome, names) in &tally {
@@ -185,5 +209,17 @@ fn corpus_smoke_sample() {
         for (name, count) in sorted.iter().take(15) {
             eprintln!("  {name}: {count}");
         }
+    }
+    assert!(tested > 0, "no packages matched CORPUS_ONLY");
+    if std::env::var_os("CORPUS_REQUIRE_VIDEO").is_some() {
+        let failures: Vec<_> = tally
+            .iter()
+            .filter(|(outcome, _)| **outcome != "content")
+            .flat_map(|(_, names)| names)
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "packages without a substantial frame: {failures:?}"
+        );
     }
 }

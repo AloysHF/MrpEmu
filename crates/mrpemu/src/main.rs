@@ -1,15 +1,16 @@
 //! MrpEmu standalone desktop frontend.
 //!
 //! Loads a `.mrp` application package and displays the emulated phone
-//! screen in a minifb window. The mythroad VM is not implemented yet, so the
-//! window shows the placeholder frame produced by the core.
+//! screen in a minifb window.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use minifb::{Key, Window, WindowOptions};
+use std::time::Duration;
 
 mod audio;
 
+use mrpemu_core::emulator::FRAME_RATE;
 use mrpemu_core::{MrpKey, MrpMachine};
 
 /// MrpEmu — Sky-mobi mythroad (MRP) feature-phone application emulator.
@@ -19,9 +20,13 @@ struct Args {
     /// Path to the `.mrp` application package to run.
     mrp_path: std::path::PathBuf,
 
-    /// Integer scale factor applied to the 240x320 screen.
+    /// Integer scale factor applied to the phone screen.
     #[arg(long, default_value_t = 2)]
     scale: u32,
+
+    /// Directory with optional Mythroad system files and plugins.
+    #[arg(long)]
+    system_dir: Option<std::path::PathBuf>,
 }
 
 /// Host keys mapped to feature-phone keys.
@@ -33,6 +38,16 @@ const KEY_MAP: &[(Key, MrpKey)] = &[
     (Key::Enter, MrpKey::Ok),
     (Key::Z, MrpKey::LeftSoft),
     (Key::X, MrpKey::RightSoft),
+    (Key::Key0, MrpKey::Num0),
+    (Key::Key1, MrpKey::Num1),
+    (Key::Key2, MrpKey::Num2),
+    (Key::Key3, MrpKey::Num3),
+    (Key::Key4, MrpKey::Num4),
+    (Key::Key5, MrpKey::Num5),
+    (Key::Key6, MrpKey::Num6),
+    (Key::Key7, MrpKey::Num7),
+    (Key::Key8, MrpKey::Num8),
+    (Key::Key9, MrpKey::Num9),
 ];
 
 /// Expands an RGB565 pixel to the 0RGB u32 format minifb expects.
@@ -52,6 +67,17 @@ fn main() -> Result<()> {
 
     let mut machine = MrpMachine::from_path(&args.mrp_path)
         .with_context(|| format!("failed to load {}", args.mrp_path.display()))?;
+    if let Some(directory) = args
+        .system_dir
+        .as_deref()
+        .or_else(|| args.mrp_path.parent())
+    {
+        for &name in mrpemu_core::vfs::DEVICE_FILES {
+            if let Ok(data) = std::fs::read(directory.join(name)) {
+                machine.vfs_mut().write(name, data);
+            }
+        }
+    }
     log::info!(
         "loaded {:?} (internal name {:?}, app id {})",
         machine.header().display_name,
@@ -76,7 +102,10 @@ fn main() -> Result<()> {
         WindowOptions::default(),
     )
     .context("failed to open window")?;
-    window.set_target_fps(60);
+    window.set_target_fps(FRAME_RATE as usize);
+    let mut buffer = vec![0; width * height];
+    let frame_duration = Duration::from_secs_f64(1.0 / FRAME_RATE);
+    let mut elapsed = Duration::ZERO;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let held = window.get_keys();
@@ -88,14 +117,15 @@ fn main() -> Result<()> {
             }
         }
 
-        machine.run_frame();
+        machine.run_frame_at(elapsed);
+        elapsed += frame_duration;
+        if let Some(error) = machine.boot_error() {
+            anyhow::bail!("failed to start {}: {error}", args.mrp_path.display());
+        }
 
-        let buffer: Vec<u32> = machine
-            .screen()
-            .pixels()
-            .iter()
-            .map(|&pixel| rgb565_to_0rgb(pixel))
-            .collect();
+        for (output, &pixel) in buffer.iter_mut().zip(machine.screen().pixels()) {
+            *output = rgb565_to_0rgb(pixel);
+        }
         window
             .update_with_buffer(&buffer, width, height)
             .context("failed to present frame")?;

@@ -129,6 +129,7 @@ impl ScriptBridge {
     /// resolution flows in so the SDK runtime sees the real screen size).
     pub fn create_guest_with(&mut self, config: crate::cfunction::GuestConfig) {
         if self.vm.guest.is_none() {
+            self.vm.screen = crate::display::Screen::new(config.screen_width, config.screen_height);
             let files = self.pending_files.take().unwrap_or_default();
             self.vm.guest = Some(crate::cfunction::Guest::new(config, files));
         }
@@ -1854,12 +1855,7 @@ impl ScriptBridge {
     /// Presents the guest framebuffer into the bridge screen.
     pub fn present(&mut self) {
         if let Some(guest) = self.vm.guest.as_mut() {
-            let width = guest.screen_width();
-            let height = guest.screen_height();
-            if self.vm.screen.width() != width || self.vm.screen.height() != height {
-                self.vm.screen = crate::display::Screen::new(width, height);
-            }
-            guest.refresh_screen(&mut self.vm.screen);
+            guest.present_frame(&mut self.vm.screen);
         }
     }
 }
@@ -2166,7 +2162,7 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
             let input1 = args.get(1).and_then(vh::as_num).unwrap_or(0.0) as i32;
             if input1 == 2913 {
                 if let Some(guest) = vm.guest.as_mut() {
-                    guest.bi |= 0x1;
+                    guest.update_flags(0x1, 0);
                 }
             }
             Ok(vec![vh::num_value(0.0)])
@@ -2235,44 +2231,17 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
                 .and_then(vh::as_num)
                 .map(|value| value as i32)
                 .unwrap_or(0);
-            let payload = match args.get(1) {
-                Some(Value::Str(text)) => text.as_ref().clone(),
-                Some(Value::Num(number)) => number.to_le_bytes().to_vec(),
-                _ => Vec::new(),
-            };
-            let Some(guest) = vm.guest.as_mut() else {
-                return Ok(vec![vh::num_value(-1.0)]);
-            };
-            let scratch = guest.scratch_buffer(&payload);
-            let mut screen = std::mem::replace(
-                &mut vm.screen,
-                crate::display::Screen::new(
-                    crate::display::DEFAULT_WIDTH,
-                    crate::display::DEFAULT_HEIGHT,
-                ),
-            );
-            let result = guest.call_c_function_full(
-                code,
-                scratch,
-                payload.len() as i32,
-                crate::cfunction::DEFAULT_INSTRUCTION_LIMIT,
-                &mut screen,
-            );
-            vm.screen = screen;
-            match result {
-                // The platform convention returns (output, ret): the handler
-                // writes an output pointer/length through the trailing stack
-                // slots; expose those bytes to the script.
-                Ok((value, (output_ptr, output_len))) => {
-                    let output = if output_ptr != 0 && output_len > 0 {
-                        guest
-                            .guest_bytes(output_ptr, output_len as usize)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(vec![vh::str_value(&output), vh::num_value(value as f32)])
+            let number;
+            let bytes = match args.get(1) {
+                Some(Value::Str(text)) => text.as_slice(),
+                Some(Value::Num(value)) => {
+                    number = value.to_le_bytes();
+                    &number
                 }
+                _ => &[],
+            };
+            match call_native_buffer(vm, code, NativeInput::Bytes(bytes)) {
+                Ok(output) => Ok(output),
                 Err(error) => {
                     log::error!("_com(801) failed: {error}");
                     Ok(vec![vh::num_value(-1.0)])
@@ -2292,34 +2261,35 @@ fn com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
 /// registered handler with (code, payload bytes).
 fn str_com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
     let input0 = args.first().and_then(vh::as_num).unwrap_or(0.0) as i32;
+    let code = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as i32;
+    if input0 == 801 {
+        let input = match args.get(1) {
+            Some(Value::Str(text)) => NativeInput::Bytes(text),
+            Some(Value::Table(pair)) => {
+                let (pointer, length) = buffer_cells(&pair.borrow());
+                NativeInput::Guest(pointer, length)
+            }
+            _ => NativeInput::Bytes(&[]),
+        };
+        return match call_native_buffer(vm, code, input) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                log::error!("_strCom(801) failed: {error}");
+                Ok(vec![vh::str_value(b""), vh::num_value(-1.0)])
+            }
+        };
+    }
     let payload: Vec<u8> = match args.get(1) {
         Some(Value::Str(text)) => text.as_ref().clone(),
         Some(Value::Table(pair)) => {
-            let cells: Vec<f32> = {
-                let table = pair.borrow();
-                table.array.iter().filter_map(Value::as_num).collect()
-            };
-            let (ptr, len) = (
-                cells.first().copied().unwrap_or(0.0) as u32,
-                cells.get(1).copied().unwrap_or(0.0) as u32,
-            );
-            let len = len.min(16 * 1024 * 1024);
-            match vm.guest.as_ref() {
-                Some(guest) => {
-                    let mut bytes = Vec::with_capacity(len as usize);
-                    for index in 0..len {
-                        let addr = ptr.wrapping_add(index);
-                        let word = guest.r32(addr & !3);
-                        bytes.push((word >> ((addr & 3) * 8)) as u8);
-                    }
-                    bytes
-                }
-                None => Vec::new(),
-            }
+            let (pointer, length) = buffer_cells(&pair.borrow());
+            vm.guest
+                .as_ref()
+                .and_then(|guest| guest.guest_bytes(pointer, length as usize))
+                .unwrap_or_default()
         }
         _ => Vec::new(),
     };
-    let code = args.get(2).and_then(vh::as_num).unwrap_or(0.0) as i32;
     match input0 {
         // Read a file from the running package (gzip-transparent).
         601 => {
@@ -2359,48 +2329,66 @@ fn str_com_native(vm: &mut Vm, args: &[Value]) -> Result<Vec<Value>, String> {
                 }
             }
         }
-        801 => {
-            let Some(guest) = vm.guest.as_mut() else {
-                return Ok(vec![vh::num_value(-1.0)]);
-            };
-            let scratch = guest.scratch_buffer(&payload);
-            let mut screen = std::mem::replace(
-                &mut vm.screen,
-                crate::display::Screen::new(
-                    crate::display::DEFAULT_WIDTH,
-                    crate::display::DEFAULT_HEIGHT,
-                ),
-            );
-            let result = guest.call_c_function_full(
-                code,
-                scratch,
-                payload.len() as i32,
-                crate::cfunction::DEFAULT_INSTRUCTION_LIMIT,
-                &mut screen,
-            );
-            vm.screen = screen;
-            match result {
-                Ok((value, (output_ptr, output_len))) => {
-                    let output = if output_ptr != 0 && output_len > 0 {
-                        guest
-                            .guest_bytes(output_ptr, output_len as usize)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(vec![vh::str_value(&output), vh::num_value(value as f32)])
-                }
-                Err(error) => {
-                    log::error!("_strCom(801) failed: {error}");
-                    Ok(vec![vh::str_value(b""), vh::num_value(-1.0)])
-                }
-            }
-        }
         other => {
             log::warn!("_strCom got unknown input0 {other:#x}");
             Ok(vec![vh::num_value(-1.0)])
         }
     }
+}
+
+enum NativeInput<'a> {
+    Bytes(&'a [u8]),
+    Guest(u32, u32),
+}
+
+fn call_native_buffer(
+    vm: &mut Vm,
+    code: i32,
+    input: NativeInput<'_>,
+) -> Result<Vec<Value>, String> {
+    let guest = vm.guest.as_mut().ok_or("no guest")?;
+    let (pointer, length, allocation) = match input {
+        NativeInput::Bytes(bytes) => {
+            let length = i32::try_from(bytes.len()).map_err(|error| error.to_string())?;
+            let allocation = length as u32 + 1;
+            let pointer = guest.heap_malloc(allocation);
+            if pointer == 0 {
+                return Err("native input allocation failed".to_string());
+            }
+            let start = pointer as usize;
+            guest.mem[start..start + bytes.len()].copy_from_slice(bytes);
+            guest.w8(pointer + length as u32, 0);
+            (pointer, length, allocation)
+        }
+        NativeInput::Guest(pointer, length) => {
+            if pointer as usize > guest.mem.len()
+                || length as usize > guest.mem.len() - pointer as usize
+            {
+                return Err("native input points outside guest memory".to_string());
+            }
+            (pointer, length as i32, 0)
+        }
+    };
+    let instruction_limit = match code {
+        0 | 6 | 8 => crate::cfunction::BOOT_INSTRUCTION_LIMIT,
+        _ => crate::cfunction::DEFAULT_INSTRUCTION_LIMIT,
+    };
+    let result = guest
+        .call_c_function_full(code, pointer, length, instruction_limit, &mut vm.screen)
+        .map(|(status, (output, length))| {
+            let bytes = if output == 0 {
+                Vec::new()
+            } else {
+                guest
+                    .guest_bytes(output, length as usize)
+                    .unwrap_or_default()
+            };
+            vec![vh::str_value(&bytes), vh::num_value(status as f32)]
+        });
+    if allocation != 0 {
+        guest.heap_free(pointer, allocation);
+    }
+    result.map_err(|error| error.to_string())
 }
 
 /// Builds the `{pointer, size}` table value that represents a guest-side
@@ -2506,5 +2494,33 @@ fn register_stub_group(vm: &mut Vm, names: &[&'static str]) {
                 Ok(vec![vh::num_value(0.0)])
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cfunction::{Guest, GuestConfig, EXT_BASE};
+
+    #[test]
+    fn native_script_calls_pass_the_whole_payload() {
+        let mut vm = Vm::new();
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        // Return the last byte of the native input buffer.
+        guest.w32(EXT_BASE, 0xe2433001); // sub r3, r3, #1
+        guest.w32(EXT_BASE + 4, 0xe7d20003); // ldrb r0, [r2, r3]
+        guest.w32(EXT_BASE + 8, 0xe12fff1e); // bx lr
+        guest.c_function = EXT_BASE;
+        let mut data = vec![0; 6000];
+        data[5999] = 0x5a;
+        let pointer = guest.heap_malloc(data.len() as u32);
+        guest.mem[pointer as usize..pointer as usize + data.len()].copy_from_slice(&data);
+        vm.guest = Some(guest);
+
+        let command = vh::num_value(801.0);
+        let result = com_native(&mut vm, &[command.clone(), vh::str_value(&data)]).unwrap();
+        assert_eq!(result.get(1).and_then(vh::as_num), Some(90.0));
+        let result = str_com_native(&mut vm, &[command, buffer_value(pointer, 6000)]).unwrap();
+        assert_eq!(result.get(1).and_then(vh::as_num), Some(90.0));
     }
 }

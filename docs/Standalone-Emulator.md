@@ -3,11 +3,9 @@
 This guide covers building and running the standalone `mrpemu` desktop
 frontend, its command-line options, and the key mappings.
 
-> **Status: early scaffold.** The frontend parses the `.mrp` package header
-> and opens a window showing the core's RGB565 framebuffer. Guest applications
-> do not execute yet — see
-> [Architecture](architecture.md#current-implementation-status) for what is
-> and is not implemented.
+> **Status: experimental.** The frontend runs MRP applications and displays
+> their RGB565 frames. See [Application Compatibility](Game-Compatibility.md)
+> for the verification criteria.
 
 ## Supported Platforms
 
@@ -42,23 +40,38 @@ mrpemu [OPTIONS] <MRP_PATH>
 | Option | Value | Description |
 |---|---|---|
 | `<MRP_PATH>` | path | *required* — path to the `.mrp` application package. |
-| `--scale <SCALE>` | integer | Integer window scale factor applied to the 240×320 framebuffer. |
+| `--scale <SCALE>` | integer | Integer window scale factor applied to the detected framebuffer size. Defaults to 2. |
+| `--system-dir <DIR>` | path | Root directory for optional Mythroad device files. Defaults to the package's parent directory. |
 
-More options (scaling filters, key remapping, headless mode) will appear as
-the frontend grows; see the
-[implementation status](architecture.md#current-implementation-status).
+The screen defaults to 240×320. A file or parent folder labeled `240x400`
+or `320x480` selects that size. Labels can also use the multiplication sign
+`×`.
 
 ## Loading Applications
 
 ```bash
-# Load an application (240×320 window)
-mrpemu path/to/app.mrp
+# Load an application at its original screen size
+mrpemu path/to/app.mrp --scale 1
 
 # Open a 2x window (480×640)
 mrpemu path/to/app.mrp --scale 2
 
 # Or straight from a source checkout
 cargo run --release -p mrpemu -- path/to/app.mrp
+```
+
+### Optional device files
+
+Some packages expect a platform plugin, such as the Flash player. Place
+your device files under `--system-dir` with this layout. Missing files
+are skipped and the emulator supplies fallback bitmap fonts.
+
+```text
+plugins/flaengine.mrp
+plugins/netpay.mrp
+system/gb12.uc2
+system/gb12_uc2.adl
+system/gb16.uc2
 ```
 
 ## Key Mappings
@@ -72,15 +85,11 @@ keys, and the number keys. The desktop frontend currently binds:
 | OK / confirm | Enter |
 | Left soft key | Z |
 | Right soft key | X |
+| Digits | 0–9 |
 | Exit | Escape |
 
 The RetroArch core uses its own input path; see the
 [RetroArch Core](RetroArch-Core.md) guide.
 
-## What the window shows today
-
-- The package header is parsed and the 240×320 RGB565 framebuffer is displayed
-  at the chosen scale.
-- Because the MiniJ VM is not implemented yet, the framebuffer does not show
-  application output, and key presses are recorded by the core's keypad model
-  without a guest to receive them.
+The window displays the emulated framebuffer at the chosen scale. If all boot
+paths fail, the desktop process reports a startup error for the package.

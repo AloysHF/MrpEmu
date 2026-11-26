@@ -19,6 +19,7 @@
 //! emulation.
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -88,15 +89,25 @@ pub const LG_MEM_LEN: u32 = HEAP_LEN;
 /// init asks for a 4 MB large-memory pool in one block.
 pub const HEAP_BASE: u32 = 0x0028_2000;
 pub const HEAP_LEN: u32 = 8 * 1024 * 1024;
-/// The guest-visible screen buffer, RGB565 — above the heap (the reference
-/// runtime allocates it from the SDK's own pool; a dedicated region keeps
-/// guest allocations from colliding with presented frames).
+/// The platform-owned RGB565 buffer sits above the SDK heap.
 pub const SCREENBUF: u32 = HEAP_BASE + HEAP_LEN;
 pub const SCREENBUF_SIZE: u32 = 240 * 320 * 2;
 /// The guest stack grows down from here (the real firmware's stack region
 /// 0x180000-0x280000, sitting between the ext code area and the tables).
 pub const STACK_TOP: u32 = 0x0028_0000;
-pub const MEM_SIZE: u32 = SCREENBUF + 512 * 1024;
+pub const MEM_SIZE: u32 = EVENT_RECORD + 0x1000;
+const BITMAP_TABLE: u32 = SCREENBUF + 320 * 480 * 4;
+const SCREEN_BITMAP: u32 = BITMAP_TABLE + 30 * 16;
+const TILE_TABLE: u32 = SCREEN_BITMAP + 16;
+const MAP_TABLE: u32 = TILE_TABLE + 3 * 20;
+const SOUND_TABLE: u32 = MAP_TABLE + 3 * 4;
+const SPRITE_TABLE: u32 = SOUND_TABLE + 5 * 12;
+const FONT_METRICS: u32 = SPRITE_TABLE + 10 * 2;
+const STORAGE_PATH_BUFFER: u32 = FONT_METRICS + 4;
+const EVENT_RECORD: u32 = STORAGE_PATH_BUFFER + 1024;
+const EXTENDED_RAM_BASE: u32 = MEM_SIZE.next_multiple_of(0x1000);
+const EXTENDED_RAM_END: u32 = EXTENDED_RAM_BASE + 12 * 1024 * 1024;
+const DEFAULT_STORAGE_ROOT: &str = "c:/mythroad/";
 
 /// Largest single allocation accepted from the heap.
 const HEAP_MAX_ALLOC: u32 = HEAP_LEN - 16;
@@ -105,7 +116,11 @@ const HEAP_MAX_ALLOC: u32 = HEAP_LEN - 16;
 const HEAP_MIN_PIECE: u32 = 8;
 /// Cap on guest instructions per host call, so runaway ext code surfaces as
 /// an error instead of a hang.
-pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 20_000_000;
+pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 32_000_000;
+// Startup can unpack a whole archive and probe the guest's memory in one call.
+pub(crate) const BOOT_INSTRUCTION_LIMIT: u64 = 128_000_000;
+const CLOCK_POLL_INSTRUCTIONS_PER_MS: u64 = 16_384;
+const MYTHROAD_MINI_VERSION: i32 = 2011;
 
 /// Cross-call instruction budget (0 = unlimited) shared by the MiniJ VM and
 /// the ARM guest engine. The corpus gate sets a finite value so a guest or
@@ -170,9 +185,11 @@ pub enum DataSlot {
     ExitCb,
     ExitCbData,
     Entry,
-    /// Shared scratch region backing the mr_bitmap/tile/map/sound/sprite
-    /// bookkeeping arrays (not modeled yet, but addressable).
-    BitmapArrays,
+    BitmapTable,
+    TileTable,
+    MapTable,
+    SoundTable,
+    SpriteTable,
 }
 
 /// Classification of one `mr_func_tab` slot.
@@ -283,11 +300,11 @@ pub const SLOTS: [Slot; TABLE_SLOTS] = {
         Slot::Data(ScreenWidth),        // 92
         Slot::Data(ScreenHeight),       // 93
         Slot::Data(ScreenBit),          // 94
-        Slot::Data(BitmapArrays),       // 95 mr_bitmap array (placeholder region)
-        Slot::Data(BitmapArrays),       // 96 mr_tile array
-        Slot::Data(BitmapArrays),       // 97 mr_map
-        Slot::Data(BitmapArrays),       // 98 mr_sound
-        Slot::Data(BitmapArrays),       // 99 mr_sprite
+        Slot::Data(BitmapTable),        // 95 mr_bitmap
+        Slot::Data(TileTable),          // 96 mr_tile
+        Slot::Data(MapTable),           // 97 mr_map
+        Slot::Data(SoundTable),         // 98 mr_sound
+        Slot::Data(SpriteTable),        // 99 mr_sprite
         Slot::Data(PackFilename),       // 100
         Slot::Data(StartFilename),      // 101
         Slot::Data(OldPackFilename),    // 102
@@ -340,9 +357,6 @@ pub const SLOTS: [Slot; TABLE_SLOTS] = {
     ]
 };
 
-// The placeholder slots (mr_bitmap/tile/map/sound/sprite arrays) share one
-// scratch region via `DataSlot::BitmapArrays`.
-
 /// Guest platform configuration filled into the data slots at boot.
 #[derive(Debug, Clone)]
 pub struct GuestConfig {
@@ -384,27 +398,30 @@ pub struct Guest {
     pub mem: Vec<u8>,
     pub cpu: Cpu,
     config: GuestConfig,
+    uses_explicit_video: bool,
     started_at: Instant,
+    frame_time: Option<Duration>,
+    sleep_elapsed: Duration,
     rand_state: u32,
-    /// Heap free list: offset of the first free block relative to
-    /// `HEAP_BASE`, then `next`/`size` words inside each free block (the
-    /// reference allocator's layout).
-    heap_free_head: u32,
+    /// Free guest blocks as (offset, size) in guest free-list order.
+    heap_free_blocks: Vec<(u32, u32)>,
+    heap_extent: u32,
     heap_left: u32,
     heap_min: u32,
     heap_top: u32,
+    extended_allocations: BTreeMap<u32, u32>,
+    offline_sockets: u16,
     /// Guest address of the ext's registered event handler.
     pub c_function: u32,
     /// Guest address of the ext's `mr_c_function_st`.
     pub c_function_p: u32,
+    ext_load_base: u32,
     /// Guest addresses registered through `mr_testCom` (codes 2..6).
     pub event_function: u32,
     pub timer_function: u32,
     stop_function: u32,
     pause_app_function: u32,
     resume_app_function: u32,
-    /// Base flags word maintained by `mr_testCom` handshake codes.
-    pub bi: u32,
     pub timers: Vec<GuestTimer>,
     pub next_timer_id: i32,
     /// Total guest instructions executed across all calls; the corpus gate
@@ -433,12 +450,15 @@ pub struct Guest {
     /// Package/virtual-file contents readable through `mr_readFile`,
     /// `mr_open`, and friends: `(name, decompressed bytes)`.
     pub files: Vec<(String, Vec<u8>)>,
+    storage_root: String,
     pub exit_requested: bool,
     /// Diagnostics: how often each table slot was called.
     pub slot_calls: [u64; TABLE_SLOTS],
     /// Heap address of the single glyph export buffer (lazily allocated).
     glyph_buf: u32,
     dirty_files: std::collections::HashSet<String>,
+    directories: std::collections::HashSet<String>,
+    md5_contexts: std::collections::HashMap<u32, crate::md5::Md5>,
     /// Loaded bitmaps: id → RGB565 pixel data.
     pub bitmaps: std::collections::HashMap<u32, Bitmap>,
     /// Monotonically increasing handle for GUI controls (menu/dialog/text/edit/win).
@@ -478,11 +498,11 @@ pub struct Bitmap {
 
 #[derive(Debug, Clone)]
 pub struct OpenFile {
-    pub name: String,
-    pub data: Vec<u8>,
-    pub pos: usize,
-    /// `true` once the handle is closed (defensive reuse guard).
-    pub closed: bool,
+    file_index: usize,
+    pos: usize,
+    readable: bool,
+    writable: bool,
+    closed: bool,
 }
 
 impl Guest {
@@ -493,20 +513,26 @@ impl Guest {
             mem: vec![0; MEM_SIZE as usize],
             cpu: Cpu::new(),
             config,
+            uses_explicit_video: false,
             started_at: Instant::now(),
+            frame_time: None,
+            sleep_elapsed: Duration::ZERO,
             rand_state: 0x1234_5678,
-            heap_free_head: 0,
+            heap_free_blocks: vec![(0, HEAP_LEN)],
+            heap_extent: HEAP_LEN,
             heap_left: HEAP_LEN,
             heap_min: HEAP_LEN,
             heap_top: 0,
+            extended_allocations: BTreeMap::new(),
+            offline_sockets: 0,
             c_function: 0,
             c_function_p: 0,
+            ext_load_base: EXT_BASE,
             event_function: 0,
             timer_function: 0,
             stop_function: 0,
             pause_app_function: 0,
             resume_app_function: 0,
-            bi: 0,
             timers: Vec::new(),
             next_timer_id: 1,
             total_instructions: 0,
@@ -517,10 +543,13 @@ impl Guest {
             exec_watch_fired: false,
             open_files: Vec::new(),
             files,
+            storage_root: DEFAULT_STORAGE_ROOT.to_string(),
             exit_requested: false,
             slot_calls: [0; TABLE_SLOTS],
             glyph_buf: 0,
             dirty_files: std::collections::HashSet::new(),
+            directories: std::collections::HashSet::new(),
+            md5_contexts: std::collections::HashMap::new(),
             bitmaps: std::collections::HashMap::new(),
             next_gui_handle: 0,
             menu: None,
@@ -552,6 +581,14 @@ impl Guest {
         self.set_data(DataSlot::ScreenHeight, h);
         self.set_data(DataSlot::ScreenBit, 16);
         self.set_data(DataSlot::ScreenBufPtr, SCREENBUF);
+        self.w16(SCREEN_BITMAP, w as u16);
+        self.w16(SCREEN_BITMAP + 2, h as u16);
+        self.w32(SCREEN_BITMAP + 4, w * h * 2);
+        self.w32(SCREEN_BITMAP + 12, SCREENBUF);
+        for tile in 0..3 {
+            self.w16(TILE_TABLE + tile * 20 + 12, w as u16);
+            self.w16(TILE_TABLE + tile * 20 + 14, h as u16);
+        }
         self.set_data(DataSlot::LgMemBase, LG_MEM_BASE);
         self.set_data(DataSlot::LgMemLen, LG_MEM_LEN);
         self.set_data(DataSlot::LgMemEnd, LG_MEM_BASE + LG_MEM_LEN);
@@ -582,7 +619,6 @@ impl Guest {
         // VM/timer state and 7-11 for gz/SMS state, then 12-76 as function
         // pointers (SMS helpers, `mr_isMr`, and the Lua C API bridges).
         let table = INTERNAL_TABLE_BASE;
-        self.set_data(DataSlot::CInternalTable, table);
         let entry_count = 78u32;
         let state_base = table + entry_count * 4; // state cells after ptrs
                                                   // Zero the full table + state region (440 bytes).
@@ -675,9 +711,13 @@ impl Guest {
             LgMemMin => 16,
             LgMemTop => 17,
             LgMemFree => 18,
-            BitmapArrays => 19,
+            BitmapTable => return BITMAP_TABLE,
+            TileTable => return TILE_TABLE,
+            MapTable => return MAP_TABLE,
+            SoundTable => return SOUND_TABLE,
+            SpriteTable => return SPRITE_TABLE,
             SmsCfgBuf => 20,
-            CInternalTable => 21,
+            CInternalTable => return INTERNAL_TABLE_BASE,
             CPortTable => 22,
             StartFileParameter => 23,
             SmsReturnFlag => 24,
@@ -705,8 +745,7 @@ impl Guest {
         // Slot 146 exports a pointer to the free-list head struct
         // (`{next, len}`), mirroring the reference `&LG_mem_free`.
         let cell = self.data_slot_address(DataSlot::LgMemFree);
-        self.set_data(DataSlot::LgMemFree, cell);
-        self.w32(cell, self.heap_free_head);
+        self.w32(cell, self.heap_head());
     }
 
     fn get_data(&self, slot: DataSlot) -> u32 {
@@ -788,123 +827,197 @@ impl Guest {
 
     // -- Heap (first-fit free list, reference layout) ------------------------
 
-    pub fn heap_malloc(&mut self, requested: u32) -> u32 {
-        if requested == 0 || requested > HEAP_MAX_ALLOC {
-            return 0;
-        }
-        let len = requested.max(HEAP_MIN_PIECE).div_ceil(8) * 8;
-        if len > self.heap_left {
-            return 0;
-        }
-        // Walk the free list: head sentinel lives at HEAP_BASE in the sense
-        // that `heap_free_head` is the offset of the first free block, and
-        // each free block stores {next: u32, size: u32} at its start.
-        // Guest use-after-free or interior frees can corrupt the list into
-        // a cycle, so the walk is bounded and charged against the survey
-        // budget; a corrupt list fails the allocation.
-        let end = HEAP_LEN;
-        let mut prev_next: Option<u32> = None;
-        let mut cursor = self.heap_free_head;
-        let mut steps = 0u32;
-        while cursor < end {
-            steps += 1;
-            if steps > HEAP_LEN / HEAP_MIN_PIECE || charge_instruction() {
-                return 0;
-            }
-            let next = self.r32(HEAP_BASE + cursor);
-            let size = self.r32(HEAP_BASE + cursor + 4);
-            if size >= len {
-                let remaining = size - len;
-                let address = HEAP_BASE + cursor;
-                if remaining > HEAP_MIN_PIECE {
-                    // Split: the tail stays on the free list.
-                    let cut = cursor + len;
-                    self.w32(HEAP_BASE + cut, next);
-                    self.w32(HEAP_BASE + cut + 4, remaining);
-                    match prev_next {
-                        Some(previous) => {
-                            self.w32(HEAP_BASE + previous, cut);
-                        }
-                        None => self.heap_free_head = cut,
-                    }
-                } else {
-                    match prev_next {
-                        Some(previous) => {
-                            self.w32(HEAP_BASE + previous, next);
-                        }
-                        None => self.heap_free_head = next,
-                    }
-                }
-                self.heap_left = self.heap_left.saturating_sub(len);
-                self.heap_min = self.heap_min.min(self.heap_left);
-                self.heap_top = self.heap_top.max(self.heap_left);
-                self.sync_lg_slots();
-                if std::env::var("MRP_TRACE").is_ok() {
-                    eprintln!(
-                        "[malloc] {len} -> {address:#010x} (left {:#x})",
-                        self.heap_left
-                    );
-                }
-                return address;
-            }
-            prev_next = Some(cursor);
-            cursor = next;
-        }
-        0
+    fn heap_head(&self) -> u32 {
+        self.heap_free_blocks
+            .first()
+            .map_or(self.heap_extent, |&(offset, _)| offset)
     }
 
-    fn heap_free(&mut self, address: u32, requested: u32) {
-        if requested == 0 || !(HEAP_BASE..HEAP_BASE + HEAP_LEN).contains(&address) {
+    fn import_guest_heap(&mut self) -> bool {
+        let head = self.get_data(DataSlot::LgMemFree);
+        let left = self.get_data(DataSlot::LgMemLeft);
+        let top = self.get_data(DataSlot::LgMemTop);
+        let end = self.get_data(DataSlot::LgMemEnd);
+        if !(HEAP_BASE + HEAP_LEN..=BITMAP_TABLE).contains(&end) {
+            return false;
+        }
+        let extent = end - HEAP_BASE;
+        if extent == self.heap_extent
+            && head == self.heap_head()
+            && left == self.heap_left
+            && top == self.heap_top
+        {
+            return true;
+        }
+
+        // Native loaders temporarily splice their output block into this pool.
+        // Adopt only a structurally valid list after an exported state change.
+        let mut blocks = Vec::new();
+        let mut visited = HashSet::new();
+        let mut offset = head;
+        while offset != extent {
+            if !offset.is_multiple_of(4)
+                || offset > extent - HEAP_MIN_PIECE
+                || !visited.insert(offset)
+                || charge_instruction()
+            {
+                log::debug!("invalid guest heap link at offset {offset:#x} (head {head:#x})");
+                return false;
+            }
+            let next = self.r32(HEAP_BASE + offset);
+            let size = self.r32(HEAP_BASE + offset + 4);
+            if next > extent
+                || size < HEAP_MIN_PIECE
+                || !size.is_multiple_of(8)
+                || size > extent - offset
+            {
+                log::debug!("invalid guest heap node at {offset:#x}: size {size:#x}, next {next:#x} (head {head:#x})");
+                return false;
+            }
+            blocks.push((offset, size));
+            offset = next;
+        }
+        self.heap_free_blocks = blocks;
+        self.heap_extent = extent;
+        self.heap_left = left;
+        self.heap_min = self.get_data(DataSlot::LgMemMin);
+        self.heap_top = top;
+        true
+    }
+
+    pub fn heap_malloc(&mut self, requested: u32) -> u32 {
+        if requested == 0 || requested > HEAP_MAX_ALLOC || !self.import_guest_heap() {
+            return 0;
+        }
+        let len = requested.max(HEAP_MIN_PIECE).div_ceil(8) * 8;
+        if len >= self.heap_left {
+            return 0;
+        }
+        let mut block = None;
+        for (index, &(offset, size)) in self.heap_free_blocks.iter().enumerate() {
+            if charge_instruction() {
+                return 0;
+            }
+            if size >= len {
+                block = Some((index, offset, size));
+                break;
+            }
+        }
+        let Some((index, offset, size)) = block else {
+            return 0;
+        };
+        let cut = offset + len;
+        let next = if size > len {
+            self.heap_free_blocks[index] = (cut, size - len);
+            self.write_heap_node(index);
+            cut
+        } else {
+            self.heap_free_blocks.remove(index);
+            self.heap_free_blocks
+                .get(index)
+                .map_or(self.heap_extent, |&(start, _)| start)
+        };
+        if index > 0 {
+            self.write_heap_node(index - 1);
+        }
+        self.heap_left -= len;
+        self.heap_min = self.heap_min.min(self.heap_left);
+        self.heap_top = self.heap_top.max(next);
+        self.sync_lg_slots();
+        HEAP_BASE + offset
+    }
+
+    pub(crate) fn heap_free(&mut self, address: u32, requested: u32) {
+        if requested == 0
+            || requested > HEAP_LEN
+            || !address.is_multiple_of(4)
+            || !(HEAP_BASE..BITMAP_TABLE).contains(&address)
+        {
             return;
         }
         let len = requested.max(HEAP_MIN_PIECE).div_ceil(8) * 8;
-        if address + len > HEAP_BASE + HEAP_LEN {
+        if !self.import_guest_heap() || address + len > HEAP_BASE + self.heap_extent {
             return;
         }
-        let cursor = address - HEAP_BASE;
-        // Insert in address order and coalesce with both neighbours — the
-        // reference allocator's layout, which probing guests depend on when
-        // they walk the exported pool state.
-        let end = HEAP_LEN;
-        let mut prev: Option<u32> = None;
-        let mut node = self.heap_free_head;
-        let mut steps = 0u32;
-        while node < end && node < cursor {
-            steps += 1;
-            if steps > HEAP_LEN / HEAP_MIN_PIECE || charge_instruction() {
-                return; // corrupt list: refuse the free
-            }
-            prev = Some(node);
-            node = self.r32(HEAP_BASE + node);
+        let offset = address - HEAP_BASE;
+        if self
+            .heap_free_blocks
+            .iter()
+            .any(|&(start, size)| start < offset + len && offset < start + size)
+        {
+            return;
         }
-        // Merge with the next node when adjacent, then with the previous —
-        // both merges compose into one node (the reference allocator's
-        // my_free does the same two-step coalesce).
-        let mut merged_len = len;
-        let mut next_node = node;
-        if node < end && cursor + len == node {
-            merged_len += self.r32(HEAP_BASE + node + 4);
-            next_node = self.r32(HEAP_BASE + node);
+        let was_sorted = self.heap_free_blocks.is_sorted();
+        if !was_sorted {
+            self.heap_free_blocks.sort_unstable();
         }
-        let mut prev_merged = false;
-        if let Some(p) = prev {
-            let prev_size = self.r32(HEAP_BASE + p + 4);
-            if p + prev_size == cursor {
-                self.w32(HEAP_BASE + p, next_node);
-                self.w32(HEAP_BASE + p + 4, prev_size + merged_len);
-                prev_merged = true;
-            }
+        let mut index = self
+            .heap_free_blocks
+            .partition_point(|&(start, _)| start < offset);
+        let mut size = len;
+        if let Some(&(_, next_size)) = self
+            .heap_free_blocks
+            .get(index)
+            .filter(|(start, _)| *start == offset + len)
+        {
+            self.heap_free_blocks.remove(index);
+            size += next_size;
         }
-        if !prev_merged {
-            match prev {
-                Some(p) => self.w32(HEAP_BASE + p, cursor),
-                None => self.heap_free_head = cursor,
+        if index > 0 && {
+            let (previous, previous_size) = self.heap_free_blocks[index - 1];
+            previous + previous_size == offset
+        } {
+            index -= 1;
+            self.heap_free_blocks[index].1 += size;
+        } else {
+            self.heap_free_blocks.insert(index, (offset, size));
+        }
+        if was_sorted {
+            self.write_heap_node(index);
+            if index > 0 {
+                self.write_heap_node(index - 1);
             }
-            self.w32(HEAP_BASE + cursor, next_node);
-            self.w32(HEAP_BASE + cursor + 4, merged_len);
+        } else {
+            for index in 0..self.heap_free_blocks.len() {
+                self.write_heap_node(index);
+            }
         }
         self.heap_left = self.heap_left.saturating_add(len);
         self.sync_lg_slots();
+    }
+
+    fn write_heap_node(&mut self, index: usize) {
+        // Publish the SDK free-list view without trusting stores to freed memory.
+        let (offset, size) = self.heap_free_blocks[index];
+        let next = self
+            .heap_free_blocks
+            .get(index + 1)
+            .map_or(self.heap_extent, |&(start, _)| start);
+        self.w32(HEAP_BASE + offset, next);
+        self.w32(HEAP_BASE + offset + 4, size);
+    }
+
+    fn allocate_extended_ram(&mut self, size: u32) -> u32 {
+        if size > EXTENDED_RAM_END - EXTENDED_RAM_BASE {
+            return 0;
+        }
+        let size = size.next_multiple_of(8);
+        let mut address = EXTENDED_RAM_BASE;
+        for (&start, &allocated) in &self.extended_allocations {
+            if size <= start - address {
+                break;
+            }
+            address = start + allocated;
+        }
+        let end = address + size;
+        if end > EXTENDED_RAM_END {
+            return 0;
+        }
+        self.extended_allocations.insert(address, size);
+        if end as usize > self.mem.len() {
+            self.mem.resize(end as usize, 0);
+        }
+        address
     }
 
     // -- Guest execution -----------------------------------------------------
@@ -1044,8 +1157,21 @@ impl Guest {
         let bridge_end = BRIDGE_BASE + (TABLE_SLOTS as u32) * 4;
 
         let trace = std::env::var("MRP_TRACE").is_ok();
+        let guard_pcs: Vec<u32> = std::env::var("MRP_GUARD_PC")
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|part| u32::from_str_radix(part.trim(), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut ring: Vec<(u32, u32, u32)> = Vec::new();
         let mut prev_pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+        let mut last_bridge_slot = None;
+        let mut last_clock_poll = None;
+        let mut clock_polls = 0u32;
+        let mut clock_poll_instructions = 0u64;
         for executed in 0..limit {
             if trace {
                 let pc_now = self.cpu.reg_get(self.cpu.mode(), reg::PC);
@@ -1132,13 +1258,31 @@ impl Guest {
                     (self.cpu.reg_get(self.cpu.mode(), reg::CPSR) >> 29) & 1,
                 );
             }
+            // Generic probe guard (MRP_GUARD_PC=<hex>): dumps r0 and a
+            // stack window at one pc. Boot-path diagnostics use this to
+            // inspect a validation cell at the exact comparison site.
+            if trace && guard_pcs.contains(&pc) {
+                let sp = self.cpu.reg_get(self.cpu.mode(), reg::SP);
+                let mut line = format!(
+                    "[guard@{pc:08x}] r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x} sp={sp:#010x} stack:",
+                    self.cpu.reg_get(self.cpu.mode(), R0),
+                    self.cpu.reg_get(self.cpu.mode(), R1),
+                    self.cpu.reg_get(self.cpu.mode(), R2),
+                    self.cpu.reg_get(self.cpu.mode(), R3),
+                    self.cpu.reg_get(self.cpu.mode(), reg::LR),
+                );
+                for word in 0..24u32 {
+                    line += &format!(" {:x}", self.r32(sp + word * 4));
+                }
+                eprintln!("{line}");
+            }
             if pc == SEND_APP_EVENT_ADDR {
                 // The chunk's sendAppEvent callback: (ext, chunk, code,
                 // timer, param1-on-stack) — code 0 starts the platform timer
                 // with the stack argument as the interval, code 1 stops it.
                 let code = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
                 let interval = self.stack_arg(0) as i32;
-                if std::env::var("MRP_TRACE").is_ok() {
+                if trace {
                     eprintln!("[sendAppEvent] code={code} interval={interval}");
                 }
                 match code {
@@ -1148,7 +1292,7 @@ impl Guest {
                         self.timers.push(GuestTimer {
                             id: 0,
                             interval: Duration::from_millis(interval),
-                            next_fire: Instant::now() + Duration::from_millis(interval),
+                            next_fire: self.clock_now() + Duration::from_millis(interval),
                         });
                     }
                     1 => {
@@ -1181,7 +1325,24 @@ impl Guest {
                     )));
                 }
                 self.slot_calls[slot] += 1;
-                if std::env::var("MRP_TRACE").is_ok() {
+                if slot == 33 && self.frame_time.is_some() {
+                    // A guest waiting in a synchronous loop cannot receive a new frame.
+                    if let Some(previous) = last_clock_poll {
+                        if last_bridge_slot == Some(33) || clock_polls >= 32 {
+                            clock_poll_instructions += executed - previous;
+                            let milliseconds =
+                                clock_poll_instructions / CLOCK_POLL_INSTRUCTIONS_PER_MS;
+                            self.sleep_elapsed += Duration::from_millis(milliseconds);
+                            clock_poll_instructions %= CLOCK_POLL_INSTRUCTIONS_PER_MS;
+                        } else {
+                            clock_poll_instructions = 0;
+                        }
+                    }
+                    clock_polls += 1;
+                    last_clock_poll = Some(executed);
+                }
+                last_bridge_slot = Some(slot);
+                if trace {
                     eprintln!(
                         "[dispatch] slot={slot} r0={:#010x} r1={:#010x} r2={:#010x} r3={:#010x} lr={:#010x}",
                         self.cpu.reg_get(self.cpu.mode(), R0),
@@ -1214,13 +1375,13 @@ impl Guest {
             }
             // Thumb fetches are halfword aligned; ARM fetches word aligned.
             let thumb = self.cpu.thumb_mode();
-            if pc >= MEM_SIZE || if thumb { (pc & 1) != 0 } else { (pc & 3) != 0 } {
+            if pc as usize >= self.mem.len() || if thumb { (pc & 1) != 0 } else { (pc & 3) != 0 } {
                 return Err(MrpError::Unsupported(format!(
                     "guest PC out of range: {pc:#010x}"
                 )));
             }
-            if std::env::var("MRP_TRACE").is_ok() && executed < 80000 {
-                let inst = self.r32(pc);
+            let inst = self.r32(pc);
+            if trace && executed < 80000 {
                 eprintln!(
                     "[trace {executed}] pc={pc:#010x} inst={inst:#010x} r0={:#010x} lr={:#010x} sp={:#010x} mode={:?}",
                     self.cpu.reg_get(self.cpu.mode(), R0),
@@ -1236,7 +1397,6 @@ impl Guest {
             // ARM condition: the runtime guards optional hooks with
             // `cmp r0, #0; blxne r0`, so a failed condition must skip the
             // call instead of branching through a null pointer.
-            let inst = self.r32(pc);
             if !thumb && (inst & 0x0FFF_FFF0) == 0x012F_FF30 {
                 if self.arm_cond_passed(inst >> 28) {
                     let target = self.cpu.reg_get(self.cpu.mode(), (inst & 0xF) as reg::Reg);
@@ -1259,47 +1419,52 @@ impl Guest {
             }
             // ARMv5TE `LDRD`/`STRD` (double-word load/store): armv4t_emu's
             // halfword path debug-asserts on the encoding, which aborts the
-            // emulator in debug builds. Encoding:
-            // cond 000 P U I W L Rn Rd imm4H 1101 imm4L.
-            let inst = self.r32(pc);
-            if !thumb && (inst & 0x0E00_00F0) == 0x0000_00D0 {
-                let cond_ok = self.arm_cond_passed(inst >> 28);
-                if cond_ok {
-                    let pre_index = inst & 0x0200_0000 != 0; // P
+            // emulator in debug builds. L=1 belongs to signed loads.
+            if !thumb && (inst & 0x0E10_00D0) == 0x0000_00D0 {
+                if self.arm_cond_passed(inst >> 28) {
+                    let pre_index = inst & 0x0100_0000 != 0; // P
                     let up = inst & 0x0080_0000 != 0; // U
+                    let immediate = inst & 0x0040_0000 != 0; // I
                     let writeback = inst & 0x0020_0000 != 0; // W
-                    let load = inst & 0x0010_0000 != 0; // L
-                    let rn = (inst >> 16) & 0xF;
-                    let rd = (inst >> 12) & 0xF;
-                    let imm = (((inst >> 8) & 0xF) << 4) | (inst & 0xF);
-                    let offset = (imm * 4) as i32;
-                    let base = if rn == 15 {
+                    let load = inst & 0x20 == 0;
+                    let rn = ((inst >> 16) & 0xF) as reg::Reg;
+                    let rd = ((inst >> 12) & 0xF) as reg::Reg;
+                    if rd & 1 != 0 || rd >= reg::LR {
+                        return Err(MrpError::Unsupported(format!(
+                            "invalid ARM doubleword register pair at {pc:#010x}"
+                        )));
+                    }
+                    let offset = if immediate {
+                        ((inst >> 4) & 0xF0) | (inst & 0xF)
+                    } else {
+                        self.cpu.reg_get(self.cpu.mode(), (inst & 0xF) as reg::Reg)
+                    };
+                    let base = if rn == reg::PC {
                         pc.wrapping_add(8)
                     } else {
-                        self.cpu.reg_get(self.cpu.mode(), rn as reg::Reg)
+                        self.cpu.reg_get(self.cpu.mode(), rn)
                     };
                     let target = if up {
-                        base.wrapping_add(offset as u32)
+                        base.wrapping_add(offset)
                     } else {
-                        base.wrapping_sub(offset as u32)
+                        base.wrapping_sub(offset)
                     };
                     let addr = if pre_index { target } else { base };
                     let aligned = addr & !3;
-                    let rd_pair = rd & !1;
+                    let high_address = aligned.wrapping_add(4);
                     if load {
                         let low = self.r32(aligned);
-                        let high = self.r32(aligned + 4);
-                        self.cpu.reg_set(self.cpu.mode(), rd_pair as reg::Reg, low);
-                        self.cpu
-                            .reg_set(self.cpu.mode(), (rd_pair + 1) as reg::Reg, high);
+                        let high = self.r32(high_address);
+                        self.cpu.reg_set(self.cpu.mode(), rd, low);
+                        self.cpu.reg_set(self.cpu.mode(), rd + 1, high);
                     } else {
-                        let low = self.cpu.reg_get(self.cpu.mode(), rd_pair as reg::Reg);
-                        let high = self.cpu.reg_get(self.cpu.mode(), (rd_pair + 1) as reg::Reg);
+                        let low = self.cpu.reg_get(self.cpu.mode(), rd);
+                        let high = self.cpu.reg_get(self.cpu.mode(), rd + 1);
                         self.w32(aligned, low);
-                        self.w32(aligned + 4, high);
+                        self.w32(high_address, high);
                     }
-                    if (!pre_index || writeback) && rn != 15 {
-                        self.cpu.reg_set(self.cpu.mode(), rn as reg::Reg, target);
+                    if (!pre_index || writeback) && rn != reg::PC {
+                        self.cpu.reg_set(self.cpu.mode(), rn, target);
                     }
                 }
                 self.cpu
@@ -1311,7 +1476,6 @@ impl Guest {
             // `smlabb` for its index math (e.g. `col + row * width`), so the
             // loop decodes these itself. Encoding: bits27-20 select the
             // variant, bits7-4 = 1xy0/1xy1 pick the halfword operands.
-            let inst = self.r32(pc);
             let dsp_op = (inst >> 20) & 0xFF;
             let dsp_bits74 = (inst >> 4) & 0xF;
             let dsp_match = match dsp_op {
@@ -1335,7 +1499,6 @@ impl Guest {
             // decodes the interworking branch itself. BLX immediate always
             // enters Thumb state; the H bit only contributes bit[1] of the
             // target address.
-            let inst = self.r32(pc);
             if !thumb && (inst & 0xFE00_0000) == 0xFA00_0000 {
                 let h = (inst >> 24) & 1;
                 let imm24 = inst & 0x00FF_FFFF;
@@ -1491,8 +1654,14 @@ impl Guest {
             .filter(|(_, count)| **count > 0)
             .map(|(slot, count)| format!("{slot}:{count}"))
             .collect();
+        let pc = self.cpu.reg_get(self.cpu.mode(), reg::PC);
+        let instruction_set = if self.cpu.thumb_mode() {
+            "Thumb"
+        } else {
+            "ARM"
+        };
         Err(MrpError::Unsupported(format!(
-            "guest instruction limit exceeded after {limit}; hot slots [{}]",
+            "guest instruction limit exceeded after {limit} at {instruction_set} pc {pc:#010x}; hot slots [{}]",
             hot.join(", ")
         )))
     }
@@ -1527,21 +1696,6 @@ impl Guest {
                 "ext has not registered its event handler".to_string(),
             ));
         }
-        // The handler's trailing arguments (`uint8** output`,
-        // `int32* output_len`) live on the stack at SP+0/SP+4 as seen at
-        // handler entry. run_guest resets SP to STACK_TOP, so lower the
-        // entry SP to make room for the handler's own frame, park the two
-        // slot words above the handler's frame region, and point them at
-        // heap scratch buffers that survive any stack depth.
-        let scratch1 = self.heap_malloc(8);
-        let scratch2 = self.heap_malloc(8);
-        if scratch1 == 0 || scratch2 == 0 {
-            return Err(MrpError::Unsupported(
-                "call_c_function: heap exhausted for output scratch".to_string(),
-            ));
-        }
-        self.w32(scratch1, 0);
-        self.w32(scratch2, 0);
         // The SDK runtime copies a dispatch shell (its helper entry stub,
         // holding the real-handler pointer cell) to `SP - 0x4C` of the call
         // that runs the init — observed at HANDLER_SP - 0x4C for several
@@ -1556,8 +1710,13 @@ impl Guest {
             let base = (STACK_TOP - SHELL_SPAN as u32) as usize;
             self.mem[base..base + SHELL_SPAN].copy_from_slice(snapshot);
         }
+        // Keep the out-parameters and their storage above the callee's frame.
+        let scratch1 = HANDLER_SP + 8;
+        let scratch2 = HANDLER_SP + 12;
         self.w32(HANDLER_SP, scratch1);
         self.w32(HANDLER_SP + 4, scratch2);
+        self.w32(scratch1, 0);
+        self.w32(scratch2, 0);
         self.cpu.reg_set(self.cpu.mode(), R0, self.c_function_p);
         // r9 (static base) must hold the ext's RW globals base — the value
         // at P+0 (start_of_ER_RW), which the ext itself filled during boot
@@ -1627,17 +1786,22 @@ impl Guest {
                 MR_SUCCESS
             }
             2 => {
-                // realloc: fresh block, copy, release the old one.
                 let old = self.cpu.reg_get(self.cpu.mode(), R0);
-                let len = self.cpu.reg_get(self.cpu.mode(), R1);
+                let old_len = self.cpu.reg_get(self.cpu.mode(), R1);
+                let len = self.cpu.reg_get(self.cpu.mode(), R2);
+                if len == 0 {
+                    self.heap_free(old, old_len);
+                    return 0;
+                }
+                let count = len.min(old_len) as usize;
+                let src = old as usize;
+                if old != 0 && src.saturating_add(count) > self.mem.len() {
+                    return 0;
+                }
                 let new = self.heap_malloc(len);
                 if new != 0 && old != 0 {
-                    let count = len.min(HEAP_MAX_ALLOC) as usize;
-                    let src = old as usize;
-                    let dst = new as usize;
-                    let bytes: Vec<u8> = self.mem[src..src + count].to_vec();
-                    self.mem[dst..dst + count].copy_from_slice(&bytes);
-                    self.heap_free(old, len);
+                    self.mem.copy_within(src..src + count, new as usize);
+                    self.heap_free(old, old_len);
                 }
                 new as i32
             }
@@ -1655,7 +1819,7 @@ impl Guest {
                 self.c_function_p = block;
                 self.c_function = func;
                 // Publish P where the ext expects it: ext base + 4.
-                self.w32(self.load_base() + 4, block);
+                self.w32(self.ext_load_base + 4, block);
                 MR_SUCCESS
             }
             26 => {
@@ -1670,17 +1834,31 @@ impl Guest {
                 MR_SUCCESS
             }
             29 => {
-                // mr_drawBitmap(bmp, x, y, w, h): official table slot 29.
-                // The helper's mrc_refreshScreen routes through this slot
-                // with the screen buffer as the source — present it too.
-                let src = self.cpu.reg_get(self.cpu.mode(), R0);
-                let x = self.cpu.reg_get(self.cpu.mode(), R1);
-                let y = self.cpu.reg_get(self.cpu.mode(), R2);
-                let w = self.cpu.reg_get(self.cpu.mode(), R3);
-                let h = self.stack_arg(0);
-                self.blit_from_address(src, x, y, w, h);
-                if src == SCREENBUF {
-                    self.refresh_screen(screen);
+                // The source is a full framebuffer. The rectangle describes
+                // the damaged area and does not alter the framebuffer.
+                let src = match self.cpu.reg_get(self.cpu.mode(), R0) {
+                    0 => self.framebuffer_address().unwrap_or(0),
+                    address => address,
+                };
+                let x = i32::from(self.cpu.reg_get(self.cpu.mode(), R1) as i16);
+                let y = i32::from(self.cpu.reg_get(self.cpu.mode(), R2) as i16);
+                let w = i32::from(self.cpu.reg_get(self.cpu.mode(), R3) as u16);
+                let h = i32::from(self.stack_arg(0) as u16);
+                let width = i32::from(self.config.screen_width);
+                let height = i32::from(self.config.screen_height);
+                if src != 0
+                    && w > 0
+                    && h > 0
+                    && x < width
+                    && y < height
+                    && x + w > 0
+                    && y + h > 0
+                    && usize::try_from(src).is_ok_and(|start| {
+                        start + width as usize * height as usize * 2 <= self.mem.len()
+                    })
+                {
+                    self.uses_explicit_video = true;
+                    self.copy_screen(src, screen);
                 }
                 MR_SUCCESS
             }
@@ -1694,7 +1872,7 @@ impl Guest {
                 self.timers.push(GuestTimer {
                     id: 0,
                     interval: Duration::from_millis(u64::from(interval)),
-                    next_fire: Instant::now() + Duration::from_millis(u64::from(interval)),
+                    next_fire: self.clock_now() + Duration::from_millis(u64::from(interval)),
                 });
                 let cell = self.internal_state_cell(5);
                 self.w32(cell, 1);
@@ -1707,39 +1885,136 @@ impl Guest {
                 self.w32(cell, 0);
                 MR_SUCCESS
             }
-            33 => self.started_at.elapsed().as_millis() as u32 as i32,
+            33 => self.uptime_ms() as i32,
             34 => {
-                // mr_getDatetime(struct): year, month, day, hour, minute, second.
+                // The SDK structure stores a 16-bit year and five bytes.
                 let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
-                let now = local_datetime();
-                self.w32(buffer, now.0);
-                self.w32(buffer + 4, now.1);
-                self.w32(buffer + 8, now.2);
-                self.w32(buffer + 12, now.3);
-                self.w32(buffer + 16, now.4);
-                self.w32(buffer + 20, now.5);
+                let (year, month, day, hour, minute, second) = local_datetime();
+                let start = buffer as usize;
+                let Some(dest) = self.mem.get_mut(start..start.saturating_add(7)) else {
+                    return MR_FAILED;
+                };
+                dest[..2].copy_from_slice(&(year as u16).to_le_bytes());
+                dest[2..].copy_from_slice(&[
+                    month as u8,
+                    day as u8,
+                    hour as u8,
+                    minute as u8,
+                    second as u8,
+                ]);
                 MR_SUCCESS
             }
             35 => {
-                // mr_getUserInfo: IMEI, IMSI, vendor, device strings.
                 let buffer = self.cpu.reg_get(self.cpu.mode(), R0);
-                let imei = self.config.imei.clone();
-                let imsi = self.config.imsi.clone();
-                let vendor = self.config.vendor.clone();
-                let device = self.config.device.clone();
-                for (offset, text) in [(0, imei), (16, imsi), (32, vendor), (48, device)] {
-                    let bytes = text.as_bytes();
-                    let len = bytes.len().min(15);
-                    let base = (buffer + offset) as usize;
-                    self.mem[base..base + len].copy_from_slice(&bytes[..len]);
-                    self.mem[base + len] = 0;
+                let start = buffer as usize;
+                let Some(dest) = self.mem.get_mut(start..start.saturating_add(64)) else {
+                    return MR_FAILED;
+                };
+                dest.fill(0);
+                for (offset, capacity, value) in [
+                    (0, 16, &self.config.imei),
+                    (16, 16, &self.config.imsi),
+                    (32, 8, &self.config.vendor),
+                    (40, 8, &self.config.device),
+                ] {
+                    let len = value.len().min(capacity - 1);
+                    dest[offset..offset + len].copy_from_slice(&value.as_bytes()[..len]);
                 }
                 MR_SUCCESS
             }
-            36 => MR_SUCCESS, // mr_sleep: instantaneous in the emulator
-            37 => MR_IGNORE,  // mr_plat
-            38 => MR_IGNORE,  // mr_platEx
-            39 => 0,          // mr_ferrno
+            36 => {
+                let delay = self.cpu.reg_get(self.cpu.mode(), R0);
+                self.sleep_elapsed += Duration::from_millis(u64::from(delay));
+                MR_SUCCESS
+            }
+            37 => {
+                let command = self.cpu.reg_get(self.cpu.mode(), R0);
+                match command {
+                    1106 => 2,    // MR_WAITING: asynchronous SMS service-centre query.
+                    1205 => 1000, // MR_NORMAL_SCREEN
+                    1206 => 1000, // MR_CHINESE
+                    1218 => 1001, // MR_MSDC_OK
+                    _ => {
+                        log::debug!("mr_plat command {command} not implemented");
+                        MR_IGNORE
+                    }
+                }
+            }
+            38 => {
+                let mode = self.cpu.mode();
+                let command = self.cpu.reg_get(mode, R0);
+                match command {
+                    1001 => {
+                        let output = self.cpu.reg_get(mode, R3);
+                        let length = self.stack_arg(0);
+                        let Some(screen) = self.framebuffer_address() else {
+                            return MR_FAILED;
+                        };
+                        if output != 0 {
+                            self.w32(output, screen);
+                        }
+                        if length != 0 {
+                            self.w32(
+                                length,
+                                u32::from(self.config.screen_width)
+                                    * u32::from(self.config.screen_height)
+                                    * 4,
+                            );
+                        }
+                        MR_SUCCESS
+                    }
+                    1002 => MR_SUCCESS, // The display buffer remains owned by the platform.
+                    1014 => {
+                        let output = self.cpu.reg_get(mode, R3);
+                        let length = self.stack_arg(0);
+                        if output == 0 || length == 0 {
+                            return MR_FAILED;
+                        }
+                        let requested = self.cpu.reg_get(mode, R2) as i32;
+                        let size = if requested > 0 {
+                            requested as u32
+                        } else {
+                            u32::from(self.config.screen_width)
+                                * u32::from(self.config.screen_height)
+                                * 4
+                        };
+                        let address = self.allocate_extended_ram(size);
+                        self.w32(output, address);
+                        if address == 0 {
+                            self.w32(length, 0);
+                            return MR_FAILED;
+                        }
+                        self.w32(length, size);
+                        MR_SUCCESS
+                    }
+                    1015 => {
+                        let address = self.cpu.reg_get(mode, R1);
+                        if self.extended_allocations.remove(&address).is_some() {
+                            MR_SUCCESS
+                        } else {
+                            MR_FAILED
+                        }
+                    }
+                    1201 => {
+                        let output = self.cpu.reg_get(mode, R3);
+                        let length = self.stack_arg(0);
+                        if output == 0 || length == 0 {
+                            return MR_FAILED;
+                        }
+                        self.w32(FONT_METRICS, u32::from_le_bytes([16, 16, 8, 16]));
+                        self.w32(output, FONT_METRICS);
+                        self.w32(length, 4);
+                        MR_SUCCESS
+                    }
+                    1204 => self.swi_storage_root(),
+                    1222 | 1223 => MR_SUCCESS, // The virtual LCD remains readable.
+                    _ => {
+                        log::debug!("mr_platEx command {command} not implemented");
+                        MR_IGNORE
+                    }
+                }
+            }
+            39 => 0, // mr_ferrno
             40 => self.swi_open(),
             41 => self.swi_close(),
             42 => self.swi_info(),
@@ -1747,9 +2022,25 @@ impl Guest {
             44 => self.swi_read(),
             45 => self.swi_seek(),
             46 => self.swi_get_len(),
-            47 => MR_FAILED, // mr_remove
+            47 => {
+                let name = self.guest_file_path();
+                let Some(index) = self.find_file(&name, false) else {
+                    return MR_FAILED;
+                };
+                // Preserve the backing object for handles already open.
+                self.files[index].0.clear();
+                self.dirty_files.remove(&name);
+                MR_SUCCESS
+            }
             48 => MR_FAILED, // mr_rename
-            49 => MR_FAILED, // mr_mkDir
+            49 => {
+                let name = self.guest_file_path();
+                if name.is_empty() || self.find_file(&name, false).is_some() {
+                    return MR_FAILED;
+                }
+                self.directories.insert(name);
+                MR_SUCCESS
+            }
             50 => MR_FAILED, // mr_rmDir
             51 => MR_FAILED, // mr_findStart
             52 => MR_FAILED, // mr_findGetNext
@@ -1965,88 +2256,128 @@ impl Guest {
                 self.w32(buffer + 8, 16);
                 MR_SUCCESS
             }
-            81..=90 => {
+            81 => MR_SUCCESS, // Initialize the offline transport.
+            82 => {
+                self.offline_sockets = 0;
+                MR_SUCCESS
+            }
+            84 => {
+                let mode = self.cpu.mode();
+                let kind = self.cpu.reg_get(mode, R0);
+                let protocol = self.cpu.reg_get(mode, R1);
+                let index = self.offline_sockets.trailing_ones();
+                if kind > 1 || kind != protocol || index >= u16::BITS {
+                    return MR_FAILED;
+                }
+                self.offline_sockets |= 1 << index;
+                index as i32 + 1
+            }
+            86 => {
+                let index = self.cpu.reg_get(self.cpu.mode(), R0).wrapping_sub(1);
+                if index >= u16::BITS || self.offline_sockets & (1 << index) == 0 {
+                    return MR_FAILED;
+                }
+                self.offline_sockets &= !(1 << index);
+                MR_SUCCESS
+            }
+            83 | 85 | 87..=90 => {
                 warn_once(
                     "net",
                     format!("mr_table slot {slot} (network) is offline; failing"),
                 );
                 MR_FAILED
             }
-            113..=117 => 0, // md5 / sms cfg: tolerated stubs
+            113 => {
+                let state = self.cpu.reg_get(self.cpu.mode(), R0);
+                self.md5_contexts.insert(state, crate::md5::Md5::new());
+                MR_SUCCESS
+            }
+            114 => {
+                let state = self.cpu.reg_get(self.cpu.mode(), R0);
+                let start = self.cpu.reg_get(self.cpu.mode(), R1) as usize;
+                let len = self.cpu.reg_get(self.cpu.mode(), R2) as usize;
+                let (Some(context), Some(data)) = (
+                    self.md5_contexts.get_mut(&state),
+                    self.mem.get(start..start.saturating_add(len)),
+                ) else {
+                    return MR_FAILED;
+                };
+                context.update(data);
+                MR_SUCCESS
+            }
+            115 => {
+                let state = self.cpu.reg_get(self.cpu.mode(), R0);
+                let start = self.cpu.reg_get(self.cpu.mode(), R1) as usize;
+                let (Some(context), Some(output)) = (
+                    self.md5_contexts.remove(&state),
+                    self.mem.get_mut(start..start.saturating_add(16)),
+                ) else {
+                    return MR_FAILED;
+                };
+                output.copy_from_slice(&context.finish());
+                MR_SUCCESS
+            }
+            116 | 117 => MR_SUCCESS, // SMS config
             119 => {
-                // mr_drawPoint(x, y, color): draw into the guest buffer.
-                let x = self.cpu.reg_get(self.cpu.mode(), R0);
-                let y = self.cpu.reg_get(self.cpu.mode(), R1);
-                let color = rgb_to_565(self.cpu.reg_get(self.cpu.mode(), R2));
-                let width = u32::from(self.config.screen_width);
-                if x < width {
-                    self.w16(SCREENBUF + (y * width + x) * 2, color);
-                }
+                let x = i32::from(self.cpu.reg_get(self.cpu.mode(), R0) as i16);
+                let y = i32::from(self.cpu.reg_get(self.cpu.mode(), R1) as i16);
+                let color = self.cpu.reg_get(self.cpu.mode(), R2) as u16;
+                self.screen_put(x, y, color);
                 MR_SUCCESS
             }
             122 => {
-                // mr_drawRect(x1, y1, x2, y2, r, g, b)
-                let x1 = self.cpu.reg_get(self.cpu.mode(), R0);
-                let y1 = self.cpu.reg_get(self.cpu.mode(), R1);
-                let x2 = self.cpu.reg_get(self.cpu.mode(), R2);
-                let y2 = self.cpu.reg_get(self.cpu.mode(), R3);
+                let x = i32::from(self.cpu.reg_get(self.cpu.mode(), R0) as i16);
+                let y = i32::from(self.cpu.reg_get(self.cpu.mode(), R1) as i16);
+                let w = i32::from(self.cpu.reg_get(self.cpu.mode(), R2) as i16);
+                let h = i32::from(self.cpu.reg_get(self.cpu.mode(), R3) as i16);
                 let r = self.stack_arg(0) & 0xFF;
                 let g = self.stack_arg(1) & 0xFF;
                 let b = self.stack_arg(2) & 0xFF;
-                let color = rgb888_to_565(r, g, b);
-                let width = u32::from(self.config.screen_width);
-                let height = u32::from(self.config.screen_height);
-                for y in y1.min(height)..y2.min(height) {
-                    for x in x1.min(width)..x2.min(width) {
-                        self.w16(SCREENBUF + (y * width + x) * 2, color);
-                    }
-                }
+                self.draw_rect(
+                    x.max(0) as u32,
+                    y.max(0) as u32,
+                    (x + w).max(0) as u32,
+                    (y + h).max(0) as u32,
+                    r,
+                    g,
+                    b,
+                );
                 MR_SUCCESS
             }
-            123 | 128 => {
-                // mr_drawText(text, x, y, r, g, b, ...) — GBK text rendering.
+            123 => {
                 let text_addr = self.cpu.reg_get(self.cpu.mode(), R0);
-                let x = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
-                let y = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
-                let text = self.guest_cstring(text_addr, 512);
-                let (r, g, b) = (
-                    self.stack_arg(0) & 0xFF,
-                    self.stack_arg(1) & 0xFF,
-                    self.stack_arg(2) & 0xFF,
-                );
-                let color = rgb888_to_565(r, g, b);
-                self.draw_text(&text, x, y, color);
+                let x = i32::from(self.cpu.reg_get(self.cpu.mode(), R1) as i16);
+                let y = i32::from(self.cpu.reg_get(self.cpu.mode(), R2) as i16);
+                let r = self.cpu.reg_get(self.cpu.mode(), R3) & 0xff;
+                let color = rgb888_to_565(r, self.stack_arg(0) & 0xff, self.stack_arg(1) & 0xff);
+                let text = self.read_platform_text(text_addr, self.stack_arg(2) != 0);
+                self.draw_decoded_text(&text, x, y, color);
                 MR_SUCCESS
             }
+            128 => self.draw_text_in_rect(),
             145 => {
-                // mr_platDrawChar(ch, x, y, r, g, b)
-                let ch = self.cpu.reg_get(self.cpu.mode(), R0) as u8 as char;
+                let ch = self.cpu.reg_get(self.cpu.mode(), R0) & 0xffff;
                 let x = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
                 let y = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
-                let (r, g, b) = (
-                    self.stack_arg(0) & 0xFF,
-                    self.stack_arg(1) & 0xFF,
-                    self.stack_arg(2) & 0xFF,
-                );
-                let mut buf = [0u8; 3];
-                ch.encode_utf8(&mut buf);
-                let color = rgb888_to_565(r, g, b);
-                self.draw_text(&buf[..ch.len_utf8()], x, y, color);
+                let color = self.cpu.reg_get(self.cpu.mode(), R3) as u16;
+                if let Some(glyph) = char::from_u32(ch).and_then(unifont::get_glyph) {
+                    self.draw_glyph(glyph, x, y, color, i32::MAX, i32::MAX);
+                }
                 MR_SUCCESS
             }
             120 => {
                 // mr_drawBitmap(p, x, y, w, h, rop, transcolor, sx, sy, mw):
                 // the ten-argument sprite blit (rop modes, rotate/flip).
                 let p = self.cpu.reg_get(self.cpu.mode(), R0);
-                let x = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
-                let y = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
-                let w = self.cpu.reg_get(self.cpu.mode(), R3);
-                let h = self.stack_arg(0);
-                let rop = self.stack_arg(1);
+                let x = i32::from(self.cpu.reg_get(self.cpu.mode(), R1) as i16);
+                let y = i32::from(self.cpu.reg_get(self.cpu.mode(), R2) as i16);
+                let w = u32::from(self.cpu.reg_get(self.cpu.mode(), R3) as u16);
+                let h = u32::from(self.stack_arg(0) as u16);
+                let rop = u32::from(self.stack_arg(1) as u16);
                 let transcolor = self.stack_arg(2) as u16;
-                let sx = self.stack_arg(3) as i32;
-                let sy = self.stack_arg(4) as i32;
-                let mw = self.stack_arg(5);
+                let sx = i32::from(self.stack_arg(3) as i16);
+                let sy = i32::from(self.stack_arg(4) as i16);
+                let mw = u32::from(self.stack_arg(5) as u16);
                 self.draw_bitmap_rop(p, x, y, w, h, rop, transcolor, sx, sy, mw);
                 MR_SUCCESS
             }
@@ -2084,22 +2415,56 @@ impl Guest {
             118 => {
                 // _DispUpEx: the helper's mrc_refreshScreen presents the
                 // screen buffer rect through this slot.
+                self.uses_explicit_video = true;
                 self.refresh_screen(screen);
                 MR_SUCCESS
             }
             124 => 0, // mr_bitmapCheck
             125 => self.swi_read_file(),
-            126 => 0, // mr_wstrlen
+            126 => {
+                let text = self.cpu.reg_get(self.cpu.mode(), R0);
+                self.guest_ucs2_bytes(text).len() as i32
+            }
             127 => 0, // mr_registerAPP
             129 => 0, // mr_effSetCon
             130 => {
                 // mr_testCom(state, input0, input1)
                 let input0 = self.cpu.reg_get(self.cpu.mode(), R1);
                 let input1 = self.cpu.reg_get(self.cpu.mode(), R2);
-                self.dispatch_test_com(input0, input1)
+                if input0 == 800 {
+                    self.load_nested_ext(input1, screen).unwrap_or(-1)
+                } else {
+                    self.dispatch_test_com(input0, input1)
+                }
             }
-            131 => MR_IGNORE, // mr_testCom1
-            132 => 0,         // mr_c2u
+            131 => {
+                let command = self.cpu.reg_get(self.cpu.mode(), R1);
+                let buffer = self.cpu.reg_get(self.cpu.mode(), R2);
+                match command {
+                    2 => {
+                        let length = self.cpu.reg_get(self.cpu.mode(), R3);
+                        if buffer as usize > self.mem.len()
+                            || length as usize > self.mem.len() - buffer as usize
+                        {
+                            return MR_FAILED;
+                        }
+                        let previous = self.get_data(DataSlot::RamFile);
+                        if previous != 0 && previous != buffer {
+                            self.heap_free(previous, self.get_data(DataSlot::RamFileLen));
+                        }
+                        self.set_data(DataSlot::RamFile, buffer);
+                        self.set_data(DataSlot::RamFileLen, length);
+                        MR_SUCCESS
+                    }
+                    800 => self.load_nested_ext(buffer, screen).unwrap_or(MR_FAILED),
+                    9 => MR_SUCCESS, // The interpreter reads guest instructions directly from RAM.
+                    _ => {
+                        log::debug!("mr_testCom1 command {command:#x} not implemented");
+                        MR_IGNORE
+                    }
+                }
+            }
+            132 => self.swi_c2u(),
             133 => {
                 let a = self.cpu.reg_get(self.cpu.mode(), R0) as i32;
                 let b = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
@@ -2119,30 +2484,7 @@ impl Guest {
                 }
             }
             137 => 0, // mr_updCrc
-            141 => {
-                // mr_unzip(inputBuf, inputLen, &outputBuf, &outputLen):
-                // gunzip into a fresh malloc'd buffer; the ext frees it.
-                let input_buf = self.cpu.reg_get(self.cpu.mode(), R0);
-                let input_len = self.cpu.reg_get(self.cpu.mode(), R1) as usize;
-                let out_buf_ptr = self.cpu.reg_get(self.cpu.mode(), R2);
-                let out_len_ptr = self.cpu.reg_get(self.cpu.mode(), R3);
-                let Some(input) = self.guest_bytes(input_buf, input_len) else {
-                    return MR_FAILED;
-                };
-                let Some(output) = gunzip_any(&input) else {
-                    warn_once("unzip", "mr_unzip: payload is not gzip/zlib".to_string());
-                    return MR_FAILED;
-                };
-                let block = self.heap_malloc(output.len() as u32);
-                if block == 0 {
-                    return MR_FAILED;
-                }
-                let base = block as usize;
-                self.mem[base..base + output.len()].copy_from_slice(&output);
-                self.w32(out_buf_ptr, block);
-                self.w32(out_len_ptr, output.len() as u32);
-                MR_SUCCESS
-            }
+            141 => self.swi_unzip().map_or(MR_FAILED, |()| MR_SUCCESS),
             // mr_getCharBitmap(ch, font, &width, &height) → glyph bitmap
             // pointer: 1 bit per pixel, rows aligned to 2 bytes, MSB first
             // (the MTK font convention the ext renderers expect).
@@ -2191,11 +2533,47 @@ impl Guest {
     /// (0=m0_files, 1=vm_state, 2=mr_state, 3=bi, 4=timer_p,
     /// 5=timer_state, 6=timer_run_without_pause).
     fn internal_state_cell(&self, index: u32) -> u32 {
-        self.data_slot_address(DataSlot::CInternalTable) + 64 + index * 4
+        self.r32(INTERNAL_TABLE_BASE + index * 4)
     }
 
-    fn load_base(&self) -> u32 {
-        EXT_BASE
+    pub(crate) fn update_flags(&mut self, set: u32, clear: u32) {
+        let address = self.internal_state_cell(3);
+        self.w32(address, (self.r32(address) | set) & !clear);
+    }
+
+    fn swi_unzip(&mut self) -> Option<()> {
+        use std::io::Read;
+
+        // The caller parses the gzip header and provides both buffers and
+        // the deflate offset through the internal table.
+        let input = self.r32(self.internal_state_cell(7)) as usize;
+        let output = self.r32(self.internal_state_cell(8)) as usize;
+        let input_offset = self.r32(self.internal_state_cell(9)) as usize;
+        if input == 0 || output == 0 || output >= self.mem.len() {
+            return None;
+        }
+        let input_start = input.checked_add(input_offset)?;
+        let source = self.mem.get(input_start..)?;
+        let mut decoder = flate2::bufread::DeflateDecoder::new(source);
+        let mut bytes = Vec::new();
+        let capacity = self.mem.len() - output;
+        (&mut decoder)
+            .take(capacity as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let consumed = usize::try_from(decoder.total_in()).ok()?;
+        let trailer = source.get(consumed..consumed.checked_add(8)?)?;
+        let len = u32::from_le_bytes(trailer[4..8].try_into().ok()?) as usize;
+        if bytes.len() != len || bytes.len() > capacity {
+            return None;
+        }
+        self.mem[output..output + len].copy_from_slice(&bytes);
+        self.w32(
+            self.internal_state_cell(9),
+            (input_offset + consumed + 8) as u32,
+        );
+        self.w32(self.internal_state_cell(10), len as u32);
+        Some(())
     }
 
     /// `mr_mem_get`/`mr_mem_free` (slots 27/28) manage an auxiliary block
@@ -2207,23 +2585,13 @@ impl Guest {
         let r1 = self.cpu.reg_get(self.cpu.mode(), R1);
         let r2 = self.cpu.reg_get(self.cpu.mode(), R2);
         match slot {
-            3 => {
-                // memcpy(dst, src, len)
-                if let (Some(dst), Some(src)) = ((r0 as usize..).next(), (r1 as usize..).next()) {
-                    let count = r2 as usize;
-                    if src + count <= self.mem.len() && dst + count <= self.mem.len() {
-                        let bytes = self.mem[src..src + count].to_vec();
-                        self.mem[dst..dst + count].copy_from_slice(&bytes);
-                    }
-                }
-                r0 as i32
-            }
-            4 => {
-                // memmove: copy through a temporary.
+            3 | 4 => {
                 let count = r2 as usize;
-                if r1 as usize + count <= self.mem.len() && r0 as usize + count <= self.mem.len() {
-                    let bytes = self.mem[r1 as usize..r1 as usize + count].to_vec();
-                    self.mem[r0 as usize..r0 as usize + count].copy_from_slice(&bytes);
+                let (dst, src) = (r0 as usize, r1 as usize);
+                if src.saturating_add(count) <= self.mem.len()
+                    && dst.saturating_add(count) <= self.mem.len()
+                {
+                    self.mem.copy_within(src..src + count, dst);
                 }
                 r0 as i32
             }
@@ -2268,27 +2636,25 @@ impl Guest {
             }
             9..=12 => {
                 // memcmp/strcmp/strncmp/strcoll
-                let a = self.guest_cstring_or_fixed(r0, r2, slot == 9);
-                let b = self.guest_cstring_or_fixed(r1, r2, slot == 9);
-                let limit = match slot {
-                    11 => r2 as usize,
-                    9 => a.len(),
-                    _ => usize::MAX,
+                let a = self.mem.get(r0 as usize..).unwrap_or_default();
+                let b = self.mem.get(r1 as usize..).unwrap_or_default();
+                let available = a.len().max(b.len());
+                let limit = if matches!(slot, 9 | 11) {
+                    (r2 as usize).min(available)
+                } else {
+                    available
                 };
-                let result = a
-                    .iter()
-                    .zip(b.iter())
-                    .take(limit)
-                    .find_map(|(x, y)| match x.cmp(y) {
-                        std::cmp::Ordering::Equal => None,
-                        other => Some(other),
-                    })
-                    .unwrap_or(std::cmp::Ordering::Equal);
-                match result {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Greater => 1,
-                    std::cmp::Ordering::Equal => 0,
+                for index in 0..limit {
+                    let x = a.get(index).copied().unwrap_or(0);
+                    let y = b.get(index).copied().unwrap_or(0);
+                    if x != y {
+                        return i32::from(x) - i32::from(y);
+                    }
+                    if slot != 9 && x == 0 {
+                        break;
+                    }
                 }
+                0
             }
             13 => {
                 // memchr(src, ch, len)
@@ -2370,108 +2736,108 @@ impl Guest {
         }
     }
 
-    fn guest_cstring_or_fixed(&self, addr: u32, len: u32, fixed: bool) -> Vec<u8> {
-        if fixed {
-            let start = addr as usize;
-            let end = self.mem.len().min(start + len as usize);
-            return self.mem[start..end].to_vec();
+    pub fn refresh_screen(&mut self, screen: &mut crate::display::Screen) {
+        if let Some(source) = self.framebuffer_address() {
+            self.copy_screen(source, screen);
+        } else {
+            screen.fill(0);
         }
-        self.guest_cstring(addr, 4096)
     }
 
-    pub fn refresh_screen(&mut self, screen: &mut crate::display::Screen) {
-        let width = u32::from(self.config.screen_width);
-        let height = u32::from(self.config.screen_height);
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = self.r16(SCREENBUF + (y * width + x) * 2);
-                screen.set_pixel(x as u16, y as u16, pixel);
-            }
+    pub(crate) fn present_frame(&mut self, screen: &mut crate::display::Screen) {
+        if !self.uses_explicit_video {
+            self.refresh_screen(screen);
         }
+    }
+
+    fn copy_screen(&self, source: u32, screen: &mut crate::display::Screen) {
+        let (width, height) = (self.config.screen_width, self.config.screen_height);
+        if (screen.width(), screen.height()) != (width, height) {
+            *screen = crate::display::Screen::new(width, height);
+        }
+        let pixels = screen.pixels_mut();
+        let source = self.mem.get(source as usize..).unwrap_or_default();
+        let byte_count = (pixels.len() * 2).min(source.len());
+        let source = &source[..byte_count];
+        for (pixel, bytes) in pixels.iter_mut().zip(source.as_chunks::<2>().0) {
+            *pixel = u16::from_le_bytes(*bytes);
+        }
+        pixels[byte_count / 2..].fill(0);
     }
 
     fn swi_open(&mut self) -> i32 {
-        let path = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 512);
-        let name = String::from_utf8_lossy(&path).to_string();
+        let name = self.guest_file_path();
         let mode = self.cpu.reg_get(self.cpu.mode(), R1);
         log::info!("mr_open({name:?}, mode={mode:#x})");
-        // Missing files fail with handle 0 unless MR_FILE_CREATE (8) asks
-        // for creation — mirrors the on-device contract (`if (f)`).
-        let data = match self.file_lookup(&name) {
-            Some(data) => data,
-            None if mode & 8 != 0 => Vec::new(),
-            None => return 0,
-        };
-        self.open_files.push(OpenFile {
-            name,
-            data,
-            pos: 0,
-            closed: false,
-        });
-        (self.open_files.len() as u32) as i32
+        let writable = mode & (2 | 4) != 0;
+        let readable = mode & 2 == 0 || mode & 4 != 0;
+        self.open_file(&name, readable, writable, mode & 8 != 0)
+            .map_or(0, |handle| handle as i32)
     }
 
     fn swi_close(&mut self) -> i32 {
         let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
-        if handle == 0 || handle > self.open_files.len() {
-            return -1;
-        }
-        self.open_files[handle - 1].closed = true;
-        // Sync the (possibly written) data back to the file table so
-        // subsequent mr_open calls see the updated content.
-        let file = &self.open_files[handle - 1];
-        if let Some(entry) = self.files.iter_mut().find(|(name, _)| *name == file.name) {
-            entry.1 = file.data.clone();
+        if self.close_file(handle) {
+            0
         } else {
-            self.dirty_files.insert(file.name.clone());
+            -1
         }
-        0
     }
 
     fn swi_info(&mut self) -> i32 {
-        // mr_info(path) returns the file size, or MR_FAILED (-1).
-        let path = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 512);
-        let name = String::from_utf8_lossy(&path).to_string();
-        let result = match self.file_lookup(&name) {
-            Some(data) => data.len() as i32,
-            None => -1,
+        let name = self.guest_file_path();
+        self.ensure_system_font(&name);
+        let result = if self.find_file(&name, false).is_some() {
+            1 // MR_IS_FILE
+        } else if self.directories.contains(&name) {
+            2 // MR_IS_DIR
+        } else {
+            8 // MR_IS_INVALID
         };
         log::info!("mr_info({name:?}) -> {result}");
         result
     }
 
     fn swi_write(&mut self) -> i32 {
-        // Writes land in the handle's buffer; persistence lands with the
-        // guest file system work.
         let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
+        let source = self.cpu.reg_get(self.cpu.mode(), R1) as usize;
         let len = self.cpu.reg_get(self.cpu.mode(), R2) as usize;
-        if handle == 0 || handle > self.open_files.len() {
+        let Some(data) = self.mem.get(source..source.saturating_add(len)) else {
             return -1;
+        };
+        let bytes = data.to_vec();
+        if self.file_write(handle, &bytes) {
+            len as i32
+        } else {
+            -1
         }
-        len as i32
     }
 
     fn swi_read(&mut self) -> i32 {
         let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
         let buffer = self.cpu.reg_get(self.cpu.mode(), R1);
         let len = self.cpu.reg_get(self.cpu.mode(), R2) as usize;
-        if handle == 0 || handle > self.open_files.len() || self.open_files[handle - 1].closed {
+        let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) else {
+            return -1;
+        };
+        if file.closed || !file.readable {
             return -1;
         }
-        let file = &mut self.open_files[handle - 1];
-        let remaining = file.data.len().saturating_sub(file.pos);
+        let (name, data) = &self.files[file.file_index];
+        let start = file.pos.min(data.len());
+        let remaining = data.len() - start;
         let count = len.min(remaining);
         log::info!(
             "mr_read(handle={handle} {:?} pos={:#x} len={count})",
-            file.name,
+            name,
             file.pos
         );
-        let bytes = file.data[file.pos..file.pos + count].to_vec();
-        file.pos += count;
         let base = buffer as usize;
-        if base + count <= self.mem.len() {
-            self.mem[base..base + count].copy_from_slice(&bytes);
-        }
+        let Some(destination) = self.mem.get_mut(base..base.saturating_add(count)) else {
+            return -1;
+        };
+        destination.copy_from_slice(&data[start..start + count]);
+        file.pos += count;
         count as i32
     }
 
@@ -2479,43 +2845,187 @@ impl Guest {
         let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
         let offset = self.cpu.reg_get(self.cpu.mode(), R1) as i32;
         let whence = self.cpu.reg_get(self.cpu.mode(), R2) as i32;
-        if handle == 0 || handle > self.open_files.len() {
+        let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) else {
+            return -1;
+        };
+        if file.closed {
             return -1;
         }
-        let file = &mut self.open_files[handle - 1];
-        let len = file.data.len() as i64;
         let base = match whence {
             0 => 0,
             1 => file.pos as i64,
-            _ => len,
+            2 => self.files[file.file_index].1.len() as i64,
+            _ => return -1,
         };
-        let target = (base + i64::from(offset)).clamp(0, len);
+        let Ok(target) = usize::try_from(base + i64::from(offset)) else {
+            return -1;
+        };
         log::info!("mr_seek(handle={handle} offset={offset} whence={whence} -> {target:#x})",);
-        file.pos = target as usize;
-        file.pos as i32
+        file.pos = target;
+        0
     }
 
     fn swi_get_len(&mut self) -> i32 {
-        let handle = self.cpu.reg_get(self.cpu.mode(), R0) as usize;
-        match self.open_files.get(handle.wrapping_sub(1)) {
-            Some(file) => file.data.len() as i32,
-            None => -1,
+        let path = self.guest_file_path();
+        self.ensure_system_font(&path);
+        self.find_file(&path, true)
+            .map_or(-1, |index| self.files[index].1.len() as i32)
+    }
+
+    fn ensure_system_font(&mut self, path: &str) {
+        let name = path.strip_prefix("mythroad/").unwrap_or(path);
+        if !name.starts_with("system/") || self.find_file(path, false).is_some() {
+            return;
+        }
+        if let Some(font) = crate::display::system_font(name) {
+            self.files.push((path.to_string(), font.to_vec()));
         }
     }
 
-    /// `mr_readFile(name, buf, *len, lookfor)` — reads from the running
-    /// package first (gzip-aware), then the virtual file system.
+    fn guest_file_path(&self) -> String {
+        let path = self.guest_cstring(self.cpu.reg_get(self.cpu.mode(), R0), 512);
+        self.resolve_storage_path(&encoding_rs::GBK.decode(&path).0)
+    }
+
+    fn resolve_storage_path(&self, name: &str) -> String {
+        let name = normalize_file_path(name);
+        if name.is_empty() {
+            return name;
+        }
+        let full = if name.as_bytes().get(1) == Some(&b':') {
+            name
+        } else if self.storage_root == DEFAULT_STORAGE_ROOT {
+            return name;
+        } else {
+            format!("{}{name}", self.storage_root)
+        };
+        let drive = char::from(full.as_bytes()[0].to_ascii_lowercase());
+        let tail = full[2..].trim_start_matches('/');
+        if drive == 'c' {
+            if tail == "mythroad" {
+                return String::new();
+            }
+            if let Some(path) = tail.strip_prefix("mythroad/") {
+                return path.to_string();
+            }
+        }
+        format!("disk/{drive}/{tail}")
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    fn swi_storage_root(&mut self) -> i32 {
+        let mode = self.cpu.mode();
+        let input = self.cpu.reg_get(mode, R1);
+        let length = self.cpu.reg_get(mode, R2) as usize;
+        let path = self.guest_cstring(input, length.min(510));
+        let Some(drive) = path.first().map(u8::to_ascii_lowercase) else {
+            return 1; // MR_IGNORE
+        };
+        match drive {
+            b'y' => {
+                let output = self.cpu.reg_get(mode, R3);
+                let length = self.stack_arg(0);
+                if output == 0 || length == 0 {
+                    return -1;
+                }
+                let (bytes, _, _) = encoding_rs::GBK.encode(&self.storage_root);
+                let start = STORAGE_PATH_BUFFER as usize;
+                self.mem[start..start + bytes.len()].copy_from_slice(&bytes);
+                self.mem[start + bytes.len()] = 0;
+                let size = bytes.len() as u32;
+                self.w32(output, STORAGE_PATH_BUFFER);
+                self.w32(length, size);
+            }
+            b'z' => self.storage_root = DEFAULT_STORAGE_ROOT.to_string(),
+            b'x' => self.storage_root = "x:/".to_string(),
+            b'a' | b'b' | b'c' => {
+                if path.len() > 1 && !matches!(path.get(1..3), Some(b":/" | b":\\")) {
+                    return 1;
+                }
+                let suffix = path.get(3..).unwrap_or_default();
+                let (suffix, _, invalid) = encoding_rs::GBK.decode(suffix);
+                if invalid {
+                    return -1;
+                }
+                let suffix = normalize_file_path(&suffix);
+                self.storage_root = if suffix.is_empty() {
+                    format!("{}:/", char::from(drive))
+                } else {
+                    format!("{}:/{suffix}/", char::from(drive))
+                };
+            }
+            _ => return 1,
+        }
+        0
+    }
+
+    fn guest_ucs2_bytes(&self, address: u32) -> &[u8] {
+        if address == 0 {
+            return &[];
+        }
+        let data = self.mem.get(address as usize..).unwrap_or_default();
+        let words = data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take_while(|word| **word != [0, 0])
+            .count();
+        &data[..words * 2]
+    }
+
+    fn swi_c2u(&mut self) -> i32 {
+        let mode = self.cpu.mode();
+        let source = self.cpu.reg_get(mode, R0);
+        let error = self.cpu.reg_get(mode, R1);
+        let size = self.cpu.reg_get(mode, R2);
+        if error != 0 {
+            self.w32(error, u32::MAX);
+        }
+        if source == 0 || source as usize >= self.mem.len() {
+            return 0;
+        }
+        let gbk = self.guest_cstring(source, self.mem.len() - source as usize);
+        let (text, _, _) = encoding_rs::GBK.decode(&gbk);
+        let bytes: Vec<_> = text
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        let length = bytes.len() as u32;
+        let output = self.heap_malloc(length);
+        if output != 0 {
+            self.mem[output as usize..output as usize + bytes.len()].copy_from_slice(&bytes);
+        }
+        if size != 0 {
+            self.w32(size, if output == 0 { 0 } else { length });
+        }
+        output as i32
+    }
+
+    /// `mr_readFile(name, *len, lookfor)` reads the active package member.
     fn swi_read_file(&mut self) -> i32 {
-        // mr_readFile(name, &filelen, lookfor): `lookfor` only changes the
-        // result shape, per the reference `_mr_readFile` — 1 is an
-        // existence probe that returns 1 when the pack carries the name
-        // (callers use it to decide whether a resource is bundled), 0 and
-        // 2 return the malloc'd data. Everything resolves from the package.
         let name_addr = self.cpu.reg_get(self.cpu.mode(), R0);
         let len_ptr = self.cpu.reg_get(self.cpu.mode(), R1);
         let lookfor = self.cpu.reg_get(self.cpu.mode(), R2);
-        let name = String::from_utf8_lossy(&self.guest_cstring(name_addr, 512)).to_string();
-        let content = self.file_lookup(&name);
+        let name = self.guest_cstring(name_addr, 512);
+        let pack_name = self.guest_cstring(self.data_slot_address(DataSlot::PackFilename), 128);
+        if pack_name.starts_with(b"$") {
+            return self.swi_read_ram_entry(&name, len_ptr, lookfor);
+        }
+        let name = encoding_rs::GBK.decode(&name).0;
+        let pack_name = self.resolve_storage_path(&encoding_rs::GBK.decode(&pack_name).0);
+        let content = if pack_name != self.config.pack_filename {
+            if let Some(index) = self.find_file(&pack_name, false) {
+                crate::package::MrpPackage::parse(self.files[index].1.clone())
+                    .and_then(|package| package.read_entry(&name))
+                    .ok()
+            } else {
+                self.file_lookup(&name)
+            }
+        } else {
+            self.file_lookup(&name)
+        };
         if lookfor == 1 {
             let found = content.is_some() as i32;
             log::info!("mr_readFile({name:?}, lookfor={lookfor}) -> {found}");
@@ -2529,14 +3039,64 @@ impl Guest {
             self.w32(len_ptr, 0);
             return 0;
         };
+        self.allocate_file_bytes(&content, len_ptr)
+    }
+
+    fn allocate_file_bytes(&mut self, content: &[u8], len_ptr: u32) -> i32 {
         let block = self.heap_malloc(content.len() as u32);
         if block == 0 {
             return 0;
         }
         let base = block as usize;
-        self.mem[base..base + content.len()].copy_from_slice(&content);
+        self.mem[base..base + content.len()].copy_from_slice(content);
         self.w32(len_ptr, content.len() as u32);
         block as i32
+    }
+
+    fn swi_read_ram_entry(&mut self, name: &[u8], len_ptr: u32, lookfor: u32) -> i32 {
+        use std::io::Read;
+
+        let base = self.get_data(DataSlot::RamFile);
+        let length = self.get_data(DataSlot::RamFileLen);
+        let Some(range) = base
+            .checked_add(length)
+            .and_then(|end| self.mem.get(base as usize..end as usize))
+            .and_then(|package| ram_entry_range(package, name))
+        else {
+            log::debug!("RAM package member {name:?} missing at {base:#x} ({length} bytes)");
+            if lookfor != 1 {
+                self.w32(len_ptr, 0);
+            }
+            return 0;
+        };
+        if lookfor == 1 {
+            return 1;
+        }
+        let start = base as usize + range.start;
+        let raw = &self.mem[start..base as usize + range.end];
+        let raw_len = raw.len() as u32;
+        if lookfor == 2 || !raw.starts_with(&[0x1f, 0x8b]) {
+            self.w32(len_ptr, raw_len);
+            return start as i32;
+        }
+        let Some(size) = raw.last_chunk::<4>().copied().map(u32::from_le_bytes) else {
+            return 0;
+        };
+        let mut decoded = Vec::new();
+        let decoder = flate2::read::GzDecoder::new(raw);
+        let success = size <= HEAP_MAX_ALLOC
+            && decoder
+                .take(u64::from(size) + 1)
+                .read_to_end(&mut decoded)
+                .is_ok()
+            && decoded.len() == size as usize;
+        self.w32(len_ptr, size);
+        if success {
+            self.allocate_file_bytes(&decoded, len_ptr)
+        } else {
+            log::debug!("invalid compressed RAM package member {name:?}");
+            0
+        }
     }
 
     /// Looks up `name` in the file table seeded at boot (package members
@@ -2546,23 +3106,26 @@ impl Guest {
     /// the pack under its platform-assigned disk name, which is not a
     /// member of its own file list).
     pub fn file_lookup(&self, name: &str) -> Option<Vec<u8>> {
-        let name = name.trim_start_matches(['/', '\\']);
+        let index = self.find_file(&normalize_file_path(name), true)?;
+        Some(self.files[index].1.clone())
+    }
+
+    fn find_file(&self, name: &str, allow_basename: bool) -> Option<usize> {
         if name.is_empty() {
             return None;
         }
-        if let Some((_, data)) = self.files.iter().find(|(entry, _)| entry == name) {
-            return Some(data.clone());
+        let exact = self.files.iter().position(|(entry, _)| entry == name);
+        if exact.is_some() || !allow_basename {
+            return exact;
         }
-        if name.to_lowercase().ends_with(".mrp") {
-            if let Some((_, data)) = self.files.iter().find(|(entry, _)| entry == "app.mrp") {
-                return Some(data.clone());
-            }
+        let base = name.rsplit('/').next().unwrap_or(name);
+        if let Some(index) = self.files.iter().position(|(entry, _)| entry == base) {
+            return Some(index);
         }
-        let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-        self.files
-            .iter()
-            .find(|(entry, _)| entry.ends_with(base))
-            .map(|(_, data)| data.clone())
+        if base == name && base.to_ascii_lowercase().ends_with(".mrp") {
+            return self.files.iter().position(|(entry, _)| entry == "app.mrp");
+        }
+        None
     }
 
     /// Internal-table bridge entry points, indexed by `_mr_c_internal_table`
@@ -3237,19 +3800,19 @@ impl Guest {
                 0
             }
             0x12e => {
-                self.bi |= 0x4;
+                self.update_flags(0x4, 0);
                 0
             }
             0x12f => {
-                self.bi &= !0x4;
+                self.update_flags(0, 0x4);
                 0
             }
             0x130 => {
-                self.bi |= 0x8;
+                self.update_flags(0x8, 0);
                 0
             }
             0x131 => {
-                self.bi &= !0x8;
+                self.update_flags(0, 0x8);
                 0
             }
             0x132 => {
@@ -3273,44 +3836,16 @@ impl Guest {
                 old as i32
             }
             0xe2d if input1 == 0xb61 => {
-                self.bi |= 0x1;
+                self.update_flags(0x1, 0);
                 0
             }
             0xf51 if input1 == 0x18030 => {
-                self.bi |= 0x2;
+                self.update_flags(0x2, 0);
                 0
             }
             0xcb3 if input1 == 0x9E67A => {
-                self.bi &= !0x2;
+                self.update_flags(0, 0x2);
                 0
-            }
-            // Secondary ext load (the loader-chain flow): the ext hands the
-            // platform a buffer holding a full ext image; the runtime writes
-            // the function-table pointer at its base and executes
-            // buffer+8 with r0 = code. This mirrors the platform's
-            // `_mr_TestCom` case 800.
-            800 => {
-                // The C-level `_mr_TestCom(?, 800, buf)` reads its code via
-                // `mr_L_optint(L, 3, 0)` — no Lua frame on this path, so the
-                // platform default 0 applies.
-                let buffer = input1;
-                let code = 0u32; // mr_L_optint(L, 3, 0) platform default
-                let _ = code;
-                if buffer == 0 {
-                    return -1; // MR_FAILED
-                }
-                self.w32(buffer, TABLE_BASE);
-                let entry = buffer + 8;
-                let mut screen = crate::display::Screen::new(
-                    self.config.screen_width,
-                    self.config.screen_height,
-                );
-                let result = self
-                    .run_guest(entry, DEFAULT_INSTRUCTION_LIMIT, &mut screen)
-                    .map(|value| value as i32)
-                    .unwrap_or(-1); // MR_FAILED
-                self.refresh_screen(&mut screen);
-                result
             }
             other => {
                 warn_once(
@@ -3321,6 +3856,33 @@ impl Guest {
                     ),
                 );
                 1 // MR_IGNORE
+            }
+        }
+    }
+
+    fn load_nested_ext(&mut self, buffer: u32, screen: &mut crate::display::Screen) -> Option<i32> {
+        if buffer < EXT_BASE || buffer as usize > self.mem.len() - 12 || buffer & 3 != 0 {
+            return None;
+        }
+        let caller = self.cpu;
+        let caller_sp = caller.reg_get(caller.mode(), reg::SP);
+        let caller_base = self.ext_load_base;
+        let registration = (self.c_function, self.c_function_p);
+        self.ext_load_base = buffer;
+        self.w32(buffer, TABLE_BASE);
+        self.cpu.reg_set(self.cpu.mode(), R0, 0);
+        let result =
+            self.run_guest_with_sp(buffer + 8, caller_sp & !7, BOOT_INSTRUCTION_LIMIT, screen);
+        self.cpu = caller;
+        if !matches!(result, Ok(value) if value != u32::MAX) {
+            self.ext_load_base = caller_base;
+            (self.c_function, self.c_function_p) = registration;
+        }
+        match result {
+            Ok(value) => Some(value as i32),
+            Err(error) => {
+                log::debug!("nested ext load failed: {error}");
+                None
             }
         }
     }
@@ -3345,11 +3907,12 @@ impl Guest {
             )));
         }
         let base = addr as usize;
+        self.ext_load_base = addr;
         self.mem[base..base + ext.len()].copy_from_slice(ext);
         self.w32(addr, TABLE_BASE);
         self.cpu.reg_set(self.cpu.mode(), R0, code as u32);
         let result = self
-            .run_guest(addr + 8, DEFAULT_INSTRUCTION_LIMIT, screen)
+            .run_guest(addr + 8, BOOT_INSTRUCTION_LIMIT, screen)
             .map(|value| value as i32)?;
         self.install_ext_chunk(addr, ext.len() as u32);
         Ok(result)
@@ -3371,8 +3934,8 @@ impl Guest {
         self.w32(chunk + 0x08, self.c_function); // event
         self.w32(chunk + 0x0c, addr); // code_buf
         self.w32(chunk + 0x10, len); // code_len
-        self.w32(chunk + 0x14, 0); // var_buf
-        self.w32(chunk + 0x18, 0); // var_len
+        self.w32(chunk + 0x14, self.r32(self.c_function_p)); // var_buf
+        self.w32(chunk + 0x18, self.r32(self.c_function_p + 4)); // var_len
         self.w32(chunk + 0x1c, self.c_function_p); // global_p_buf
         self.w32(chunk + 0x20, 20); // global_p_len
         self.w32(chunk + 0x24, 1); // timer
@@ -3397,18 +3960,19 @@ impl Guest {
             )));
         }
         let base = EXT_BASE as usize;
+        self.ext_load_base = EXT_BASE;
         self.mem[base..base + ext.len()].copy_from_slice(ext);
         self.w32(EXT_BASE, TABLE_BASE);
 
         // mr_testCom(0, 0xe2d, 0xb61): the loader's flag handshake.
-        self.bi |= 0x1;
+        self.update_flags(0x1, 0);
 
         // mr_c_function_load(code): the ext compares r0 against 1 and only
         // takes the mr_c_function_new registration path when the argument
         // is 1 (observed in the reference ext's disassembly); other values
         // jump to an alternate entry.
         self.cpu.reg_set(self.cpu.mode(), R0, 1);
-        self.run_guest(EXT_BASE + 8, DEFAULT_INSTRUCTION_LIMIT, screen)?;
+        self.run_guest(EXT_BASE + 8, BOOT_INSTRUCTION_LIMIT, screen)?;
         self.install_ext_chunk(EXT_BASE, ext.len() as u32);
         if std::env::var("MRP_TRACE").is_ok() {
             eprintln!(
@@ -3423,14 +3987,33 @@ impl Guest {
         }
 
         // code 6: loader handshake with the raw ext region.
-        self.call_c_function(6, EXT_BASE, 0x7cd, DEFAULT_INSTRUCTION_LIMIT, screen)?;
+        self.call_c_function(
+            6,
+            EXT_BASE,
+            MYTHROAD_MINI_VERSION,
+            BOOT_INSTRUCTION_LIMIT,
+            screen,
+        )?;
         // code 8: application info block (id, version, sidName, reserved).
         let app_info = self.heap_malloc(16);
+        if app_info == 0 {
+            return Err(MrpError::Unsupported(
+                "app info allocation failed".to_string(),
+            ));
+        }
         self.w32(app_info, app_id);
         self.w32(app_info + 4, app_version);
-        self.call_c_function(8, app_info, 16, DEFAULT_INSTRUCTION_LIMIT, screen)?;
+        self.w32(app_info + 8, 0);
+        self.w32(app_info + 12, 0);
+        self.call_c_function(8, app_info, 16, BOOT_INSTRUCTION_LIMIT, screen)?;
         // code 0: mrc_init.
-        self.call_c_function(0, EXT_BASE, 0x7cd, DEFAULT_INSTRUCTION_LIMIT, screen)?;
+        self.call_c_function(
+            0,
+            EXT_BASE,
+            MYTHROAD_MINI_VERSION,
+            BOOT_INSTRUCTION_LIMIT,
+            screen,
+        )?;
         Ok(())
     }
 
@@ -3457,12 +4040,13 @@ impl Guest {
                 .map(|value| value as i32);
         }
         if self.c_function != 0 {
-            // mr_com_event_t { code, param0, param1 } allocated on the heap.
-            let block = self.heap_malloc(12);
-            self.w32(block, event_type as u32);
-            self.w32(block + 4, param0 as u32);
-            self.w32(block + 8, param1 as u32);
-            return self.call_c_function(1, block, 12, DEFAULT_INSTRUCTION_LIMIT, screen);
+            // Mini uses a five-word event record.
+            self.w32(EVENT_RECORD, event_type as u32);
+            self.w32(EVENT_RECORD + 4, param0 as u32);
+            self.w32(EVENT_RECORD + 8, param1 as u32);
+            self.w32(EVENT_RECORD + 12, 0);
+            self.w32(EVENT_RECORD + 16, 0);
+            return self.call_c_function(1, EVENT_RECORD, 20, DEFAULT_INSTRUCTION_LIMIT, screen);
         }
         Ok(1)
     }
@@ -3477,12 +4061,13 @@ impl Guest {
             self.c_function,
             self.timers.len()
         );
+        // SDK wrappers can initialize resources on their first timer tick.
         if self.c_function != 0 {
-            return self.call_c_function(2, 0, 0, DEFAULT_INSTRUCTION_LIMIT, screen);
+            return self.call_c_function(2, 0, 1, BOOT_INSTRUCTION_LIMIT, screen);
         }
         if self.timer_function != 0 {
             return self
-                .run_guest(self.timer_function, DEFAULT_INSTRUCTION_LIMIT, screen)
+                .run_guest(self.timer_function, BOOT_INSTRUCTION_LIMIT, screen)
                 .map(|value| value as i32);
         }
         self.send_event(1, 0, 0, screen)
@@ -3511,14 +4096,15 @@ impl Guest {
 
     pub fn timer_start(&mut self, id: i32, interval_ms: u32) {
         let interval = std::time::Duration::from_millis(interval_ms.max(1) as u64);
+        let next_fire = self.clock_now() + interval;
         if let Some(timer) = self.timers.iter_mut().find(|timer| timer.id == id) {
             timer.interval = interval;
-            timer.next_fire = std::time::Instant::now() + interval;
+            timer.next_fire = next_fire;
         } else {
             self.timers.push(GuestTimer {
                 id,
                 interval,
-                next_fire: std::time::Instant::now() + interval,
+                next_fire,
             });
         }
         // Mirror MR_TIMER_STATE_RUNNING so helper-side paths unblock.
@@ -3533,30 +4119,33 @@ impl Guest {
     }
 
     pub fn draw_point(&mut self, x: u32, y: u32, color: u32) {
-        let width = u32::from(self.config.screen_width);
-        if x < width {
-            self.w16(SCREENBUF + (y * width + x) * 2, rgb_to_565(color));
-        }
+        self.screen_put(x as i32, y as i32, rgb_to_565(color));
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn draw_rect(&mut self, x1: u32, y1: u32, x2: u32, y2: u32, r: u32, g: u32, b: u32) {
+        let Some(base) = self.framebuffer_address() else {
+            return;
+        };
         let color = rgb888_to_565(r, g, b);
         let width = u32::from(self.config.screen_width);
         let height = u32::from(self.config.screen_height);
         for y in y1.min(height)..y2.min(height) {
             for x in x1.min(width)..x2.min(width) {
-                self.w16(SCREENBUF + (y * width + x) * 2, color);
+                self.w16(base + (y * width + x) * 2, color);
             }
         }
     }
 
     pub fn fill_screenbuf(&mut self, color: u16) {
+        let Some(base) = self.framebuffer_address() else {
+            return;
+        };
         let width = u32::from(self.config.screen_width);
         let height = u32::from(self.config.screen_height);
         for y in 0..height {
             for x in 0..width {
-                self.w16(SCREENBUF + (y * width + x) * 2, color);
+                self.w16(base + (y * width + x) * 2, color);
             }
         }
     }
@@ -3573,12 +4162,16 @@ impl Guest {
     /// title bar, white background, and items with the current selection
     /// drawn in inverse video.
     pub fn render_menu(&mut self) {
+        self.uses_explicit_video = false;
+        let Some(base) = self.framebuffer_address() else {
+            return;
+        };
         let width = u32::from(self.config.screen_width);
         let height = u32::from(self.config.screen_height);
         for y in 0..height {
             for x in 0..width {
                 let color = if y < 20 { 0x001F } else { 0xFFFF };
-                self.w16(SCREENBUF + (y * width + x) * 2, color);
+                self.w16(base + (y * width + x) * 2, color);
             }
         }
         let Some(menu) = self.menu.clone() else {
@@ -3595,7 +4188,7 @@ impl Guest {
                 for y in 0..16u32 {
                     for x in 0..width {
                         let py = (row_y as u32 + y) * width + x;
-                        self.w16(SCREENBUF + py * 2, 0x001F);
+                        self.w16(base + py * 2, 0x001F);
                     }
                 }
             }
@@ -3621,28 +4214,99 @@ impl Guest {
     /// using the embedded Unicode bitmap font.
     pub fn draw_text(&mut self, text: &[u8], x: i32, y: i32, color: u16) {
         let (decoded, _, _) = encoding_rs::GBK.decode(text);
+        self.draw_decoded_text(&decoded, x, y, color);
+    }
+
+    fn draw_decoded_text(&mut self, text: &str, x: i32, y: i32, color: u16) {
         let mut cursor_x = x;
-        for ch in decoded.chars() {
+        for ch in text.chars() {
             let Some(glyph) = unifont::get_glyph(ch) else {
-                cursor_x += 8;
+                cursor_x = cursor_x.saturating_add(8);
                 continue;
             };
-            let width = glyph.get_width() as i32;
-            let s_width = u32::from(self.config.screen_width);
-            let s_height = u32::from(self.config.screen_height);
-            for row in 0..16u32 {
-                for col in 0..width {
-                    if glyph.get_pixel(col as usize, row as usize) {
-                        let px = cursor_x + col;
-                        let py = y + row as i32;
-                        if px >= 0 && py >= 0 && (px as u32) < s_width && (py as u32) < s_height {
-                            self.w16(SCREENBUF + (py as u32 * s_width + px as u32) * 2, color);
-                        }
-                    }
+            self.draw_glyph(glyph, cursor_x, y, color, i32::MAX, i32::MAX);
+            cursor_x = cursor_x.saturating_add(glyph.get_width() as i32);
+        }
+    }
+
+    fn draw_glyph(
+        &mut self,
+        glyph: &unifont::Glyph,
+        x: i32,
+        y: i32,
+        color: u16,
+        right: i32,
+        bottom: i32,
+    ) {
+        for row in 0..16 {
+            let dy = y.saturating_add(row);
+            if dy >= bottom {
+                break;
+            }
+            for col in 0..glyph.get_width() {
+                let dx = x.saturating_add(col as i32);
+                if dx >= right {
+                    break;
+                }
+                if glyph.get_pixel(col, row as usize) {
+                    self.screen_put(dx, dy, color);
                 }
             }
-            cursor_x += width;
         }
+    }
+
+    fn read_platform_text(&self, address: u32, unicode: bool) -> String {
+        if unicode {
+            let bytes = self.mem.get(address as usize..).unwrap_or_default();
+            let units = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take(512)
+                .map(|bytes| u16::from_be_bytes(*bytes))
+                .take_while(|&unit| unit != 0);
+            char::decode_utf16(units)
+                .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect()
+        } else {
+            let bytes = self.guest_cstring(address, 1024);
+            encoding_rs::GBK.decode(&bytes).0.into_owned()
+        }
+    }
+
+    fn draw_text_in_rect(&mut self) -> i32 {
+        let mode = self.cpu.mode();
+        let x = i32::from(self.cpu.reg_get(mode, R1) as i16);
+        let y = i32::from(self.cpu.reg_get(mode, R2) as i16);
+        let size = self.stack_arg(0);
+        let right = x + i32::from(size as u16);
+        let bottom = y + i32::from((size >> 16) as u16);
+        let color = self.stack_arg(1).to_le_bytes();
+        let color = rgb888_to_565(color[0].into(), color[1].into(), color[2].into());
+        let flags = self.stack_arg(2);
+        let wrap = flags & 2 != 0;
+        let text = self.read_platform_text(self.cpu.reg_get(mode, R0), flags & 1 != 0);
+        let (mut cursor_x, mut cursor_y) = (x, y);
+        let mut consumed = 0;
+        for ch in text.chars() {
+            let glyph = unifont::get_glyph(ch);
+            let width = glyph.map_or(8, |glyph| glyph.get_width() as i32);
+            if wrap && (ch == '\n' || cursor_x + width > right) {
+                cursor_x = x;
+                cursor_y += 18;
+            }
+            if cursor_y >= bottom || (!wrap && (ch == '\n' || cursor_x + width > right)) {
+                break;
+            }
+            if !matches!(ch, '\n' | '\r') {
+                if let Some(glyph) = glyph {
+                    self.draw_glyph(glyph, cursor_x, cursor_y, color, right, bottom);
+                }
+                cursor_x += width;
+            }
+            consumed += (ch.len_utf16() * 2) as i32;
+        }
+        consumed
     }
 
     /// Blits an RGB565 bitmap to the screen buffer at (x, y), with an
@@ -3655,6 +4319,9 @@ impl Guest {
         y: u32,
         transparent: Option<u16>,
     ) {
+        let Some(base) = self.framebuffer_address() else {
+            return;
+        };
         let s_width = u32::from(self.config.screen_width);
         let s_height = u32::from(self.config.screen_height);
         let bitmap_width = width;
@@ -3669,23 +4336,7 @@ impl Guest {
             let px = x + col;
             let py = y + row;
             if px < s_width && py < s_height {
-                self.w16(SCREENBUF + (py * s_width + px) * 2, *pixel);
-            }
-        }
-    }
-
-    /// Blits a rectangle of raw RGB565 pixels from guest memory at `src`.
-    pub fn blit_from_address(&mut self, src: u32, x: u32, y: u32, w: u32, h: u32) {
-        let s_width = u32::from(self.config.screen_width);
-        let s_height = u32::from(self.config.screen_height);
-        for row in 0..h {
-            for col in 0..w {
-                let px = x + col;
-                let py = y + row;
-                if px < s_width && py < s_height {
-                    let pixel = self.r16(src + (row * w + col) * 2);
-                    self.w16(SCREENBUF + (py * s_width + px) * 2, pixel);
-                }
+                self.w16(base + (py * s_width + px) * 2, *pixel);
             }
         }
     }
@@ -3702,11 +4353,37 @@ impl Guest {
 
     /// Opens a package/VFS file, returning a 1-based handle.
     pub fn file_open(&mut self, name: &str) -> Option<usize> {
-        let data = self.file_lookup(name)?;
+        let name = self.resolve_storage_path(name);
+        self.open_file(&name, true, true, false)
+    }
+
+    fn open_file(
+        &mut self,
+        name: &str,
+        readable: bool,
+        writable: bool,
+        create: bool,
+    ) -> Option<usize> {
+        if name.is_empty() || self.directories.contains(name) {
+            return None;
+        }
+        if !create {
+            self.ensure_system_font(name);
+        }
+        let file_index = match self.find_file(name, !create) {
+            Some(index) => index,
+            None if create => {
+                self.files.push((name.to_string(), Vec::new()));
+                self.dirty_files.insert(name.to_string());
+                self.files.len() - 1
+            }
+            None => return None,
+        };
         self.open_files.push(OpenFile {
-            name: name.to_string(),
-            data,
+            file_index,
             pos: 0,
+            readable,
+            writable,
             closed: false,
         });
         Some(self.open_files.len())
@@ -3714,24 +4391,36 @@ impl Guest {
 
     pub fn file_read(&mut self, handle: usize, len: usize) -> Option<Vec<u8>> {
         let file = self.open_files.get_mut(handle.wrapping_sub(1))?;
-        if file.closed {
+        if file.closed || !file.readable {
             return None;
         }
-        let remaining = file.data.len().saturating_sub(file.pos);
+        let data = &self.files[file.file_index].1;
+        let start = file.pos.min(data.len());
+        let remaining = data.len() - start;
         let count = len.min(remaining);
-        let bytes = file.data[file.pos..file.pos + count].to_vec();
+        let bytes = data[start..start + count].to_vec();
         file.pos += count;
         Some(bytes)
     }
 
     pub fn file_close(&mut self, handle: usize) {
-        if let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) {
-            file.closed = true;
+        self.close_file(handle);
+    }
+
+    fn close_file(&mut self, handle: usize) -> bool {
+        let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) else {
+            return false;
+        };
+        if file.closed {
+            return false;
         }
+        file.closed = true;
+        true
     }
 
     pub fn file_len(&self, handle: usize) -> Option<usize> {
-        Some(self.open_files.get(handle.wrapping_sub(1))?.data.len())
+        let file = self.open_files.get(handle.wrapping_sub(1))?;
+        (!file.closed).then(|| self.files[file.file_index].1.len())
     }
 
     /// Writes bytes at the current position; returns whether it landed.
@@ -3739,15 +4428,23 @@ impl Guest {
         let Some(file) = self.open_files.get_mut(handle.wrapping_sub(1)) else {
             return false;
         };
-        if file.closed {
+        if file.closed || !file.writable {
             return false;
         }
-        let end = file.pos + data.len();
-        if end > file.data.len() {
-            file.data.resize(end, 0);
+        if data.is_empty() {
+            return true;
         }
-        file.data[file.pos..end].copy_from_slice(data);
+        let end = file.pos.saturating_add(data.len());
+        if end > MEM_SIZE as usize {
+            return false;
+        }
+        let (name, bytes) = &mut self.files[file.file_index];
+        if end > bytes.len() {
+            bytes.resize(end, 0);
+        }
+        bytes[file.pos..end].copy_from_slice(data);
         file.pos = end;
+        self.dirty_files.insert(name.clone());
         true
     }
 
@@ -3760,7 +4457,7 @@ impl Guest {
         if file.closed {
             return -1;
         }
-        let len = file.data.len() as i64;
+        let len = self.files[file.file_index].1.len() as i64;
         let base = match whence {
             0 => 0,
             1 => file.pos as i64,
@@ -3782,7 +4479,19 @@ impl Guest {
 
     /// Milliseconds since the guest engine started (`mr_getTime` base).
     pub fn uptime_ms(&self) -> u32 {
-        self.started_at.elapsed().as_millis() as u32
+        self.clock_now().duration_since(self.started_at).as_millis() as u32
+    }
+
+    pub(crate) fn set_frame_time(&mut self, elapsed: Option<Duration>) {
+        self.frame_time = elapsed;
+    }
+
+    pub(crate) fn clock_now(&self) -> Instant {
+        self.frame_time
+            .and_then(|elapsed| self.started_at.checked_add(elapsed))
+            .unwrap_or_else(Instant::now)
+            .checked_add(self.sleep_elapsed)
+            .unwrap_or(self.started_at)
     }
 
     /// Names of files the guest created or modified (not package members).
@@ -3858,24 +4567,31 @@ impl Guest {
         Ok(count)
     }
 
+    fn framebuffer_address(&self) -> Option<u32> {
+        let base = self.get_data(DataSlot::ScreenBufPtr);
+        let size = u64::from(self.config.screen_width) * u64::from(self.config.screen_height) * 2;
+        (base != 0 && u64::from(base) + size <= self.mem.len() as u64).then_some(base)
+    }
+
     /// Screen-buffer plot with clipping.
     fn screen_put(&mut self, x: i32, y: i32, color: u16) {
         let width = u32::from(self.config.screen_width);
         let height = u32::from(self.config.screen_height);
         if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
+            let Some(base) = self.framebuffer_address() else {
+                return;
+            };
             let (x, y) = (x as u32, y as u32);
-            self.w16(SCREENBUF + (y * width + x) * 2, color);
+            self.w16(base + (y * width + x) * 2, color);
         }
     }
 
     /// Reads a guest byte range (bounds-safe).
     pub fn guest_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
         let base = addr as usize;
-        if base + len <= self.mem.len() {
-            Some(self.mem[base..base + len].to_vec())
-        } else {
-            None
-        }
+        self.mem
+            .get(base..base.checked_add(len)?)
+            .map(<[u8]>::to_vec)
     }
 
     /// The platform `mr_drawBitmap`: a 16bpp blit with the bitmap raster
@@ -3896,7 +4612,9 @@ impl Guest {
         sy: i32,
         mw: u32,
     ) {
-        let _ = (sx, sy, mw); // source-window form only used by tile draws
+        let Some(base) = self.framebuffer_address() else {
+            return;
+        };
         let screen_w = u32::from(self.config.screen_width) as i32;
         let screen_h = u32::from(self.config.screen_height) as i32;
         let (w, h) = (w as i32, h as i32);
@@ -3909,24 +4627,34 @@ impl Guest {
         let bitmap_rop = rop & 0x3FF;
         let rotate = (rop >> 11) & 0x3;
         let flip = (rop >> 11) & 0x4 != 0;
+        let bitmap_stride = if mw == 0 { w } else { mw as i32 };
         let screen_stride = u32::from(self.config.screen_width);
-        let dst = |x: u32, y: u32| SCREENBUF + (y * screen_stride + x) * 2;
+        let dst = |x: u32, y: u32| base + (y * screen_stride + x) * 2;
         for dy in min_y..max_y {
             for dx in min_x..max_x {
                 let lx = dx - x;
                 let ly = dy - y;
-                let src = if sprite_path && rotate != 0 {
-                    let (row, col) = match (rotate, flip) {
-                        (1, false) => (lx, w - 1 - ly),
-                        (1, true) => (h - 1 - lx, w - 1 - ly),
-                        (2, false) => (h - 1 - ly, w - 1 - lx),
-                        (2, true) => (ly, lx),
-                        (3, false) => (w - 1 - lx, ly),
-                        _ => (lx, ly),
+                let (row, col, stride) = if sprite_path {
+                    let (row, col) = match (bitmap_rop, rotate, flip) {
+                        (2, 0, true) => (h - 1 - ly, lx),
+                        (2, 1, false) => (lx, w - 1 - ly),
+                        (2, 1, true) => (h - 1 - lx, w - 1 - ly),
+                        (2, 2, false) => (h - 1 - ly, w - 1 - lx),
+                        (2, 2, true) => (ly, w - 1 - lx),
+                        (2, 3, false) => (h - 1 - lx, ly),
+                        (2, 3, true) => (lx, ly),
+                        _ => (ly, lx),
                     };
-                    p + ((row.max(0) * w + col.max(0)) as u32) * 2
+                    (row, col, w)
                 } else {
-                    p + ((ly.max(0) * w + lx.max(0)) as u32) * 2
+                    (ly + sy, lx + sx, bitmap_stride)
+                };
+                if row < 0 || col < 0 || col >= stride {
+                    continue;
+                }
+                let offset = (i64::from(row) * i64::from(stride) + i64::from(col)) * 2;
+                let Ok(src) = u32::try_from(i64::from(p) + offset) else {
+                    continue;
                 };
                 let value = self.r16(src);
                 let under = self.r16(dst(dx as u32, dy as u32));
@@ -4144,12 +4872,15 @@ impl Guest {
 
     /// Bresenham line into the screen buffer (clipped per pixel).
     pub fn draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: u16) {
+        let Some(base) = self.framebuffer_address() else {
+            return;
+        };
         let width = u32::from(self.config.screen_width);
         let height = u32::from(self.config.screen_height);
         let plot = |guest: &mut Self, x: i32, y: i32| {
             if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
                 let (x, y) = (x as u32, y as u32);
-                guest.w16(SCREENBUF + (y * width + x) * 2, color);
+                guest.w16(base + (y * width + x) * 2, color);
             }
         };
         let dx = (x2 - x1).abs();
@@ -4266,18 +4997,40 @@ fn rgb_to_565(value: u32) -> u16 {
     rgb888_to_565(r, g, b)
 }
 
-/// Gunzip (or raw-zlib) decompression for `mr_unzip`; accepts both
-/// containers since the platform calls sites pass gzip members.
-fn gunzip_any(data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
-    if data.len() >= 2 && data[0] == 0x1F && data[1] == 0x8B {
-        let mut decoder = flate2::read::GzDecoder::new(data);
-        let mut out = Vec::new();
-        return decoder.read_to_end(&mut out).ok().map(|_| out);
+fn ram_entry_range(package: &[u8], name: &[u8]) -> Option<std::ops::Range<usize>> {
+    fn take_u32(bytes: &[u8], start: usize) -> Option<usize> {
+        Some(u32::from_le_bytes(bytes.get(start..)?.first_chunk::<4>().copied()?) as usize)
     }
-    let mut decoder = flate2::read::ZlibDecoder::new(data);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok().map(|_| out)
+
+    let mut index = 8usize.checked_add(take_u32(package, 4)?)?;
+    while index < package.len() {
+        let name_len = take_u32(package, index)?;
+        if !(1..=512).contains(&name_len) {
+            return None;
+        }
+        let name_start = index + 4;
+        let name_end = name_start + name_len;
+        let entry_name = package.get(name_start..name_end)?;
+        let data_len = take_u32(package, name_end)?;
+        let data_start = name_end + 4;
+        let data_end = data_start.checked_add(data_len)?;
+        if data_end > package.len() {
+            return None;
+        }
+        let entry_name = entry_name.split(|&byte| byte == 0).next()?;
+        if entry_name == name {
+            return Some(data_start..data_end);
+        }
+        index = data_end;
+    }
+    None
+}
+
+fn normalize_file_path(path: &str) -> String {
+    path.split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub fn rgb888_to_565(r: u32, g: u32, b: u32) -> u16 {
@@ -4320,6 +5073,449 @@ pub fn local_datetime() -> (u32, u32, u32, u32, u32, u32) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_asset_tables_have_separate_storage_and_a_screen_entry() {
+        let config = GuestConfig {
+            screen_width: 240,
+            screen_height: 400,
+            ..GuestConfig::default()
+        };
+        let mut guest = Guest::new(config, Vec::new());
+        let bitmaps = guest.r32(TABLE_BASE + 95 * 4);
+        let screen_bitmap = bitmaps + 30 * 16;
+        assert_eq!(guest.r16(screen_bitmap), 240);
+        assert_eq!(guest.r16(screen_bitmap + 2), 400);
+        assert_eq!(guest.r32(screen_bitmap + 4), 240 * 400 * 2);
+        assert_eq!(guest.r32(screen_bitmap + 12), SCREENBUF);
+
+        for (offset, size) in [
+            (95, 31 * 16),
+            (96, 3 * 20),
+            (97, 3 * 4),
+            (98, 5 * 12),
+            (99, 10 * 2),
+        ] {
+            let address = guest.r32(TABLE_BASE + offset * 4);
+            guest.w8(address + size - 1, offset as u8);
+        }
+        assert_eq!(
+            guest.r32(TABLE_BASE + 100 * 4),
+            guest.data_slot_address(DataSlot::PackFilename)
+        );
+        assert_eq!(
+            guest.guest_cstring(guest.r32(TABLE_BASE + 100 * 4), 128),
+            b"app.mrp"
+        );
+        let tables: std::collections::HashSet<_> = (95..100)
+            .map(|slot| guest.r32(TABLE_BASE + slot * 4))
+            .collect();
+        assert_eq!(tables.len(), 5);
+    }
+
+    #[test]
+    fn native_text_conversion_returns_big_endian_ucs2_and_byte_lengths() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+        let err = STACK_TOP - 8;
+        let size = STACK_TOP - 4;
+        let source = guest.scratch_buffer(b"A\xd6\xd0");
+        guest.cpu.reg_set(mode, R0, source);
+        guest.cpu.reg_set(mode, R1, err);
+        guest.cpu.reg_set(mode, R2, size);
+        let encoded = guest.dispatch(132, &mut screen) as u32;
+        assert_ne!(encoded, 0);
+        assert_eq!(guest.r32(err), u32::MAX);
+        assert_eq!(guest.r32(size), 6);
+        assert_eq!(
+            guest.guest_bytes(encoded, 6).unwrap(),
+            [0, 0x41, 0x4e, 0x2d, 0, 0]
+        );
+        guest.cpu.reg_set(mode, R0, encoded);
+        assert_eq!(guest.dispatch(126, &mut screen), 4);
+    }
+
+    #[test]
+    fn native_read_file_follows_the_active_ram_package() {
+        use std::io::Write;
+
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![("abc".to_string(), b"disk package".to_vec())],
+        );
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(b"RAM package").unwrap();
+        let payload = gzip.finish().unwrap();
+        let mut package = b"MRPG\x04\x00\x00\x00".to_vec();
+        package.extend_from_slice(&[0; 4]);
+        package.extend_from_slice(&4u32.to_le_bytes());
+        package.extend_from_slice(b"abc\0");
+        package.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let payload_offset = package.len() as u32;
+        package.extend_from_slice(&payload);
+        let address = guest.heap_malloc(package.len() as u32);
+        guest.mem[address as usize..address as usize + package.len()].copy_from_slice(&package);
+        let mode = guest.cpu.mode();
+        guest.cpu.reg_set(mode, R1, 2);
+        guest.cpu.reg_set(mode, R2, address);
+        guest.cpu.reg_set(mode, R3, package.len() as u32);
+        assert_eq!(guest.dispatch(131, &mut screen), 0);
+        guest.store_guest_string(DataSlot::PackFilename, "$");
+
+        let name = guest.scratch_buffer(b"abc");
+        let length = STACK_TOP - 4;
+        guest.cpu.reg_set(mode, R0, name);
+        guest.cpu.reg_set(mode, R1, length);
+        guest.cpu.reg_set(mode, R2, 1);
+        assert_eq!(guest.dispatch(125, &mut screen), 1);
+        guest.cpu.reg_set(mode, R2, 2);
+        assert_eq!(
+            guest.dispatch(125, &mut screen) as u32,
+            address + payload_offset
+        );
+        assert_eq!(guest.r32(length), payload.len() as u32);
+        guest.cpu.reg_set(mode, R2, 0);
+        let unpacked = guest.dispatch(125, &mut screen) as u32;
+        assert_eq!(
+            guest
+                .guest_bytes(unpacked, guest.r32(length) as usize)
+                .unwrap(),
+            b"RAM package"
+        );
+    }
+
+    #[test]
+    fn native_read_file_uses_the_selected_disk_archive() {
+        let mut archive = vec![0; 240];
+        let entry_start = archive.len();
+        let bytes = b"inner file";
+        let name = b"data\0";
+        let end = entry_start + 4 + name.len() + 12;
+        archive.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        archive.extend_from_slice(name);
+        archive.extend_from_slice(&(end as u32).to_le_bytes());
+        archive.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        archive.extend_from_slice(&[0; 4]);
+        archive.extend_from_slice(bytes);
+        let length = archive.len() as u32;
+        archive[..4].copy_from_slice(b"MRPG");
+        archive[4..8].copy_from_slice(&((end - 8) as u32).to_le_bytes());
+        archive[8..12].copy_from_slice(&length.to_le_bytes());
+        archive[12..16].copy_from_slice(&(entry_start as u32).to_le_bytes());
+
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![
+                ("data".into(), b"outer file".to_vec()),
+                ("plugins/demo.mrp".into(), archive),
+            ],
+        );
+        guest.store_guest_string(DataSlot::PackFilename, "plugins/demo.mrp");
+        let mut screen = crate::display::Screen::new(240, 320);
+        let input = guest.scratch_buffer(b"data");
+        let mode = guest.cpu.mode();
+        let size = STACK_TOP - 4;
+        guest.cpu.reg_set(mode, R0, input);
+        guest.cpu.reg_set(mode, R1, size);
+        guest.cpu.reg_set(mode, R2, 0);
+        let output = guest.dispatch(125, &mut screen) as u32;
+        assert_eq!(
+            guest.guest_bytes(output, guest.r32(size) as usize).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn native_string_comparison_distinguishes_resource_names_with_a_common_prefix() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let short = HEAP_BASE + 32;
+        let long = HEAP_BASE + 64;
+        guest.mem[short as usize..short as usize + 3].copy_from_slice(b"m\0z");
+        guest.mem[long as usize..long as usize + 8].copy_from_slice(b"minimap\0");
+        let mode = guest.cpu.mode();
+        guest.cpu.reg_set(mode, R0, short);
+        guest.cpu.reg_set(mode, R1, long);
+        assert!(guest.dispatch_mem_string(10) < 0);
+        guest.cpu.reg_set(mode, R2, 1);
+        assert_eq!(guest.dispatch_mem_string(11), 0);
+        guest.cpu.reg_set(mode, R2, 2);
+        assert!(guest.dispatch_mem_string(11) < 0);
+        guest.mem[long as usize..long as usize + 3].copy_from_slice(b"m\0a");
+        guest.cpu.reg_set(mode, R2, 3);
+        assert_eq!(guest.dispatch_mem_string(10), 0);
+        assert!(guest.dispatch_mem_string(9) > 0);
+    }
+
+    #[test]
+    fn native_platform_allocates_and_releases_requested_extended_ram() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::default();
+        let mode = guest.cpu.mode();
+        let output = STACK_TOP - 16;
+        let length = output + 4;
+        let requested = 10 * 1024 * 1024;
+        guest.w32(output + 8, length);
+        guest.cpu.reg_set(mode, reg::SP, output + 8);
+        guest.cpu.reg_set(mode, R0, 1014);
+        guest.cpu.reg_set(mode, R2, requested);
+        guest.cpu.reg_set(mode, R3, output);
+        assert_eq!(guest.dispatch(38, &mut screen), 0);
+        let address = guest.r32(output);
+        assert_ne!(address, 0);
+        assert_eq!(guest.r32(length), requested);
+        guest.w32(address + requested - 4, 0xaa55aa55);
+        guest.cpu.reg_set(mode, R0, 1015);
+        guest.cpu.reg_set(mode, R1, address);
+        assert_eq!(guest.dispatch(38, &mut screen), 0);
+        assert_eq!(guest.heap_malloc(128), HEAP_BASE);
+        guest.cpu.reg_set(mode, R0, 1014);
+        assert_eq!(guest.dispatch(38, &mut screen), 0);
+        assert_eq!(guest.r32(output), address);
+    }
+
+    #[test]
+    fn offline_transport_initializes_but_cannot_connect() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::default();
+        let mode = guest.cpu.mode();
+        assert_eq!(guest.dispatch(81, &mut screen), 0);
+        let socket = guest.dispatch(84, &mut screen);
+        assert!(socket > 0);
+        guest.cpu.reg_set(mode, R0, socket as u32);
+        assert_eq!(guest.dispatch(85, &mut screen), -1);
+        assert_eq!(guest.dispatch(86, &mut screen), 0);
+        assert_eq!(guest.dispatch(86, &mut screen), -1);
+        assert_eq!(guest.dispatch(82, &mut screen), 0);
+    }
+
+    #[test]
+    #[ignore = "executes a long native timer; run in release mode"]
+    fn native_timer_finishes_first_use_initialization() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::default();
+        guest.timer_function = EXT_BASE;
+        for (index, instruction) in [
+            0xe3a00401, // mov r0, #0x01000000
+            0xe2500001, // subs r0, r0, #1
+            0x1afffffd, // bne to subs
+            0xe3a00007, // mov r0, #7
+            0xe12fff1e, // bx lr
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            guest.w32(EXT_BASE + index as u32 * 4, instruction);
+        }
+        assert_eq!(guest.fire_timer(&mut screen).unwrap(), 7);
+    }
+
+    #[test]
+    fn native_allocator_tracks_a_guest_extension_into_display_scratch() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let tail = SCREENBUF + SCREENBUF_SIZE;
+        let end = tail + 64;
+        guest.set_data(DataSlot::LgMemEnd, end);
+        guest.set_data(DataSlot::LgMemLeft, HEAP_LEN + 64);
+        guest.set_data(DataSlot::LgMemFree, tail - HEAP_BASE);
+        guest.w32(tail, 0);
+        guest.w32(tail + 4, 64);
+        guest.w32(HEAP_BASE, end - HEAP_BASE);
+        assert_eq!(guest.heap_malloc(48), tail);
+        assert_eq!(guest.r32(HEAP_BASE), end - HEAP_BASE);
+        guest.heap_free(tail, 48);
+        assert_eq!(guest.heap_malloc(64), HEAP_BASE);
+        assert_eq!(guest.heap_malloc(HEAP_LEN - 64), HEAP_BASE + 64);
+        assert_eq!(guest.heap_malloc(56), tail);
+        assert_eq!(guest.r32(tail + 56), end - HEAP_BASE);
+    }
+
+    #[test]
+    fn guest_writing_a_released_buffer_cannot_damage_future_allocations() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let first = guest.heap_malloc(32);
+        let second = guest.heap_malloc(32);
+        guest.heap_free(first, 32);
+        guest.w32(first, 0);
+        guest.w32(first + 4, 0);
+
+        assert_eq!(guest.heap_malloc(8), first);
+        assert_eq!(guest.r32(first + 8), second + 32 - HEAP_BASE);
+        assert_eq!(guest.r32(first + 12), 24);
+        assert_eq!(guest.heap_malloc(24), first + 8);
+    }
+
+    #[test]
+    fn native_allocator_uses_a_block_temporarily_published_by_the_guest() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let first = guest.heap_malloc(64);
+        let _reserved = guest.heap_malloc(64);
+        let sentinel = guest.data_slot_address(DataSlot::LgMemFree);
+        let old_head = guest.r32(sentinel);
+        let old_left = guest.get_data(DataSlot::LgMemLeft);
+
+        // The unpacker temporarily adds its output region to the device heap.
+        guest.w32(first, old_head);
+        guest.w32(first + 4, 64);
+        guest.w32(sentinel, 0);
+        guest.set_data(DataSlot::LgMemLeft, old_left + 64);
+        assert_eq!(guest.heap_malloc(64), first);
+        assert_eq!(guest.r32(sentinel), old_head);
+        assert_eq!(guest.get_data(DataSlot::LgMemLeft), old_left);
+    }
+
+    #[test]
+    fn native_platform_queries_report_keypad_device_and_glyph_metrics() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+        guest.cpu.reg_set(mode, R0, 1205);
+        assert_eq!(guest.dispatch(37, &mut screen), 1000);
+        guest.cpu.reg_set(mode, R0, 1206);
+        assert_eq!(guest.dispatch(37, &mut screen), 1000);
+        guest.cpu.reg_set(mode, R0, 1218);
+        assert_eq!(guest.dispatch(37, &mut screen), 1001);
+
+        let output = STACK_TOP - 32;
+        let length = output + 4;
+        let sp = output + 8;
+        guest.cpu.reg_set(mode, R0, 1201);
+        guest.cpu.reg_set(mode, R3, output);
+        guest.cpu.reg_set(mode, reg::SP, sp);
+        guest.w32(sp, length);
+        assert_eq!(guest.dispatch(38, &mut screen), 0);
+        assert_eq!(guest.r32(length), 4);
+        assert_eq!(
+            guest.guest_bytes(guest.r32(output), 4).unwrap(),
+            [16, 16, 8, 16]
+        );
+    }
+
+    #[test]
+    fn native_drawing_follows_the_current_framebuffer_pointer() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let replacement = guest.heap_malloc(SCREENBUF_SIZE);
+        guest.set_data(DataSlot::ScreenBufPtr, replacement);
+        guest.draw_point(5, 6, 0x00ff00);
+        guest.draw_rect(0, 1, 3, 2, 255, 0, 0);
+        let mut screen = crate::display::Screen::new(240, 320);
+        guest.refresh_screen(&mut screen);
+        assert_eq!(screen.pixels()[6 * 240 + 5], 0x07e0);
+        assert_eq!(screen.pixels()[240 + 2], 0xf800);
+        assert_eq!(guest.r16(SCREENBUF + 2 * (6 * 240 + 5)), 0);
+    }
+
+    #[test]
+    fn native_present_accepts_the_null_framebuffer_alias() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+        guest.w16(SCREENBUF, 0x1234);
+        guest.cpu.reg_set(mode, R0, 0);
+        guest.cpu.reg_set(mode, R1, 0);
+        guest.cpu.reg_set(mode, R2, 0);
+        guest.cpu.reg_set(mode, R3, 240);
+        guest.cpu.reg_set(mode, reg::SP, STACK_TOP - 4);
+        guest.w32(STACK_TOP - 4, 320);
+        assert_eq!(guest.dispatch(29, &mut screen), 0);
+        assert_eq!(screen.pixels()[0], 0x1234);
+    }
+
+    #[test]
+    fn native_filesystem_provides_a_unicode_bitmap_font() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+        let path = guest.scratch_buffer(b"system/gb12.uc2");
+        guest.cpu.reg_set(mode, R0, path);
+        assert_eq!(guest.dispatch(42, &mut screen), 1);
+
+        let file = guest.file_data("system/gb12.uc2").unwrap();
+        assert_eq!(file.len(), 65536 * 18);
+        let cjk = 0x4e2d * 18;
+        assert!(file[cjk..cjk + 18].iter().any(|&byte| byte != 0));
+        let space = usize::from(b' ') * 18;
+        assert!(file[space..space + 18].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn native_storage_root_switch_keeps_drive_paths_distinct() {
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![
+                ("disk/a/saves/state.dat".to_string(), vec![1]),
+                ("disk/b/saves/state.dat".to_string(), vec![2]),
+            ],
+        );
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+        let sp = STACK_TOP - 32;
+        guest.cpu.reg_set(mode, reg::SP, sp);
+        guest.cpu.reg_set(mode, R0, 1204);
+        guest.cpu.reg_set(mode, R3, sp + 4);
+        guest.w32(sp, sp + 8);
+        for (root, bytes) in [
+            (b"A:/saves/".as_slice(), [1]),
+            (b"B:/saves/".as_slice(), [2]),
+        ] {
+            let input = guest.scratch_buffer(root);
+            guest.cpu.reg_set(mode, R1, input);
+            guest.cpu.reg_set(mode, R2, root.len() as u32);
+            assert_eq!(guest.dispatch(38, &mut screen), 0);
+            let handle = guest.file_open("state.dat").unwrap();
+            assert_eq!(guest.file_read(handle, 1).unwrap(), bytes);
+        }
+        let query = guest.scratch_buffer(b"Y");
+        guest.cpu.reg_set(mode, R1, query);
+        guest.cpu.reg_set(mode, R2, 1);
+        assert_eq!(guest.dispatch(38, &mut screen), 0);
+        assert_eq!(guest.r32(sp + 8), 9);
+        assert_eq!(guest.guest_cstring(guest.r32(sp + 4), 32), b"b:/saves/");
+    }
+
+    #[test]
+    fn synchronous_guest_timer_poll_advances_with_a_fixed_frame_clock() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::new(240, 320);
+        guest.set_frame_time(Some(Duration::ZERO));
+        for (index, instruction) in [
+            0xe92d4000, // push {lr}
+            0xe59f400c, // ldr r4, [pc, #12]
+            0xe12fff34, // blx r4
+            0xe3500000, // cmp r0, #0
+            0x0afffffc, // beq to blx
+            0xe8bd8000, // pop {pc}
+            BRIDGE_BASE + 33 * 4,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            guest.w32(EXT_BASE + index as u32 * 4, instruction);
+        }
+        assert_eq!(guest.run_guest(EXT_BASE, 50_000, &mut screen).unwrap(), 1);
+        assert_eq!(guest.uptime_ms(), 1);
+    }
+
+    #[test]
+    fn native_allocator_preserves_the_order_of_guest_spliced_blocks() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let low = guest.heap_malloc(64);
+        let high = guest.heap_malloc(64);
+        let sentinel = guest.data_slot_address(DataSlot::LgMemFree);
+        let old_head = guest.r32(sentinel);
+        let old_left = guest.get_data(DataSlot::LgMemLeft);
+
+        guest.w32(high, low - HEAP_BASE);
+        guest.w32(high + 4, 64);
+        guest.w32(low, old_head);
+        guest.w32(low + 4, 64);
+        guest.w32(sentinel, high - HEAP_BASE);
+        guest.set_data(DataSlot::LgMemLeft, old_left + 128);
+        assert_eq!(guest.heap_malloc(64), high);
+        assert_eq!(guest.heap_malloc(64), low);
+        assert_eq!(guest.r32(sentinel), old_head);
+    }
+
     fn guest() -> Guest {
         Guest::new(GuestConfig::default(), Vec::new())
     }
@@ -4350,6 +5546,243 @@ mod tests {
             g.r32(g.data_slot_address(DataSlot::ScreenBufPtr)),
             SCREENBUF
         );
+    }
+
+    #[test]
+    fn native_file_calls_report_status_and_read_from_seek_position() {
+        let mut g = Guest::new(
+            GuestConfig::default(),
+            vec![("sample.dat".to_string(), b"abcdef".to_vec())],
+        );
+        let name = g.scratch_buffer(b"sample.dat");
+        let handle = g.file_open("sample.dat").expect("file exists") as u32;
+        let mode = g.cpu.mode();
+        g.cpu.reg_set(mode, R0, handle);
+        g.cpu.reg_set(mode, R1, 2);
+        g.cpu.reg_set(mode, R2, 0);
+        assert_eq!(g.swi_seek(), 0);
+        g.cpu.reg_set(mode, R1, HEAP_BASE);
+        g.cpu.reg_set(mode, R2, 2);
+        assert_eq!(g.swi_read(), 2);
+        assert_eq!(g.guest_bytes(HEAP_BASE, 2).unwrap(), b"cd");
+
+        g.cpu.reg_set(mode, R0, name);
+        assert_eq!(g.swi_get_len(), 6);
+        assert_eq!(g.swi_info(), 1);
+    }
+
+    #[test]
+    fn native_file_write_is_visible_to_other_handles() {
+        let mut g = guest();
+        let path = g.scratch_buffer(b"cache\\data.bin");
+        let mode = g.cpu.mode();
+        g.cpu.reg_set(mode, R0, path);
+        g.cpu.reg_set(mode, R1, 12);
+        let writer = g.swi_open() as u32;
+        assert_ne!(writer, 0);
+        let path = g.scratch_buffer(b"cache/data.bin");
+        g.cpu.reg_set(mode, R0, path);
+        g.cpu.reg_set(mode, R1, 1);
+        let reader = g.swi_open() as u32;
+        assert_ne!(reader, 0);
+
+        let bytes = g.scratch_buffer(b"frame");
+        g.cpu.reg_set(mode, R0, writer);
+        g.cpu.reg_set(mode, R1, bytes);
+        g.cpu.reg_set(mode, R2, 5);
+        assert_eq!(g.swi_write(), 5);
+        g.cpu.reg_set(mode, R0, reader);
+        g.cpu.reg_set(mode, R1, HEAP_BASE + 16);
+        assert_eq!(g.swi_read(), 5);
+        assert_eq!(g.guest_bytes(HEAP_BASE + 16, 5).unwrap(), b"frame");
+        g.cpu.reg_set(mode, R0, writer);
+        assert_eq!(g.swi_close(), 0);
+        assert_eq!(g.swi_write(), -1);
+        assert_eq!(g.file_data("cache/data.bin"), Some(&b"frame"[..]));
+    }
+
+    #[test]
+    fn native_realloc_uses_old_and_new_lengths() {
+        let mut g = guest();
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = g.cpu.mode();
+        let old = g.heap_malloc(8);
+        let neighbor = g.heap_malloc(8);
+        g.w32(old, 0xdead_beef);
+        g.w32(neighbor, 0xbadc_0ffe);
+        g.cpu.reg_set(mode, R0, old);
+        g.cpu.reg_set(mode, R1, 8);
+        g.cpu.reg_set(mode, R2, 24);
+        let new = g.dispatch(2, &mut screen) as u32;
+        assert_eq!(g.r32(new), 0xdead_beef);
+        assert_eq!(g.heap_left, HEAP_LEN - 32);
+        assert_eq!(g.r32(neighbor), 0xbadc_0ffe);
+        assert_eq!(g.heap_malloc(8), old);
+    }
+
+    #[test]
+    fn native_datetime_does_not_overwrite_adjacent_stack_words() {
+        let mut g = guest();
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = g.cpu.mode();
+        let datetime = STACK_TOP - 16;
+        g.w32(datetime + 8, 0xa5a5_a5a5);
+        g.w32(datetime + 12, 0x0008_0123);
+        g.cpu.reg_set(mode, R0, datetime);
+        assert_eq!(g.dispatch(34, &mut screen), 0);
+        assert!((2000..=2100).contains(&g.r16(datetime)));
+        assert!((1..=12).contains(&g.r8(datetime + 2)));
+        assert_eq!(g.r32(datetime + 8), 0xa5a5_a5a5);
+        assert_eq!(g.r32(datetime + 12), 0x0008_0123);
+    }
+
+    #[test]
+    fn guest_internal_table_exposes_timer_and_inflate_state() {
+        use std::io::Write;
+
+        let mut g = guest();
+        let table = g.r32(TABLE_BASE + 23 * 4);
+        assert_eq!(table, INTERNAL_TABLE_BASE);
+        let timer_state = g.r32(table + 5 * 4);
+        g.timer_start(0, 20);
+        assert_eq!(g.r32(timer_state), 1);
+        g.timer_stop(0);
+        assert_eq!(g.r32(timer_state), 0);
+
+        let payload = b"resource data";
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(payload).unwrap();
+        let compressed = gzip.finish().unwrap();
+        let input = g.heap_malloc(compressed.len() as u32);
+        let output = g.heap_malloc(payload.len() as u32);
+        g.mem[input as usize..input as usize + compressed.len()].copy_from_slice(&compressed);
+        for (index, value) in [(7, input), (8, output), (9, 10)] {
+            g.w32(g.r32(table + index * 4), value);
+        }
+        let mut screen = crate::display::Screen::new(240, 320);
+        assert_eq!(g.dispatch(141, &mut screen), 0);
+        assert_eq!(g.guest_bytes(output, payload.len()).unwrap(), payload);
+        assert_eq!(g.r32(g.r32(table + 9 * 4)), compressed.len() as u32);
+        assert_eq!(g.r32(g.r32(table + 10 * 4)), payload.len() as u32);
+    }
+
+    #[test]
+    fn native_present_reads_full_stride_without_writing_guest_pixels() {
+        let mut g = Guest::new(
+            GuestConfig {
+                screen_width: 4,
+                screen_height: 3,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let mut screen = crate::display::Screen::new(4, 3);
+        let format = g.cpu.mode();
+        let pixels = [
+            0xf800, 0x07e0, 0x001f, 0, 0x1082, 0x39e7, 0xffff, 0, 0, 0, 0, 0,
+        ];
+        for (index, pixel) in pixels.iter().enumerate() {
+            g.w16(SCREENBUF + index as u32 * 2, *pixel);
+        }
+        g.cpu.reg_set(format, R0, SCREENBUF);
+        g.cpu.reg_set(format, R1, 1);
+        g.cpu.reg_set(format, R2, 1);
+        g.cpu.reg_set(format, R3, 2);
+        g.cpu.reg_set(format, reg::SP, STACK_TOP - 16);
+        g.w32(STACK_TOP - 16, 1);
+        assert_eq!(g.dispatch(29, &mut screen), 0);
+        assert_eq!(screen.pixels(), pixels);
+        assert_eq!(g.r16(SCREENBUF + (4 + 1) * 2), 0x39e7);
+        // Native applications may clear or reuse their source after submitting it.
+        g.fill_screenbuf(0);
+        g.present_frame(&mut screen);
+        assert_eq!(screen.pixels(), pixels);
+    }
+
+    #[test]
+    fn nested_native_loader_returns_to_the_guest_caller() {
+        let mut g = guest();
+        g.w32(EXT_BASE, 0xe52d_e004); // push {lr}
+        g.w32(EXT_BASE + 4, 0xe12f_ff33); // blx r3
+        g.w32(EXT_BASE + 8, 0xe280_0001); // add r0, r0, #1
+        g.w32(EXT_BASE + 12, 0xe49d_f004); // pop {pc}
+        g.w32(HEAP_BASE + 8, 0xe280_0007); // add r0, r0, #7
+        g.w32(HEAP_BASE + 12, 0xe12f_ff1e); // bx lr
+        let mode = g.cpu.mode();
+        g.cpu.reg_set(mode, R0, 100);
+        g.cpu.reg_set(mode, R1, 800);
+        g.cpu.reg_set(mode, R2, HEAP_BASE);
+        g.cpu.reg_set(mode, R3, BRIDGE_BASE + 130 * 4);
+        let mut screen = crate::display::Screen::new(240, 320);
+        assert_eq!(g.run_guest(EXT_BASE, 16, &mut screen).unwrap(), 8);
+        assert_eq!(g.r32(HEAP_BASE), TABLE_BASE);
+    }
+
+    #[test]
+    fn native_callbacks_receive_mini_event_sizes() {
+        let mut g = guest();
+        g.c_function = EXT_BASE;
+        g.c_function_p = g.heap_malloc(20);
+        assert_ne!(g.heap_malloc(HEAP_LEN - 40), 0);
+        g.w32(EXT_BASE, 0xe1a0_0003); // mov r0, r3
+        g.w32(EXT_BASE + 4, 0xe12f_ff1e); // bx lr
+        let mut screen = crate::display::Screen::new(240, 320);
+        assert_eq!(g.send_event(0, 20, 0, &mut screen).unwrap(), 20);
+        assert_eq!(g.fire_timer(&mut screen).unwrap(), 1);
+    }
+
+    #[test]
+    fn native_point_and_rectangle_use_sdk_color_and_dimensions() {
+        let mut g = guest();
+        let mode = g.cpu.mode();
+        let mut screen = crate::display::Screen::new(240, 320);
+        g.cpu.reg_set(mode, R0, 4);
+        g.cpu.reg_set(mode, R1, 6);
+        g.cpu.reg_set(mode, R2, 0xf800);
+        assert_eq!(g.dispatch(119, &mut screen), 0);
+        assert_eq!(g.r16(SCREENBUF + (6 * 240 + 4) * 2), 0xf800);
+
+        g.cpu.reg_set(mode, R0, u32::MAX);
+        g.cpu.reg_set(mode, R1, 1);
+        g.cpu.reg_set(mode, R2, 4);
+        g.cpu.reg_set(mode, R3, 2);
+        let sp = STACK_TOP - 16;
+        g.cpu.reg_set(mode, reg::SP, sp);
+        g.w32(sp, 0);
+        g.w32(sp + 4, 255);
+        g.w32(sp + 8, 0);
+        assert_eq!(g.dispatch(122, &mut screen), 0);
+        assert_eq!(g.r16(SCREENBUF + (2 * 240 + 2) * 2), 0x07e0);
+        assert_eq!(g.r16(SCREENBUF + (2 * 240 + 3) * 2), 0);
+    }
+
+    #[test]
+    fn native_bitmap_copy_observes_source_stride_and_offsets() {
+        let mut g = guest();
+        let src = HEAP_BASE + 32;
+        for index in 0..12 {
+            g.w16(src + index * 2, index as u16 + 1);
+        }
+        g.draw_bitmap_rop(src, 0, 0, 2, 2, 2, 0, 1, 1, 4);
+        assert_eq!(g.r32(SCREENBUF), 0x0007_0006);
+        assert_eq!(g.r32(SCREENBUF + 480), 0x000b_000a);
+    }
+
+    #[test]
+    fn native_text_handles_big_endian_unicode_and_register_color() {
+        let mut g = guest();
+        let mode = g.cpu.mode();
+        let address = HEAP_BASE + 32;
+        g.w32(address, 0x0000_4100); // UCS-2BE 'A' followed by NUL
+        g.cpu.reg_set(mode, R0, address);
+        g.cpu.reg_set(mode, R3, 255);
+        let sp = STACK_TOP - 16;
+        g.cpu.reg_set(mode, reg::SP, sp);
+        g.w32(sp + 8, 1);
+        let mut screen = crate::display::Screen::new(240, 320);
+        assert_eq!(g.dispatch(123, &mut screen), 0);
+        g.refresh_screen(&mut screen);
+        assert!(screen.pixels().contains(&0xf800));
     }
 
     #[test]
@@ -4405,6 +5838,29 @@ mod tests {
     fn heap_exhaustion_is_reported_as_zero() {
         let mut g = guest();
         assert_eq!(g.heap_malloc(HEAP_MAX_ALLOC + 1), 0);
+    }
+
+    #[test]
+    fn heap_double_free_preserves_the_free_list() {
+        let mut g = guest();
+        let first = g.heap_malloc(16);
+        let second = g.heap_malloc(16);
+        g.heap_free(first, 16);
+        let free_bytes = g.heap_left;
+        g.heap_free(first, 16);
+        assert_eq!(g.heap_left, free_bytes);
+        assert_eq!(g.heap_malloc(16), first);
+        assert_eq!(g.heap_malloc(16), second + 16);
+    }
+
+    #[test]
+    fn heap_keeps_an_eight_byte_remainder_reusable() {
+        let mut g = guest();
+        let first = g.heap_malloc(16);
+        let _next = g.heap_malloc(16);
+        g.heap_free(first, 16);
+        assert_eq!(g.heap_malloc(8), first);
+        assert_eq!(g.heap_malloc(8), first + 8);
     }
 
     #[test]
@@ -4785,6 +6241,28 @@ mod tests {
             g.run_guest(EXT_BASE, 1_000, &mut screen),
             Err(MrpError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn arm_doubleword_transfers_leave_signed_byte_loads_intact() {
+        let mut g = guest();
+        let data = HEAP_BASE + 32;
+        g.w32(data + 8, 0x1122_80ff);
+        g.w32(data + 12, 0x5566_7788);
+        g.w32(EXT_BASE, 0xe1d2_50d9); // ldrsb r5, [r2, #9]
+        g.w32(EXT_BASE + 4, 0xe1e2_00d8); // ldrd r0, r1, [r2, #8]!
+        g.w32(EXT_BASE + 8, 0xe1a2_00f3); // strd r0, r1, [r2, r3]!
+        g.w32(EXT_BASE + 12, 0xe12f_ff1e); // bx lr
+        let mode = g.cpu.mode();
+        g.cpu.reg_set(mode, R2, data);
+        g.cpu.reg_set(mode, R3, 16);
+        let mut screen = crate::display::Screen::new(240, 320);
+        assert_eq!(g.run_guest(EXT_BASE, 16, &mut screen).unwrap(), 0x1122_80ff);
+        assert_eq!(g.cpu.reg_get(mode, 5), 0xffff_ff80);
+        assert_eq!(g.cpu.reg_get(mode, R1), 0x5566_7788);
+        assert_eq!(g.cpu.reg_get(mode, R2), data + 24);
+        assert_eq!(g.r32(data + 24), 0x1122_80ff);
+        assert_eq!(g.r32(data + 28), 0x5566_7788);
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub mod bit {
         fn set_bit(self, off: u8, len: u8, val: u32) -> u32 {
             debug_assert!(off < 32 && len < 32);
             let mask = ((1u32 << len) - 1) << off;
-            ((std::u32::MAX - mask) & self) | ((val << off) & mask)
+            ((u32::MAX - mask) & self) | ((val << off) & mask)
         }
 
         #[inline]

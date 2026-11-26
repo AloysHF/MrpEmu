@@ -29,4 +29,4 @@ needs_fullpath = "true"
 disk_control = "false"
 is_experimental = "true"
 
-description = "MrpEmu runs Sky-mobi mythroad (MRP) .mrp applications with a 240x320 RGB565 screen and feature-phone key mapping. The MiniJ VM is not implemented yet."
+description = "MrpEmu runs Sky-mobi mythroad (MRP) applications with MiniJ and native ARM/Thumb execution, RGB565 video, and phone keypad controls."

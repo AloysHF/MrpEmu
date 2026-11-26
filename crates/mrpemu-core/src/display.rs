@@ -6,6 +6,45 @@ pub const DEFAULT_WIDTH: u16 = 240;
 /// Screen height of the most common MRP phone variant (240×320 portrait).
 pub const DEFAULT_HEIGHT: u16 = 320;
 
+/// Bitmap files consumed by applications that open the phone's font directly.
+pub(crate) fn system_font(path: &str) -> Option<&'static [u8]> {
+    use std::sync::OnceLock;
+    static SMALL: OnceLock<Vec<u8>> = OnceLock::new();
+    static MEDIUM: OnceLock<Vec<u8>> = OnceLock::new();
+    match path {
+        "system/gb12.uc2" => Some(SMALL.get_or_init(|| make_system_font(12))),
+        "system/gb16.uc2" => Some(MEDIUM.get_or_init(|| make_system_font(16))),
+        _ => None,
+    }
+}
+
+fn make_system_font(size: usize) -> Vec<u8> {
+    // UC2 stores an MSB-first cell at a fixed offset for each UCS-2 code point.
+    let cell_bytes = size * size / 8;
+    let mut data = vec![0; 65536 * cell_bytes];
+    for (character, glyph) in unifont::enumerate_glyphs() {
+        let code = character as usize;
+        if code >= 65536 {
+            break;
+        }
+        if character.is_control() || character.is_whitespace() {
+            continue;
+        }
+        let cell = code * cell_bytes;
+        let width = if code < 128 { size / 2 } else { size };
+        let stride = width.max(8);
+        for y in 0..size {
+            for x in 0..width {
+                if glyph.get_pixel(x * glyph.get_width() / width, y * 16 / size) {
+                    let bit = y * stride + x;
+                    data[cell + bit / 8] |= 0x80 >> (bit % 8);
+                }
+            }
+        }
+    }
+    data
+}
+
 /// A 16-bit RGB565 framebuffer in row-major order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Screen {

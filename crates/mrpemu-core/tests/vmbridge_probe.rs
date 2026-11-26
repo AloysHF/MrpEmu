@@ -48,7 +48,7 @@ fn probe_vmbridge() {
     }
     eprintln!("[final] nonblank_best={nonblank_best}");
     // Coarse ASCII map: 60x40 downsample of the RGB565 screen.
-    let (w, h) = (240usize, 320usize);
+    let w = 240usize;
     let px = machine.screen().pixels();
     for row in 0..40 {
         let mut line = String::new();
