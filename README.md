@@ -60,7 +60,6 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
 - **Additional audio formats and libretro audio output**
 - **Save states**
 - **Network services** — the platform's online features
-- **EmulatorJS browser core** — the WebAssembly build of the libretro core
 
 ## Usage
 
@@ -98,9 +97,15 @@ the current feature set.
 
 ### Browser Mode (EmulatorJS)
 
-Planned: the same libretro core compiled to WebAssembly for
-[EmulatorJS](https://emulatorjs.org). See
-[EmulatorJS Core](docs/EmulatorJS-Core.md) for the target pipeline.
+The project site hosts a browser player at
+<https://AloysHF.github.io/MrpEmu/play.html>. It runs a local `.mrp` file
+through the WASM libretro core with [EmulatorJS](https://emulatorjs.org).
+Files stay in the browser and are never uploaded. Application coverage is
+still limited, so not every package runs.
+
+The Pages workflow fetches the pinned EmulatorJS runtime and the
+`mrpemu-emulatorjs.zip` core from the rolling `nightly-build` release. See
+[EmulatorJS Core](docs/EmulatorJS-Core.md) to host the core in your own page.
 
 ## Building
 
@@ -129,7 +134,7 @@ before placing it in RetroArch's `cores/` directory.
 For Android cross-compilation, see [Android Libretro Core](docs/Android-Libretro-Core.md).
 For iOS, see [iOS Libretro Core](docs/iOS-Libretro-Core.md).
 
-### EmulatorJS Core (Browser, planned)
+### EmulatorJS Core (Browser)
 
 The EmulatorJS bundles need an activated emsdk, `p7zip`, and a nightly
 toolchain that can rebuild std:
@@ -187,17 +192,6 @@ See [Game Compatibility](docs/Game-Compatibility.md) for the verification
 criteria and the captured 105-title hot-game table with screenshots.
 The project website mirrors that table as a filterable gallery at
 <https://AloysHF.github.io/MrpEmu/#gallery>.
-
-## Browser Mode (EmulatorJS)
-
-The website provides an experimental browser player at
-<https://AloysHF.github.io/MrpEmu/play.html>. It loads a local `.mrp` file
-through a blob URL and runs it with the WASM libretro core; no game data is
-uploaded or hosted. Browser application support is still experimental and
-not every package runs. The Pages workflow fetches the pinned EmulatorJS runtime
-and the `mrpemu-emulatorjs.zip` core from the rolling `nightly-build` release,
-so the player tracks `master`. See [EmulatorJS Core](docs/EmulatorJS-Core.md)
-for embedding details.
 
 To regenerate the site's compatibility manifest after editing the table, run
 `python scripts/generate-site-data.py`. The generated

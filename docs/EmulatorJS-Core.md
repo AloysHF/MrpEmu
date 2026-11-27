@@ -6,18 +6,12 @@ compiled for `wasm32-unknown-emscripten`, linked against the
 `EmulatorJS/RetroArch` fork, and packaged as the `<core>-wasm.data` bundles
 that an EmulatorJS page loads at runtime.
 
-> **Status: planned / experimental.** The WebAssembly pipeline is described
-> here, but MrpEmu is in scaffold stage: the core cannot execute applications
-> yet, so a browser build is not usable today. See
-> [Architecture](architecture.md#current-implementation-status).
-
 ## Project player
 
 `site/play.html` is a complete example page. It sets `EJS_core = "mrpemu"`,
 loads a user-selected `.mrp` through a blob URL and uses `data/` as
 `EJS_pathtodata`. The published player lives at
-<https://AloysHF.github.io/MrpEmu/play.html>; the page labels the core
-experimental because application coverage in the browser is still limited.
+<https://AloysHF.github.io/MrpEmu/play.html>.
 
 `.github/workflows/pages.yml` deploys `site/` at the repository root and
 fetches the pinned EmulatorJS runtime plus the `mrpemu-emulatorjs.zip` core
