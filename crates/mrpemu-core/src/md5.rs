@@ -171,7 +171,8 @@ impl Md5 {
 
 /// One-shot MD5 digest.
 pub fn md5(data: &[u8]) -> [u8; 16] {
-    let mut md5 = Md5::new();
+    // Implements the MRP guest API digest; MD5 is required for compatibility.
+    let mut md5 = Md5::new(); // NOSONAR
     md5.update(data);
     md5.finish()
 }

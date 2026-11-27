@@ -2289,7 +2289,8 @@ impl Guest {
             }
             113 => {
                 let state = self.cpu.reg_get(self.cpu.mode(), R0);
-                self.md5_contexts.insert(state, crate::md5::Md5::new());
+                // MRP syscall 113 uses MD5 as a platform API digest, not for security.
+                self.md5_contexts.insert(state, crate::md5::Md5::new()); // NOSONAR
                 MR_SUCCESS
             }
             114 => {
