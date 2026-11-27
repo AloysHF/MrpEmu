@@ -30,7 +30,7 @@ unifont = "1.1"           # Embedded Unicode bitmap font (GBK/CJK glyph renderin
 clap = { version = "4", features = ["derive"] }  # CLI argument parsing (standalone)
 minifb = "0.29"           # Window creation and pixel rendering (standalone)
 env_logger = "0.11"       # Log output to stderr (standalone)
-cpal = "0.15"             # Pure-Rust audio output (standalone)
+cpal = "0.18"             # Pure-Rust audio output (standalone)
 image = { version = "0.25", default-features = false, features = ["png"] } # Screenshot encoding (standalone)
 
 [profile.release]
