@@ -39,15 +39,15 @@ jobs:
         run: |
           EJS_DATA="https://cdn.emulatorjs.org/${EJS_VERSION}/data"
           mkdir -p site/data/compression
-          curl --fail --silent --show-error "$EJS_DATA/loader.js" -o site/data/loader.js
-          curl --fail --silent --show-error "$EJS_DATA/emulator.min.zip" -o "$RUNNER_TEMP/emulatorjs-runtime.zip"
+          curl -fsSL "$EJS_DATA/loader.js" -o site/data/loader.js
+          curl -fsSL "$EJS_DATA/emulator.min.zip" -o "$RUNNER_TEMP/emulatorjs-runtime.zip"
           unzip -oq "$RUNNER_TEMP/emulatorjs-runtime.zip" -d site/data
           # The runtime archive omits these; the core reports "Network Error"
           # without them when a game bundle needs decompression.
-          curl --fail --silent --show-error "$EJS_DATA/compression/extract7z.js" -o site/data/compression/extract7z.js
-          curl --fail --silent --show-error "$EJS_DATA/compression/extractzip.js" -o site/data/compression/extractzip.js
+          curl -fsSL "$EJS_DATA/compression/extract7z.js" -o site/data/compression/extract7z.js
+          curl -fsSL "$EJS_DATA/compression/extractzip.js" -o site/data/compression/extractzip.js
           mkdir -p site/data/localization
-          curl --fail --silent --show-error "$EJS_DATA/localization/zh-CN.json" -o site/data/localization/zh-CN.json
+          curl -fsSL "$EJS_DATA/localization/zh-CN.json" -o site/data/localization/zh-CN.json
 
       - name: Fetch MrpEmu EmulatorJS core
         id: core
