@@ -85,12 +85,12 @@ impl CpalSink {
             .context("audio device has no default output configuration")?;
         eprintln!(
             "audio: output device '{}' ({} Hz, {} channels)",
-            device.name()?,
-            config.sample_rate().0,
+            device,
+            config.sample_rate(),
             config.channels()
         );
         let device_config = DeviceConfig {
-            rate: config.sample_rate().0 as f64,
+            rate: config.sample_rate() as f64,
             channels: config.channels() as usize,
         };
         let shared = Arc::new(Mutex::new(Shared {
@@ -100,7 +100,7 @@ impl CpalSink {
         let callback_shared = Arc::clone(&shared);
         let stream = device
             .build_output_stream(
-                &config.clone().into(),
+                config.config(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     mix_callback(data, &callback_shared);
                 },
