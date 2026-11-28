@@ -5998,11 +5998,11 @@ mod tests {
             "../../tmp/mrpemu/sdcard/mythroad/test.mrp",
             "../../tmp/vmrp/wasm/dist/fs/mythroad/dsm_gm.mrp",
             "../../tmp/vmrp/wasm/dist/fs/mythroad/mpc.mrp",
-            "../../tmp/scratch/Maze.mrp",
+            "../../tmp/work/Maze.mrp",
             "../../tmp/vmrp/mrc/asm/asm.mrp",
             "../../tmp/vmrp/wasm/dist/fs/mythroad/ydqtwo.mrp",
         ];
-        let _ = std::fs::create_dir_all("../../tmp/scratch/survey");
+        let _ = std::fs::create_dir_all("../../tmp/work/survey");
         // SURVEY_ONLY=<substring> restricts the run to matching samples.
         let only = std::env::var("SURVEY_ONLY").ok();
         for sample in &samples {
@@ -6076,7 +6076,7 @@ mod tests {
                 slots.join(" "),
                 missing
             );
-            write_screen_bmp(&machine, &format!("../../tmp/scratch/survey/{stem}.bmp"));
+            write_screen_bmp(&machine, &format!("../../tmp/work/survey/{stem}.bmp"));
         }
     }
 
@@ -6086,7 +6086,7 @@ mod tests {
     #[ignore = "requires the local reference corpus under tmp/"]
     fn maze_slot_trace() {
         let _ = env_logger::try_init();
-        let mut machine = crate::emulator::MrpMachine::from_path("../../tmp/scratch/Maze.mrp")
+        let mut machine = crate::emulator::MrpMachine::from_path("../../tmp/work/Maze.mrp")
             .expect("Maze.mrp must load");
         for frame in 0..400 {
             machine.run_frame();
@@ -6166,7 +6166,7 @@ mod tests {
             }
             bmp.resize(bmp.len() + padding as usize, 0);
         }
-        let _ = std::fs::write("../../tmp/scratch/maze_screen.bmp", &bmp);
+        let _ = std::fs::write("../../tmp/work/maze_screen.bmp", &bmp);
         let _ = machine.missing_globals();
     }
 
@@ -6180,7 +6180,7 @@ mod tests {
             "../../tmp/mrpemu/sdcard/mythroad/test.mrp",
             "../../tmp/vmrp/wasm/dist/fs/mythroad/dsm_gm.mrp",
             "../../tmp/vmrp/wasm/dist/fs/mythroad/mpc.mrp",
-            "../../tmp/scratch/Maze.mrp",
+            "../../tmp/work/Maze.mrp",
             "../../tmp/vmrp/mrc/asm/asm.mrp",
             "../../tmp/vmrp/wasm/dist/fs/mythroad/ydqtwo.mrp",
         ];
