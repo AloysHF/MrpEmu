@@ -18,6 +18,7 @@ use std::{
 use ffi::*;
 use mrpemu_core::audio::AudioPlayer;
 use mrpemu_core::emulator::FRAME_RATE;
+use mrpemu_core::save_state;
 use mrpemu_core::{MrpKey, MrpMachine};
 
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -507,6 +508,24 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
             }
         }
 
+        // Per-game persistence directory: guest-created files (save data,
+        // configs) live here and reload with the content on the next run.
+        let environment = core().callbacks.environment;
+        let mut save_dir: *const c_char = ptr::null();
+        if call_environment(
+            environment,
+            ENVIRONMENT_GET_SAVE_DIRECTORY,
+            ptr::from_mut(&mut save_dir).cast(),
+        ) && !save_dir.is_null()
+        {
+            let save_directory = PathBuf::from(
+                unsafe { CStr::from_ptr(save_dir) }
+                    .to_string_lossy()
+                    .as_ref(),
+            );
+            emulator.set_persist_dir(save_directory);
+        }
+
         let mut core = core();
         let mut pixel_format = PIXEL_FORMAT_RGB565;
         if !call_environment(
@@ -541,6 +560,11 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
 pub extern "C" fn retro_unload_game() {
     guard((), || {
         let mut core = core();
+        if let Some(emulator) = core.emulator.as_mut() {
+            if let Err(error) = emulator.flush_persistence() {
+                log::warn!("persistence flush failed: {error}");
+            }
+        }
         core.emulator = None;
         core.audio = None;
         core.content.clear();
@@ -563,23 +587,72 @@ pub extern "C" fn retro_load_game_special(
 
 #[no_mangle]
 pub extern "C" fn retro_serialize_size() -> usize {
-    // Save states arrive together with the VM; reporting zero keeps frontends
-    // from offering broken state support.
-    guard(0, || 0)
+    // The machine snapshot travels in a fixed-capacity buffer so the
+    // frontend can allocate once; guest memory dominates the payload.
+    guard(0, || save_state::SERIALIZED_SIZE)
 }
 
 #[no_mangle]
 /// # Safety
 /// `data` must be null or point to writable storage of at least `size` bytes.
-pub unsafe extern "C" fn retro_serialize(_data: *mut c_void, _size: usize) -> bool {
-    guard(false, || false)
+pub unsafe extern "C" fn retro_serialize(data: *mut c_void, size: usize) -> bool {
+    guard(false, || {
+        let mut core = core();
+        let Some(emulator) = core.emulator.as_mut() else {
+            return false;
+        };
+        if size < save_state::SERIALIZED_SIZE || data.is_null() {
+            log::error!("save-state buffer too small: {size}");
+            return false;
+        }
+        let buffer = unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), size) };
+        match save_state::encode_machine(emulator, buffer) {
+            Ok(()) => {
+                // Persisted guest files ride along with every state save so
+                // the on-disk save data stays current.
+                if let Some(error) = emulator.flush_persistence().err() {
+                    log::warn!("persistence flush failed: {error}");
+                }
+                true
+            }
+            Err(error) => {
+                log::error!("failed to encode save state: {error}");
+                false
+            }
+        }
+    })
 }
 
 #[no_mangle]
 /// # Safety
 /// `data` must be null or point to readable storage of at least `size` bytes.
-pub unsafe extern "C" fn retro_unserialize(_data: *const c_void, _size: usize) -> bool {
-    guard(false, || false)
+pub unsafe extern "C" fn retro_unserialize(data: *const c_void, size: usize) -> bool {
+    guard(false, || {
+        let audio = core().audio.clone();
+        let mut core = core();
+        let Some(emulator) = core.emulator.as_mut() else {
+            return false;
+        };
+        if data.is_null() || size == 0 {
+            return false;
+        }
+        let buffer = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size) };
+        let crc = save_state::content_crc32(emulator);
+        let mut restored = match save_state::decode_machine(buffer, crc) {
+            Ok(restored) => restored,
+            Err(error) => {
+                log::error!("failed to restore save state: {error}");
+                return false;
+            }
+        };
+        // The snapshot parks the discarding sink; reconnect the live player.
+        if let Some(audio) = audio {
+            restored.set_audio_sink(Box::new(audio));
+        }
+        *emulator = restored;
+        log::info!("save state restored");
+        true
+    })
 }
 
 #[no_mangle]
