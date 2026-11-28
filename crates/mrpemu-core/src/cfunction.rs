@@ -4684,33 +4684,62 @@ impl Guest {
     }
 
     /// Loads files from `dir` into the guest file table (overriding any
-    /// same-named entries). Returns the number of files loaded.
+    /// same-named entries). Mirrors [`Guest::flush_persistence`]: the
+    /// directory tree maps onto guest paths with `/` separators, so files
+    /// written to nested host directories restore under their original
+    /// guest names. Returns the number of files loaded.
     pub fn load_persistence(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {
         let mut count = 0usize;
+        Self::walk_persistence(self, dir, "", &mut count);
+        Ok(count)
+    }
+
+    fn walk_persistence(guest: &mut Guest, dir: &std::path::Path, prefix: &str, count: &mut usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
-            return Ok(0);
+            return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.is_empty() || name.contains("..") {
                 continue;
             }
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
+            let guest_path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.is_dir() {
+                // Register every ancestor segment so guest lookups see the
+                // same directory layout they wrote.
+                let mut segment = String::new();
+                for part in guest_path.split('/') {
+                    if !segment.is_empty() {
+                        segment.push('/');
+                    }
+                    segment.push_str(part);
+                    guest.directories.insert(segment.clone());
+                }
+                Self::walk_persistence(guest, &path, &guest_path, count);
+                continue;
+            }
             let Ok(data) = std::fs::read(&path) else {
                 continue;
             };
-            if let Some(existing) = self.files.iter_mut().find(|(entry, _)| *entry == name) {
+            // The guest may hold the same file under backslash separators;
+            // update that twin first so existing handles stay coherent.
+            let twin = guest_path.replace('/', "\\");
+            let existing = guest
+                .files
+                .iter_mut()
+                .find(|(entry, _)| *entry == guest_path || *entry == twin);
+            if let Some(existing) = existing {
                 existing.1 = data;
             } else {
-                self.files.push((name, data));
+                guest.files.push((guest_path.clone(), data));
             }
-            count += 1;
+            *count += 1;
         }
-        Ok(count)
     }
 
     fn framebuffer_address(&self) -> Option<u32> {
@@ -6632,5 +6661,124 @@ mod tests {
             matches!(result, Ok(42)),
             "fall through past the failed blxne, got {result:?}"
         );
+    }
+
+    /// Writes `data` into a guest file through the public file API so the
+    /// dirty tracking behaves like a real `mr_write` session.
+    fn write_guest_file(guest: &mut Guest, name: &str, data: &[u8]) {
+        let handle = guest.file_open(name).expect("open seeded file");
+        assert!(guest.file_write(handle, data), "write {name}");
+        guest.file_close(handle);
+    }
+
+    fn temp_persistence_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mrpemu-persist-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create persistence dir");
+        dir
+    }
+
+    #[test]
+    fn persistence_flush_and_load_roundtrips_top_level_files() {
+        let dir = temp_persistence_dir("top");
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![("save0.sav".to_string(), b"old".to_vec())],
+        );
+        write_guest_file(&mut guest, "save0.sav", b"progress-v1");
+        assert_eq!(guest.flush_persistence(&dir).expect("flush"), 1);
+        assert_eq!(
+            std::fs::read(dir.join("save0.sav")).unwrap(),
+            b"progress-v1"
+        );
+
+        let mut restored = Guest::new(
+            GuestConfig::default(),
+            vec![("myapp/save0.sav".to_string(), b"old".to_vec())],
+        );
+        assert_eq!(restored.load_persistence(&dir).expect("load"), 1);
+        let data = restored
+            .files
+            .iter()
+            .find(|(name, _)| name == "save0.sav")
+            .map(|(_, data)| data.clone())
+            .expect("restored save0.sav");
+        assert_eq!(data, b"progress-v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_roundtrips_nested_directories() {
+        let dir = temp_persistence_dir("nested");
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![("gymls/save.dat".to_string(), b"seed".to_vec())],
+        );
+        // The guest writes through the nested path it created at runtime.
+        write_guest_file(&mut guest, "gymls/save.dat", b"nested-progress");
+        assert_eq!(guest.flush_persistence(&dir).expect("flush"), 1);
+        assert!(dir.join("gymls").join("save.dat").is_file());
+
+        let mut restored = Guest::new(
+            GuestConfig::default(),
+            vec![("gymls/save.dat".to_string(), b"seed".to_vec())],
+        );
+        assert_eq!(restored.load_persistence(&dir).expect("load"), 1);
+        assert!(
+            restored.directories.contains("gymls"),
+            "load registers the directory segment"
+        );
+        let data = restored
+            .files
+            .iter()
+            .find(|(name, _)| name == "gymls/save.dat")
+            .map(|(_, data)| data.clone())
+            .expect("restored nested file under its original guest path");
+        assert_eq!(data, b"nested-progress");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_load_updates_backslash_named_twin() {
+        let dir = temp_persistence_dir("twin");
+        // Flush a forward-slash name, then restore into a guest whose file
+        // table carries the backslash twin a game may have created before a
+        // path normalization fix. The load must update the twin in place
+        // instead of adding a second entry.
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![("app/data.cfg".to_string(), b"stale".to_vec())],
+        );
+        write_guest_file(&mut guest, "app/data.cfg", b"cfg-v2");
+        assert_eq!(guest.flush_persistence(&dir).expect("flush"), 1);
+
+        let mut restored = Guest::new(
+            GuestConfig::default(),
+            vec![("app\\data.cfg".to_string(), b"stale".to_vec())],
+        );
+        assert_eq!(restored.load_persistence(&dir).expect("load"), 1);
+        let updated = restored
+            .files
+            .iter()
+            .find(|(name, _)| name == "app\\data.cfg")
+            .map(|(_, data)| data.clone())
+            .expect("backslash twin updated in place");
+        assert_eq!(updated, b"cfg-v2");
+        assert!(
+            !restored
+                .files
+                .iter()
+                .any(|(name, _)| name == "app/data.cfg"),
+            "no duplicate forward-slash entry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_load_of_missing_dir_is_empty() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let missing = std::env::temp_dir().join("mrpemu-persist-does-not-exist");
+        assert_eq!(guest.load_persistence(&missing).expect("load"), 0);
+        assert!(guest.files.is_empty());
     }
 }

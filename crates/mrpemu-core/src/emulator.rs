@@ -223,6 +223,17 @@ impl MrpMachine {
                 guest.files.push((path.to_string(), bytes.to_vec()));
             }
         }
+        // Restore previously persisted guest files ahead of the boot so the
+        // application sees its save data from the first frame.
+        if let Some(dir) = self.persist_dir.clone() {
+            match guest.load_persistence(&dir) {
+                Ok(count) if count > 0 => {
+                    log::debug!("persistence: restored {count} files from {}", dir.display());
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("persistence: load failed: {error}"),
+            }
+        }
         if let Some(sink) = self.pending_audio_sink.take() {
             guest.audio_sink = sink;
         }
