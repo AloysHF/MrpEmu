@@ -39,6 +39,14 @@ pub struct MrpMachine {
     /// reinstall their device backend after a snapshot restore.
     #[serde(skip)]
     pending_audio_sink: Option<Box<dyn crate::audio::AudioSink>>,
+    /// Playback volume in percent (0-100); travels with snapshots and
+    /// re-applies to every newly created guest's sink.
+    #[serde(default = "default_volume")]
+    volume: u32,
+}
+
+fn default_volume() -> u32 {
+    100
 }
 
 impl MrpMachine {
@@ -57,6 +65,7 @@ impl MrpMachine {
             last_keys: BTreeSet::new(),
             last_touch: TouchState::default(),
             persist_dir: None,
+            volume: 100,
             resolution: (240, 320),
             pending_audio_sink: None,
         };
@@ -267,6 +276,24 @@ impl MrpMachine {
         if let Some(sink) = self.pending_audio_sink.take() {
             guest.audio_sink = sink;
         }
+        guest.audio_sink.set_volume(self.volume);
+    }
+
+    /// Sets the playback volume in percent (0-100). Applies to the live
+    /// guest's sink now and to every guest created afterwards.
+    pub fn set_volume(&mut self, volume: u32) {
+        let volume = volume.min(100);
+        self.volume = volume;
+        if let Some(bridge) = self.script.as_mut() {
+            if let Some(guest) = bridge.vm.guest.as_mut() {
+                guest.audio_sink.set_volume(volume);
+            }
+        }
+    }
+
+    /// Returns the playback volume in percent.
+    pub fn volume(&self) -> u32 {
+        self.volume
     }
 
     /// Installs the audio sink used by the guest's `mr_playSound` /

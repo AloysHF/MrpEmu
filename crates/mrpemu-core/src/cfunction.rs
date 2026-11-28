@@ -2060,6 +2060,13 @@ impl Guest {
                         self.w32(length, 4);
                         MR_SUCCESS
                     }
+                    // 1302: set the playback volume (mrpoid reference
+                    // semantics: the first argument is the level).
+                    1302 => {
+                        let volume = self.cpu.reg_get(mode, R1).min(100);
+                        self.audio_sink.set_volume(volume);
+                        MR_SUCCESS
+                    }
                     1204 => self.swi_storage_root(),
                     1222 | 1223 => MR_SUCCESS, // The virtual LCD remains readable.
                     _ => {
@@ -6796,6 +6803,30 @@ mod tests {
             "no duplicate forward-slash entry"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn platex_volume_command_sets_the_sink_volume() {
+        use crate::audio::AudioPlayer;
+        use crate::cfunction::R1;
+
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let player = AudioPlayer::new(48_000);
+        guest.audio_sink = Box::new(player.clone());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+
+        for (param, expected) in [(30u32, 30u32), (250, 100)] {
+            guest.cpu.reg_set(mode, R0, 1302); // mr_platEx code: set volume
+            guest.cpu.reg_set(mode, R1, param);
+            assert_eq!(guest.dispatch(38, &mut screen), 0, "platEx succeeds");
+            assert_eq!(player.volume(), expected, "volume clamped to 0-100");
+        }
+        // 0 mutes entirely.
+        guest.cpu.reg_set(mode, R0, 1302);
+        guest.cpu.reg_set(mode, R1, 0);
+        assert_eq!(guest.dispatch(38, &mut screen), 0);
+        assert_eq!(player.volume(), 0);
     }
 
     #[test]

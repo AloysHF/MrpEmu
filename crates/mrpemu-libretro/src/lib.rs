@@ -4,6 +4,7 @@
 //! and the frontend pointer drives a single touch on the screen.
 
 pub mod ffi;
+mod options;
 
 #[cfg(not(target_os = "emscripten"))]
 use std::ffi::CString;
@@ -120,7 +121,11 @@ fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
 #[cfg(not(target_os = "emscripten"))]
 static FRONTEND_LOG: Mutex<LogCallback> = Mutex::new(None);
 
-fn call_environment(callback: EnvironmentCallback, command: u32, data: *mut c_void) -> bool {
+pub(crate) fn call_environment(
+    callback: EnvironmentCallback,
+    command: u32,
+    data: *mut c_void,
+) -> bool {
     callback.is_some_and(|callback| unsafe { callback(command, data) })
 }
 
@@ -344,6 +349,8 @@ pub extern "C" fn retro_set_controller_port_device(_port: u32, _device: u32) {
 pub extern "C" fn retro_reset() {
     guard((), || {
         let mut core = core();
+        let environment = core.callbacks.environment;
+        let applied = options::read_core_options(environment);
         let Some(emulator) = core.emulator.as_ref() else {
             return;
         };
@@ -354,6 +361,9 @@ pub extern "C" fn retro_reset() {
                 emulator.set_resolution(width, height);
                 *emulator.vfs_mut() = files;
                 core.set_emulator(emulator);
+                if let Some(emulator) = core.emulator.as_mut() {
+                    emulator.set_volume(applied.volume);
+                }
             }
             Err(error) => log::error!("reset failed: {error}"),
         }
@@ -377,6 +387,13 @@ pub extern "C" fn retro_run() {
 
         if let Some(poll) = callbacks.input_poll {
             unsafe { poll() };
+        }
+
+        let environment = callbacks.environment;
+        if options::core_options_changed(environment) {
+            let applied = options::read_core_options(environment);
+            emulator.set_volume(applied.volume);
+            log::info!("core options applied: volume={}", applied.volume);
         }
 
         update_input(emulator, |device, id| {
@@ -543,6 +560,12 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
             descriptors.as_ptr().cast_mut().cast(),
         );
 
+        let environment = core.callbacks.environment;
+        if options::set_core_options(environment) {
+            let applied = options::read_core_options(environment);
+            log::info!("core options applied: volume={}", applied.volume);
+        }
+
         log::info!(
             "loaded {:?} (internal name {:?}, app id {}) from {}",
             emulator.header().display_name,
@@ -551,7 +574,12 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
             path.display()
         );
         core.content = emulator.package().to_vec();
+        let environment = core.callbacks.environment;
+        let applied = options::read_core_options(environment);
         core.set_emulator(emulator);
+        if let Some(emulator) = core.emulator.as_mut() {
+            emulator.set_volume(applied.volume);
+        }
         true
     })
 }
@@ -767,6 +795,50 @@ mod tests {
         assert_eq!(
             std::mem::take(&mut *CAPTURE.lock().unwrap()),
             [[0; 2]; 1600]
+        );
+
+        // Machine-level volume scales the submitted PCM through the same
+        // libretro path a frontend hears: 50% halves, 0 mutes, and 100
+        // restores the untouched samples.
+        {
+            let mut core = core();
+            core.audio.as_mut().unwrap().play_bgm(
+                PcmClip {
+                    sample_rate: AUDIO_SAMPLE_RATE,
+                    channels: 2,
+                    samples: vec![1234, -2345],
+                },
+                true,
+            );
+            core.audio.as_mut().unwrap().set_volume(50);
+        }
+        retro_run();
+        let frames = std::mem::take(&mut *CAPTURE.lock().unwrap());
+        assert!(
+            frames
+                .iter()
+                .all(|&[left, right]| (left == 616 || left == 617)
+                    && (right == -1173 || right == -1172)),
+            "50% volume: {frames:?}"
+        );
+
+        {
+            let mut core = core();
+            core.audio.as_mut().unwrap().set_volume(0);
+        }
+        retro_run();
+        assert!(std::mem::take(&mut *CAPTURE.lock().unwrap())
+            .iter()
+            .all(|&frame| frame == [0, 0]));
+
+        {
+            let mut core = core();
+            core.audio.as_mut().unwrap().set_volume(100);
+        }
+        retro_run();
+        assert_eq!(
+            std::mem::take(&mut *CAPTURE.lock().unwrap()),
+            [[1234, -2345]; 1600]
         );
 
         retro_unload_game();

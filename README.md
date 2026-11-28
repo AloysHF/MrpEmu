@@ -52,6 +52,9 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
   a per-game directory (desktop `--persist-dir`, RetroArch save directory),
   and the full machine state snapshots to a versioned, checksummed save
   state on every frontend
+- **Playback volume** — `--volume` on desktop and an Audio Volume core
+  option in RetroArch scale every decoded format live (the guest's own
+  volume command routes into the same control)
 - **Standalone desktop frontend** — the `mrpemu` binary (minifb): loads an
   `.mrp` file and opens a scaled window
 - **Libretro core** — `mrpemu_libretro` presents RGB565 game frames and maps

@@ -60,6 +60,10 @@ struct Args {
     #[arg(long, default_value_t = 200)]
     screenshot_frames: u32,
 
+    /// Playback volume in percent (0-100). Defaults to 100.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(0..=100))]
+    volume: u32,
+
     /// Directory where guest-created files persist between runs. Loaded
     /// before the first frame and flushed when the run ends.
     #[arg(long)]
@@ -330,6 +334,8 @@ fn main() -> Result<()> {
         machine = restored;
         log::info!("restored save state from {}", state_path.display());
     }
+    machine.set_volume(args.volume);
+    log::info!("playback volume: {}%", args.volume);
     if let Some(dir) = &args.persist_dir {
         machine.set_persist_dir(dir);
         log::info!("persistence directory: {}", dir.display());
@@ -460,6 +466,14 @@ mod tests {
         assert_eq!(args.instruction_limit, HEADLESS_INSTRUCTION_BUDGET);
         assert!(!args.headless);
         assert!(!args.verbose);
+        assert_eq!(args.volume, 100);
+        assert!(Args::try_parse_from(["mrpemu", "game.mrp", "--volume", "101"]).is_err());
+        assert_eq!(
+            Args::try_parse_from(["mrpemu", "game.mrp", "--volume", "35"])
+                .unwrap()
+                .volume,
+            35
+        );
         assert_eq!(args.persist_dir, None);
         assert_eq!(args.load_state, None);
         assert_eq!(args.save_state, None);

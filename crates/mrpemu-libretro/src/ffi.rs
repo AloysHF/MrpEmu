@@ -6,6 +6,10 @@ pub const API_VERSION: u32 = 1;
 pub const REGION_NTSC: u32 = 0;
 
 pub const ENVIRONMENT_GET_SYSTEM_DIRECTORY: u32 = 9;
+pub const ENVIRONMENT_GET_VARIABLE: u32 = 15;
+pub const ENVIRONMENT_SET_VARIABLE: u32 = 16;
+pub const ENVIRONMENT_GET_VARIABLE_UPDATE: u32 = 17;
+pub const ENVIRONMENT_SET_CORE_OPTIONS: u32 = 49;
 pub const ENVIRONMENT_GET_SAVE_DIRECTORY: u32 = 31;
 pub const ENVIRONMENT_SET_PIXEL_FORMAT: u32 = 10;
 pub const ENVIRONMENT_SET_INPUT_DESCRIPTORS: u32 = 11;
@@ -33,6 +37,15 @@ pub const JOYPAD_LEFT: u32 = 6;
 pub const JOYPAD_RIGHT: u32 = 7;
 pub const JOYPAD_A: u32 = 8;
 pub const JOYPAD_X: u32 = 9;
+
+/// `RETRO_ENVIRONMENT_GET_VARIABLE` / `RETRO_ENVIRONMENT_SET_CORE_OPTIONS`
+/// payload: the core fills `key` (for reads, pointing at core-owned text);
+/// the frontend points `value` at its own storage on read.
+#[repr(C)]
+pub struct RetroVariable {
+    pub key: *const c_char,
+    pub value: *mut c_char,
+}
 
 pub const POINTER_X: u32 = 0;
 pub const POINTER_Y: u32 = 1;

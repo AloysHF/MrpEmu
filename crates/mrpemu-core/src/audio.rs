@@ -103,6 +103,9 @@ pub trait AudioSink {
     fn play_effect(&mut self, clip: PcmClip);
     /// Stops the active background audio.
     fn stop_bgm(&mut self);
+    /// Sets the playback volume in percent (0-100). Sinks with shared state
+    /// implement this through interior mutability.
+    fn set_volume(&self, _volume: u32) {}
 }
 
 /// The default sink: discards audio (headless runs and tests).

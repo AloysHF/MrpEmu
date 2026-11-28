@@ -64,6 +64,13 @@ RetroPad input.
 | Star | Select |
 | Pound | Start |
 
+## Core Options
+
+Quick Menu → Core Options exposes **Audio Volume** (100 down to 0 in ten
+steps). The value applies immediately — no reset needed — and scales every
+decoded format (MIDI, WAV, MP3, AMR). The application's own volume command
+(`platEx` 1302) writes into the same control.
+
 ## Save States and Save Data
 
 The core supports libretro save states (`retro_serialize` /
