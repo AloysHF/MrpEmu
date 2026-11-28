@@ -404,3 +404,65 @@ mod tests {
         assert_eq!(short_type_name(T_TABLE), "tab");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot serialization. Values travel through the freeze/thaw pool; the
+// globals table identity is re-linked by the machine after decode because
+// the VM and this state share one table.
+// ---------------------------------------------------------------------------
+
+impl serde::Serialize for LuaState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut freezer = crate::save_state::Freezer::default();
+        let globals = freezer.table_id(&self.globals);
+        let stack: Vec<_> = self.stack.iter().map(|v| freezer.value(v)).collect();
+        let frozen = freezer.into_frozen();
+        LuaData {
+            globals,
+            stack,
+            cclosures: self.cclosures.clone(),
+            frames: self.frames.clone(),
+            lightuserdata: self.lightuserdata.clone(),
+            userdata: self.userdata.clone(),
+            error: self.error.clone(),
+            frozen,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// serde payload for [`LuaState`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LuaData {
+    globals: u32,
+    stack: Vec<crate::save_state::FrozenValue>,
+    cclosures: Vec<u32>,
+    frames: Vec<usize>,
+    lightuserdata: Vec<u32>,
+    userdata: Vec<(u32, u32)>,
+    error: Option<String>,
+    frozen: crate::save_state::Frozen,
+}
+
+impl<'de> serde::Deserialize<'de> for LuaState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let data = LuaData::deserialize(deserializer)?;
+        let mut thaw = crate::save_state::Thaw::new(data.frozen);
+        let globals = thaw.table(data.globals).map_err(Error::custom)?;
+        let stack = data
+            .stack
+            .iter()
+            .map(|fv| thaw.value(fv).map_err(Error::custom))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            stack,
+            globals,
+            cclosures: data.cclosures,
+            frames: data.frames,
+            lightuserdata: data.lightuserdata,
+            userdata: data.userdata,
+            error: data.error,
+        })
+    }
+}

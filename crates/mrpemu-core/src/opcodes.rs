@@ -21,7 +21,7 @@ pub const SIZE_BX: u32 = SIZE_C + SIZE_B;
 pub const OFFSET_SBX: i32 = (1 << (SIZE_BX - 1)) - 1;
 
 /// Raw 32-bit instruction word with field accessors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Instruction(pub u32);
 
 impl Instruction {

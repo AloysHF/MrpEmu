@@ -18,7 +18,7 @@ pub const DEVICE_FILES: &[&str] = &[
 
 /// A memory-backed file tree keyed by guest path (for example
 /// `mythroad/game.dat`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryVfs {
     files: BTreeMap<String, Vec<u8>>,
 }

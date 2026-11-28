@@ -1,7 +1,9 @@
 //! MD5 (RFC 1321) — the platform exposes it through `_strCom(500, data)`.
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Md5 {
     state: [u32; 4],
+    #[serde(with = "serde_big_array::BigArray")]
     buffer: [u8; 64],
     buffered: usize,
     length: u64,

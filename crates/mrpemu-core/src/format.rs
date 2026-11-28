@@ -26,7 +26,7 @@ pub const FIXED_HEADER_SIZE: usize = 16;
 pub const FULL_HEADER_SIZE: usize = 200;
 
 /// Parsed `.mrp` package header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MrpHeader {
     /// Offset 4: size of the info block that follows the fixed header. Some
     /// community tools call this field `data_offset`.

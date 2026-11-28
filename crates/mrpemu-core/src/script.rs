@@ -2497,6 +2497,54 @@ fn register_stub_group(vm: &mut Vm, names: &[&'static str]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Snapshot serialization. The VM travels through its own pooled impl; the
+// native registry rebuilds from the platform template after decode (the
+// machine drives that via `rebuild_snapshot_state`).
+// ---------------------------------------------------------------------------
+
+impl ScriptBridge {
+    /// Builds the platform native registry for snapshot restoration.
+    pub(crate) fn platform_native_registry() -> (Vec<Native>, Vec<&'static str>) {
+        let mut bridge = Self::new();
+        bridge.vm.take_native_registry()
+    }
+}
+
+impl serde::Serialize for ScriptBridge {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Data<'a> {
+            vm: &'a Vm,
+            missing_globals: Vec<String>,
+            pending_files: &'a Option<Vec<(String, Vec<u8>)>>,
+        }
+        Data {
+            vm: &self.vm,
+            missing_globals: self.missing_globals.borrow().iter().cloned().collect(),
+            pending_files: &self.pending_files,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ScriptBridge {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Data {
+            vm: Vm,
+            missing_globals: Vec<String>,
+            pending_files: Option<Vec<(String, Vec<u8>)>>,
+        }
+        let data = Data::deserialize(deserializer)?;
+        Ok(Self {
+            vm: data.vm,
+            missing_globals: RefCell::new(data.missing_globals.into_iter().collect()),
+            pending_files: data.pending_files,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 ///
 /// Numeric keys are separate variants so dispatch sites can match them
 /// exhaustively without range checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum MrpKey {
     Up,
     Down,
@@ -32,7 +34,7 @@ pub enum MrpKey {
     Pound,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TouchState {
     pub x: u16,
     pub y: u16,
@@ -40,7 +42,7 @@ pub(crate) struct TouchState {
 }
 
 /// Current keypad and touchscreen state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InputState {
     pressed: BTreeSet<MrpKey>,
     touch: TouchState,
