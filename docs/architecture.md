@@ -81,6 +81,8 @@ The framebuffer supports 240×320, 240×400, and 320×480 displays.
 Native drawing follows the current guest framebuffer pointer, and an
 explicit video submission retains its pixels for the frontend. Optional
 platform extended RAM is allocated separately from the SDK's main heap.
+The offline platform accepts SMS notification settings and reports empty
+inbox, outbox, and drafts folders.
 
 ### Native extensions
 

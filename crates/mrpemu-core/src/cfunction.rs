@@ -1963,8 +1963,13 @@ impl Guest {
                 MR_SUCCESS
             }
             37 => {
-                let command = self.cpu.reg_get(self.cpu.mode(), R0);
+                let mode = self.cpu.mode();
+                let command = self.cpu.reg_get(mode, R0);
+                let parameter = self.cpu.reg_get(mode, R1);
                 match command {
+                    1011 if parameter <= 1 => MR_SUCCESS, // Incoming SMS notifications.
+                    1101 if matches!(parameter, 2..=4) => 1000, // MR_PLAT_VALUE_BASE + 0 messages.
+                    1011 | 1101 => MR_FAILED,
                     1106 => 2,    // MR_WAITING: asynchronous SMS service-centre query.
                     1205 => 1000, // MR_NORMAL_SCREEN
                     1206 => 1000, // MR_CHINESE
@@ -5634,6 +5639,33 @@ mod tests {
         assert_eq!(guest.heap_malloc(64), first);
         assert_eq!(guest.r32(sentinel), old_head);
         assert_eq!(guest.get_data(DataSlot::LgMemLeft), old_left);
+    }
+
+    #[test]
+    fn native_sms_commands_accept_notification_modes_and_report_empty_folders() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+
+        for (command, parameter, expected) in [
+            (1011, 0, 0),
+            (1011, 1, 0),
+            (1011, 2, -1),
+            (1101, 0, -1),
+            (1101, 1, -1),
+            (1101, 2, 1000),
+            (1101, 3, 1000),
+            (1101, 4, 1000),
+            (1101, 5, -1),
+        ] {
+            guest.cpu.reg_set(mode, R0, command);
+            guest.cpu.reg_set(mode, R1, parameter);
+            assert_eq!(
+                guest.dispatch(37, &mut screen),
+                expected,
+                "mr_plat({command}, {parameter})"
+            );
+        }
     }
 
     #[test]
