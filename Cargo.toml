@@ -25,7 +25,11 @@ thiserror = "2"           # Error handling (custom error enums in the core)
 log = "0.4"               # Logging facade
 encoding_rs = "0.8"       # GBK text decoding for MRP string fields
 flate2 = "1"              # gzip member decompression inside .mrp packages
-armv4t_emu = { path = "vendor/armv4t_emu" } # Vendored ARMv4T interpreter (Thumb ADD/CMP-to-PC fix)
+armv4t_emu = { path = "vendor/armv4t_emu", features = ["serde"] } # Vendored ARMv4T interpreter (Thumb ADD/CMP-to-PC fix)
+serde = { version = "1", features = ["derive", "rc"] }  # Save-state machine snapshots
+bincode = "1"             # Compact save-state binary encoding
+lz4_flex = "0.14"         # Save-state payload compression
+crc32fast = "1"           # Save-state integrity and content checksums
 unifont = "1.1"           # Embedded Unicode bitmap font (GBK/CJK glyph rendering)
 clap = { version = "4", features = ["derive"] }  # CLI argument parsing (standalone)
 minifb = "0.29"           # Window creation and pixel rendering (standalone)

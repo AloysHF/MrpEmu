@@ -8,6 +8,9 @@ license = "MIT"
 [features]
 default = []
 advanced_disasm = []
+# The serde gate in the source also uses serde-big-array for the register
+# file's large fixed arrays, so the feature must pull both optional deps.
+serde = ["dep:serde", "dep:serde-big-array"]
 
 [dependencies]
 log = { version = "0.4", default-features = false }

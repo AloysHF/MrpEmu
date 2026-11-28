@@ -1201,3 +1201,123 @@ mod tests {
         assert_eq!(borrowed.len(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot serialization. The native registry (`Rc<dyn Fn>` closures) and
+// the shared globals identity cannot travel through serde: the registry
+// rebuilds from the platform template after decode, and the machine
+// re-links the globals table between the VM and the guest's Lua state.
+// ---------------------------------------------------------------------------
+
+impl Vm {
+    /// Replaces the native-function registry after a snapshot restore.
+    pub(crate) fn set_native_registry(&mut self, natives: Vec<Native>, names: Vec<&'static str>) {
+        self.natives = natives;
+        self.native_names = names;
+    }
+
+    /// Removes and returns the native registry (a snapshot template source).
+    pub(crate) fn take_native_registry(&mut self) -> (Vec<Native>, Vec<&'static str>) {
+        (
+            std::mem::take(&mut self.natives),
+            std::mem::take(&mut self.native_names),
+        )
+    }
+}
+
+/// serde payload for decoding [`Vm`]: pooled Lua values plus the machine
+/// state. The native registry is rebuilt from the platform template after
+/// decode.
+#[derive(serde::Deserialize)]
+struct VmData {
+    globals: u32,
+    stack: Vec<crate::save_state::FrozenValue>,
+    open_upvals: Vec<(usize, crate::save_state::FrozenValue)>,
+    frames: usize,
+    top: usize,
+    guest: Option<crate::cfunction::Guest>,
+    screen: crate::display::Screen,
+    package: Option<crate::package::MrpPackage>,
+    stub_native: Option<u16>,
+    missing_globals: Vec<String>,
+    frozen: crate::save_state::Frozen,
+}
+
+impl serde::Serialize for Vm {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Data<'a> {
+            globals: u32,
+            stack: Vec<crate::save_state::FrozenValue>,
+            open_upvals: Vec<(usize, crate::save_state::FrozenValue)>,
+            frames: usize,
+            top: usize,
+            guest: &'a Option<crate::cfunction::Guest>,
+            screen: &'a crate::display::Screen,
+            package: &'a Option<crate::package::MrpPackage>,
+            stub_native: Option<u16>,
+            missing_globals: Vec<String>,
+            frozen: crate::save_state::Frozen,
+        }
+        let mut freezer = crate::save_state::Freezer::default();
+        let globals = freezer.table_id(&self.globals);
+        let stack: Vec<_> = self.stack.iter().map(|v| freezer.value(v)).collect();
+        let open_upvals: Vec<_> = self
+            .open_upvals
+            .iter()
+            .map(|(slot, upval)| (*slot, freezer.value(&upval.borrow())))
+            .collect();
+        let frozen = freezer.into_frozen();
+        Data {
+            globals,
+            stack,
+            open_upvals,
+            frames: self.frames,
+            top: self.top,
+            guest: &self.guest,
+            screen: &self.screen,
+            package: &self.package,
+            stub_native: self.stub_native,
+            missing_globals: self.missing_globals.borrow().clone(),
+            frozen,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Vm {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let data = VmData::deserialize(deserializer)?;
+        let mut thaw = crate::save_state::Thaw::new(data.frozen);
+        let globals = thaw.table(data.globals).map_err(Error::custom)?;
+        let stack = data
+            .stack
+            .iter()
+            .map(|fv| thaw.value(fv).map_err(Error::custom))
+            .collect::<Result<Vec<_>, _>>()?;
+        let open_upvals = data
+            .open_upvals
+            .iter()
+            .map(|(slot, frozen_value)| {
+                thaw.value(frozen_value)
+                    .map(|value| (*slot, Rc::new(RefCell::new(value))))
+                    .map_err(Error::custom)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            globals,
+            natives: Vec::new(),
+            native_names: Vec::new(),
+            stack,
+            open_upvals,
+            frames: data.frames,
+            top: data.top,
+            guest: data.guest,
+            screen: data.screen,
+            package: data.package,
+            stub_native: data.stub_native,
+            missing_globals: RefCell::new(data.missing_globals),
+        })
+    }
+}

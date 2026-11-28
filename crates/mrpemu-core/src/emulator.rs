@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
 use crate::display::{Screen, DEFAULT_HEIGHT, DEFAULT_WIDTH};
@@ -18,6 +19,7 @@ const PLACEHOLDER_BACKGROUND: u16 = 0x1082;
 const PLACEHOLDER_FRAME: u16 = 0x39E7;
 
 /// A loaded MRP application with a script VM, a native guest, and a virtual phone.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MrpMachine {
     header: MrpHeader,
     package: Vec<u8>,
@@ -33,7 +35,9 @@ pub struct MrpMachine {
     persist_dir: Option<std::path::PathBuf>,
     /// Screen resolution (detected from the corpus directory or default).
     resolution: (u16, u16),
-    /// Audio sink parked until a guest exists to receive it.
+    /// Audio sink parked until a guest exists to receive it. Frontends
+    /// reinstall their device backend after a snapshot restore.
+    #[serde(skip)]
     pending_audio_sink: Option<Box<dyn crate::audio::AudioSink>>,
 }
 
@@ -178,6 +182,32 @@ impl MrpMachine {
         }
     }
 
+    /// Checksum binding a save state to this machine's package: decoding
+    /// a snapshot saved for different content is rejected.
+    pub(crate) fn package_crc32(&self) -> u32 {
+        crc32fast::hash(&self.package)
+    }
+
+    /// Restores the parts of a decoded snapshot that cannot travel through
+    /// serde: the native-function registries (rebuilt from the platform
+    /// template) and the shared globals identity between the VM and the
+    /// guest's Lua state.
+    pub(crate) fn rebuild_snapshot_state(&mut self) {
+        let Some(bridge) = self.script.as_mut() else {
+            return;
+        };
+        let (natives, names) = ScriptBridge::platform_native_registry();
+        bridge.vm.set_native_registry(natives, names);
+        if let Some(guest) = bridge.vm.guest.as_mut() {
+            guest.lua.globals = Rc::clone(&bridge.vm.globals);
+            if let Some(vm) = guest.lua_vm.as_mut() {
+                let (natives, names) = ScriptBridge::platform_native_registry();
+                vm.set_native_registry(natives, names);
+                vm.globals = Rc::clone(&bridge.vm.globals);
+            }
+        }
+    }
+
     /// Writes all guest-created/modified files to the persistence
     /// directory. Returns the number of files written.
     pub fn flush_persistence(&mut self) -> std::io::Result<usize> {
@@ -221,6 +251,17 @@ impl MrpMachine {
         {
             if guest.file_data(path).is_none() {
                 guest.files.push((path.to_string(), bytes.to_vec()));
+            }
+        }
+        // Restore previously persisted guest files ahead of the boot so the
+        // application sees its save data from the first frame.
+        if let Some(dir) = self.persist_dir.clone() {
+            match guest.load_persistence(&dir) {
+                Ok(count) if count > 0 => {
+                    log::debug!("persistence: restored {count} files from {}", dir.display());
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("persistence: load failed: {error}"),
             }
         }
         if let Some(sink) = self.pending_audio_sink.take() {

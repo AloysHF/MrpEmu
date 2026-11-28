@@ -358,7 +358,7 @@ pub const SLOTS: [Slot; TABLE_SLOTS] = {
 };
 
 /// Guest platform configuration filled into the data slots at boot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GuestConfig {
     pub screen_width: u16,
     pub screen_height: u16,
@@ -386,19 +386,28 @@ impl Default for GuestConfig {
 }
 
 /// An active guest timer registered through `mr_timerStart`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GuestTimer {
     pub id: i32,
     pub interval: Duration,
+    #[serde(
+        serialize_with = "crate::save_state::ser_instant_remaining",
+        deserialize_with = "crate::save_state::de_instant_remaining"
+    )]
     pub next_fire: Instant,
 }
 
 /// The guest CPU, memory, and registered ext state.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Guest {
     pub mem: Vec<u8>,
     pub cpu: Cpu,
     config: GuestConfig,
     uses_explicit_video: bool,
+    #[serde(
+        serialize_with = "crate::save_state::ser_instant_elapsed",
+        deserialize_with = "crate::save_state::de_instant_elapsed"
+    )]
     started_at: Instant,
     frame_time: Option<Duration>,
     sleep_elapsed: Duration,
@@ -432,7 +441,9 @@ pub struct Guest {
     pub value_watch: ValueWatch,
     /// Audio output handed to the guest's `mr_playSound`/`mr_stopSound`
     /// calls. Defaults to the discarding sink; frontends install a real
-    /// device backend.
+    /// device backend. Snapshot restores park the discarding sink; the
+    /// frontends reinstall their device backend after a load.
+    #[serde(skip, default = "null_audio_sink")]
     pub audio_sink: Box<dyn crate::audio::AudioSink>,
     /// Snapshot of the helper dispatch shell the SDK runtime copies below
     /// its own init frame. Captured after the boot handshake and restored
@@ -452,7 +463,9 @@ pub struct Guest {
     pub files: Vec<(String, Vec<u8>)>,
     storage_root: String,
     pub exit_requested: bool,
-    /// Diagnostics: how often each table slot was called.
+    /// Diagnostics: how often each table slot was called. Not serialized:
+    /// histograms reset on restore and serde has no >32 array support.
+    #[serde(skip, default = "default_slot_calls")]
     pub slot_calls: [u64; TABLE_SLOTS],
     /// Heap address of the single glyph export buffer (lazily allocated).
     glyph_buf: u32,
@@ -475,12 +488,12 @@ pub struct Guest {
     lua_string_ptrs: std::collections::HashMap<Vec<u8>, u32>,
     /// The MiniJ VM that runs bytecode closures loaded through the Lua
     /// bridge; created lazily on the first bytecode call.
-    lua_vm: Option<Box<crate::vm::Vm>>,
+    pub(crate) lua_vm: Option<Box<crate::vm::Vm>>,
 }
 
 /// A runtime menu: title, items, and the current selection. The platform
 /// menu owns key input while shown; OK selects, RSK cancels.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MenuState {
     pub handle: u32,
     pub title: Vec<u8>,
@@ -489,6 +502,7 @@ pub struct MenuState {
     pub selection: usize,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EditState {
     handle: u32,
     pub title: String,
@@ -523,14 +537,14 @@ impl EditState {
 }
 
 /// A loaded bitmap with dimensions and RGB565 pixel data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Bitmap {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u16>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenFile {
     file_index: usize,
     pos: usize,
@@ -4684,33 +4698,62 @@ impl Guest {
     }
 
     /// Loads files from `dir` into the guest file table (overriding any
-    /// same-named entries). Returns the number of files loaded.
+    /// same-named entries). Mirrors [`Guest::flush_persistence`]: the
+    /// directory tree maps onto guest paths with `/` separators, so files
+    /// written to nested host directories restore under their original
+    /// guest names. Returns the number of files loaded.
     pub fn load_persistence(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {
         let mut count = 0usize;
+        Self::walk_persistence(self, dir, "", &mut count);
+        Ok(count)
+    }
+
+    fn walk_persistence(guest: &mut Guest, dir: &std::path::Path, prefix: &str, count: &mut usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
-            return Ok(0);
+            return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.is_empty() || name.contains("..") {
                 continue;
             }
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
+            let guest_path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if path.is_dir() {
+                // Register every ancestor segment so guest lookups see the
+                // same directory layout they wrote.
+                let mut segment = String::new();
+                for part in guest_path.split('/') {
+                    if !segment.is_empty() {
+                        segment.push('/');
+                    }
+                    segment.push_str(part);
+                    guest.directories.insert(segment.clone());
+                }
+                Self::walk_persistence(guest, &path, &guest_path, count);
+                continue;
+            }
             let Ok(data) = std::fs::read(&path) else {
                 continue;
             };
-            if let Some(existing) = self.files.iter_mut().find(|(entry, _)| *entry == name) {
+            // The guest may hold the same file under backslash separators;
+            // update that twin first so existing handles stay coherent.
+            let twin = guest_path.replace('/', "\\");
+            let existing = guest
+                .files
+                .iter_mut()
+                .find(|(entry, _)| *entry == guest_path || *entry == twin);
+            if let Some(existing) = existing {
                 existing.1 = data;
             } else {
-                self.files.push((name, data));
+                guest.files.push((guest_path.clone(), data));
             }
-            count += 1;
+            *count += 1;
         }
-        Ok(count)
     }
 
     fn framebuffer_address(&self) -> Option<u32> {
@@ -5056,7 +5099,7 @@ impl Guest {
 /// Value-range write watch: captures guest word stores whose value falls
 /// in `[lo, hi)`. Used to trace which store clobbers an ext's dispatch
 /// cells with pointers into its own function-pointer tables.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct ValueWatch {
     pub lo: u32,
     pub hi: u32,
@@ -5074,6 +5117,16 @@ impl ValueWatch {
             self.hits.push((addr, val));
         }
     }
+}
+
+/// Snapshot placeholder for the skipped audio sink field: restores park
+/// the discarding sink and the frontends reinstall their device backend.
+fn null_audio_sink() -> Box<dyn crate::audio::AudioSink> {
+    Box::new(crate::audio::NullAudioSink)
+}
+
+fn default_slot_calls() -> [u64; TABLE_SLOTS] {
+    [0; TABLE_SLOTS]
 }
 
 /// Adapter implementing `armv4t_emu::Memory` over the guest memory vector.
@@ -6632,5 +6685,170 @@ mod tests {
             matches!(result, Ok(42)),
             "fall through past the failed blxne, got {result:?}"
         );
+    }
+
+    /// Writes `data` into a guest file through the public file API so the
+    /// dirty tracking behaves like a real `mr_write` session.
+    fn write_guest_file(guest: &mut Guest, name: &str, data: &[u8]) {
+        let handle = guest.file_open(name).expect("open seeded file");
+        assert!(guest.file_write(handle, data), "write {name}");
+        guest.file_close(handle);
+    }
+
+    fn temp_persistence_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mrpemu-persist-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create persistence dir");
+        dir
+    }
+
+    #[test]
+    fn persistence_flush_and_load_roundtrips_top_level_files() {
+        let dir = temp_persistence_dir("top");
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![("save0.sav".to_string(), b"old".to_vec())],
+        );
+        write_guest_file(&mut guest, "save0.sav", b"progress-v1");
+        assert_eq!(guest.flush_persistence(&dir).expect("flush"), 1);
+        assert_eq!(
+            std::fs::read(dir.join("save0.sav")).unwrap(),
+            b"progress-v1"
+        );
+
+        let mut restored = Guest::new(
+            GuestConfig::default(),
+            vec![("myapp/save0.sav".to_string(), b"old".to_vec())],
+        );
+        assert_eq!(restored.load_persistence(&dir).expect("load"), 1);
+        let data = restored
+            .files
+            .iter()
+            .find(|(name, _)| name == "save0.sav")
+            .map(|(_, data)| data.clone())
+            .expect("restored save0.sav");
+        assert_eq!(data, b"progress-v1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_roundtrips_nested_directories() {
+        let dir = temp_persistence_dir("nested");
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![("gymls/save.dat".to_string(), b"seed".to_vec())],
+        );
+        // The guest writes through the nested path it created at runtime.
+        write_guest_file(&mut guest, "gymls/save.dat", b"nested-progress");
+        assert_eq!(guest.flush_persistence(&dir).expect("flush"), 1);
+        assert!(dir.join("gymls").join("save.dat").is_file());
+
+        let mut restored = Guest::new(
+            GuestConfig::default(),
+            vec![("gymls/save.dat".to_string(), b"seed".to_vec())],
+        );
+        assert_eq!(restored.load_persistence(&dir).expect("load"), 1);
+        assert!(
+            restored.directories.contains("gymls"),
+            "load registers the directory segment"
+        );
+        let data = restored
+            .files
+            .iter()
+            .find(|(name, _)| name == "gymls/save.dat")
+            .map(|(_, data)| data.clone())
+            .expect("restored nested file under its original guest path");
+        assert_eq!(data, b"nested-progress");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistence_load_updates_backslash_named_twin() {
+        let dir = temp_persistence_dir("twin");
+        // Flush a forward-slash name, then restore into a guest whose file
+        // table carries the backslash twin a game may have created before a
+        // path normalization fix. The load must update the twin in place
+        // instead of adding a second entry.
+        let mut guest = Guest::new(
+            GuestConfig::default(),
+            vec![("app/data.cfg".to_string(), b"stale".to_vec())],
+        );
+        write_guest_file(&mut guest, "app/data.cfg", b"cfg-v2");
+        assert_eq!(guest.flush_persistence(&dir).expect("flush"), 1);
+
+        let mut restored = Guest::new(
+            GuestConfig::default(),
+            vec![("app\\data.cfg".to_string(), b"stale".to_vec())],
+        );
+        assert_eq!(restored.load_persistence(&dir).expect("load"), 1);
+        let updated = restored
+            .files
+            .iter()
+            .find(|(name, _)| name == "app\\data.cfg")
+            .map(|(_, data)| data.clone())
+            .expect("backslash twin updated in place");
+        assert_eq!(updated, b"cfg-v2");
+        assert!(
+            !restored
+                .files
+                .iter()
+                .any(|(name, _)| name == "app/data.cfg"),
+            "no duplicate forward-slash entry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_snapshot_roundtrip_keeps_cpu_memory_files_and_timers() {
+        let mut guest = guest();
+        guest.w32(LG_MEM_BASE, 0xE3A0_005A); // mov r0, #90
+                                             // Seed through the same-module private fields: a fresh guest gains
+                                             // "save1.dat" exactly like an mr_open(MR_FILE_CREATE) would.
+        guest.files.push(("save1.dat".to_string(), Vec::new()));
+        guest.dirty_files.insert("save1.dat".to_string());
+        write_guest_file(&mut guest, "save1.dat", b"saved-state");
+        // A long deadline: the debug-build codec takes longer than a short
+        // interval, and an expired timer legitimately re-anchors to "now".
+        guest.timers.push(GuestTimer {
+            id: 7,
+            interval: std::time::Duration::from_secs(60),
+            next_fire: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        });
+        guest.total_instructions = 4321;
+
+        let mut buffer = vec![0u8; crate::save_state::SERIALIZED_SIZE];
+        crate::save_state::encode_value(&guest, 0, &mut buffer).expect("encode guest");
+        let decoded = crate::save_state::decode_payload(&buffer, 0).expect("decode payload");
+        let mut restored: Guest = crate::save_state::decode_value(&decoded).expect("decode guest");
+
+        assert_eq!(restored.mem.len(), guest.mem.len());
+        assert_eq!(restored.r32(LG_MEM_BASE), 0xE3A0_005A, "guest memory");
+        let file = restored
+            .files
+            .iter()
+            .find(|(name, _)| name == "save1.dat")
+            .map(|(_, data)| data.clone())
+            .expect("restored guest file");
+        assert_eq!(file, b"saved-state");
+        assert!(restored.dirty_files.contains("save1.dat"), "dirty tracking");
+        assert_eq!(restored.timers.len(), 1);
+        assert_eq!(restored.timers[0].id, 7);
+        assert_eq!(restored.total_instructions, 4321);
+        // A restored timer still fires in the future (re-anchored to now).
+        assert!(
+            restored.timers[0].next_fire > std::time::Instant::now(),
+            "timer deadline re-anchored"
+        );
+        // The skipped audio sink comes back as the discarding sink.
+        let mut screen = crate::display::Screen::new(240, 320);
+        assert_eq!(restored.dispatch(58, &mut screen), 0, "stopSound accepted");
+    }
+
+    #[test]
+    fn persistence_load_of_missing_dir_is_empty() {
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        let missing = std::env::temp_dir().join("mrpemu-persist-does-not-exist");
+        assert_eq!(guest.load_persistence(&missing).expect("load"), 0);
+        assert!(guest.files.is_empty());
     }
 }

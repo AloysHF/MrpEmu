@@ -10,7 +10,7 @@ use crate::error::MrpError;
 use crate::format::MrpHeader;
 
 /// One file stored inside a `.mrp` package.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PackageEntry {
     /// Entry name as stored in the package (e.g. `start.mr`).
     pub name: String,
@@ -21,7 +21,7 @@ pub struct PackageEntry {
 }
 
 /// A parsed `.mrp` package with random access to its stored files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MrpPackage {
     header: MrpHeader,
     entries: Vec<PackageEntry>,

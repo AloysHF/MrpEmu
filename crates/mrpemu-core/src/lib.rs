@@ -28,6 +28,7 @@ pub mod luastate;
 pub mod md5;
 pub mod opcodes;
 pub mod package;
+pub mod save_state;
 pub mod script;
 pub mod undump;
 pub mod value_helpers;

@@ -23,7 +23,7 @@ pub const CHUNK_MAGIC: [u8; 4] = [0x1B, b'M', b'R', b'P'];
 const MAX_PROTO_DEPTH: usize = 64;
 
 /// A constant table entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Constant {
     Nil,
     /// MiniJ stores `lua_Number` as 32-bit integers (feature-phone Lua).
@@ -33,7 +33,7 @@ pub enum Constant {
 }
 
 /// A debug-entry local variable record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LocalVar {
     pub name: Vec<u8>,
     pub start_pc: u32,
@@ -41,7 +41,7 @@ pub struct LocalVar {
 }
 
 /// One function prototype inside a chunk.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Proto {
     pub source: Option<Vec<u8>>,
     pub line_defined: u32,

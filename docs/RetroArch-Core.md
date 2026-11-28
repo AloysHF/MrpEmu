@@ -64,8 +64,15 @@ RetroPad input.
 | Star | Select |
 | Pound | Start |
 
+## Save States and Save Data
+
+The core supports libretro save states (`retro_serialize` /
+`retro_unserialize`): a snapshot is bound to the loaded content, so a
+state saved for one application refuses to restore into another. Guest
+files — game save data and settings — persist in the frontend's save
+directory and reload with the content on the next run.
+
 ## Planned Features
 
-- Save states
 - Core options
 - Guest memory exposure

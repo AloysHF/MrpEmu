@@ -49,7 +49,7 @@ fn make_system_font(size: usize, cell_count: usize) -> Vec<u8> {
 }
 
 /// A 16-bit RGB565 framebuffer in row-major order.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Screen {
     width: u16,
     height: u16,

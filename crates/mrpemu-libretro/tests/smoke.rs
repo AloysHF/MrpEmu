@@ -4,12 +4,12 @@ use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-    OnceLock,
+    Mutex, OnceLock,
 };
 
 use mrpemu::ffi::{
-    GameGeometry, GameInfo, SystemAvInfo, SystemTiming, ENVIRONMENT_GET_SYSTEM_DIRECTORY,
-    ENVIRONMENT_SET_PIXEL_FORMAT, PIXEL_FORMAT_RGB565,
+    GameGeometry, GameInfo, SystemAvInfo, SystemTiming, ENVIRONMENT_GET_SAVE_DIRECTORY,
+    ENVIRONMENT_GET_SYSTEM_DIRECTORY, ENVIRONMENT_SET_PIXEL_FORMAT, PIXEL_FORMAT_RGB565,
 };
 
 static VIDEO_WIDTH: AtomicU32 = AtomicU32::new(0);
@@ -18,10 +18,17 @@ static VIDEO_PITCH: AtomicUsize = AtomicUsize::new(0);
 static VIDEO_VISIBLE: AtomicBool = AtomicBool::new(false);
 static INPUT_FRAME: AtomicU32 = AtomicU32::new(0);
 static SYSTEM_DIR: OnceLock<CString> = OnceLock::new();
+static SAVE_DIR: Mutex<Option<CString>> = Mutex::new(None);
 
 unsafe extern "C" fn environment(cmd: u32, data: *mut core::ffi::c_void) -> bool {
     if cmd == ENVIRONMENT_GET_SYSTEM_DIRECTORY && !data.is_null() {
         if let Some(directory) = SYSTEM_DIR.get() {
+            unsafe { *data.cast() = directory.as_ptr() };
+            return true;
+        }
+    }
+    if cmd == ENVIRONMENT_GET_SAVE_DIRECTORY && !data.is_null() {
+        if let Some(directory) = SAVE_DIR.lock().unwrap().as_ref() {
             unsafe { *data.cast() = directory.as_ptr() };
             return true;
         }
@@ -83,7 +90,11 @@ unsafe extern "C" fn input_state(_port: u32, _device: u32, _index: u32, id: u32)
 #[test]
 #[ignore = "requires the local reference corpus under tmp/mrp_game"]
 fn libretro_smoke() {
-    let root = PathBuf::from("../../tmp/mrp_game/热门游戏");
+    // Worktrees keep the gitignored corpus out; point MRPEMU_CORPUS_ROOT at
+    // the main checkout when running there.
+    let root = std::env::var_os("MRPEMU_CORPUS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("../../tmp/mrp_game/热门游戏"));
     if let Ok(directory) = std::env::var("CORPUS_SYSTEM_DIR") {
         SYSTEM_DIR.set(CString::new(directory).unwrap()).unwrap();
     }
@@ -121,11 +132,24 @@ fn libretro_smoke() {
         mrpemu::retro_set_input_state(Some(input_state));
         mrpemu::retro_init();
         mrpemu::retro_set_controller_port_device(0, 1);
+        // One fixed-capacity state buffer, sized by the core itself.
+        let state_size = mrpemu::retro_serialize_size();
+        assert!(state_size > 0, "the core offers save states");
+        let mut state_buffer = vec![0u8; state_size];
 
         let mut failures = Vec::new();
+        let save_root =
+            std::env::temp_dir().join(format!("mrpemu-libretro-{}", std::process::id()));
+        std::fs::create_dir_all(&save_root).expect("create save root");
         for path in &paths {
             let name = path.file_name().unwrap().to_string_lossy();
             let height = if name.contains("240x400") { 400 } else { 320 };
+            // One persistence directory per content, like a frontend's
+            // per-game saves layout.
+            let content_save_dir = save_root.join(name.as_ref());
+            std::fs::create_dir_all(&content_save_dir).expect("create content save dir");
+            *SAVE_DIR.lock().unwrap() =
+                Some(CString::new(content_save_dir.to_string_lossy().as_ref()).unwrap());
             let c_path = CString::new(path.to_string_lossy().as_ref()).expect("cstring");
             let info = GameInfo {
                 path: c_path.as_ptr(),
@@ -171,9 +195,38 @@ fn libretro_smoke() {
             if VIDEO_VISIBLE.load(Ordering::Relaxed) {
                 eprintln!("content [240x{height}] {name}");
             } else {
-                failures.push(name);
+                failures.push(name.clone());
             }
+
+            // Save state: serialize the booted machine, advance a few frames,
+            // restore, and confirm the core keeps running on the restored
+            // state.
+            assert!(mrpemu::retro_serialize_size() == state_buffer.len());
+            INPUT_FRAME.store(0, Ordering::Relaxed);
+            assert!(
+                mrpemu::retro_serialize(state_buffer.as_mut_ptr().cast(), state_buffer.len()),
+                "serialize must succeed for {name}"
+            );
+            for frame in 0..10u32 {
+                INPUT_FRAME.store(frame, Ordering::Relaxed);
+                mrpemu::retro_run();
+            }
+            assert!(
+                mrpemu::retro_unserialize(state_buffer.as_ptr().cast(), state_buffer.len()),
+                "unserialize must succeed for {name}"
+            );
+            for frame in 0..10u32 {
+                INPUT_FRAME.store(frame, Ordering::Relaxed);
+                mrpemu::retro_run();
+            }
+
             mrpemu::retro_unload_game();
+            // The unload flush creates the persistence directory even when
+            // the title wrote no files yet.
+            assert!(
+                content_save_dir.is_dir(),
+                "persistence directory survives unload for {name}"
+            );
         }
         mrpemu::retro_deinit();
         assert!(failures.is_empty(), "packages without video: {failures:?}");
