@@ -17,6 +17,9 @@ static SOUNDFONT: OnceLock<Result<Arc<SoundFont>, SoundFontError>> = OnceLock::n
 pub struct AudioPlayer {
     sample_rate: u32,
     playback: Arc<Mutex<Option<Playback>>>,
+    /// Playback volume in percent (0-100); clones share it so a frontend or
+    /// a guest command can retune the same live renderer.
+    volume: Arc<std::sync::atomic::AtomicU32>,
 }
 
 enum Playback {
@@ -35,7 +38,23 @@ impl AudioPlayer {
         Self {
             sample_rate,
             playback: Arc::new(Mutex::new(None)),
+            volume: Arc::new(std::sync::atomic::AtomicU32::new(100)),
         }
+    }
+
+    /// Sets the playback volume in percent; values above 100 clamp.
+    pub fn set_volume(&self, volume: u32) {
+        self.volume
+            .store(volume.min(100), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the playback volume in percent.
+    pub fn volume(&self) -> u32 {
+        self.volume.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn gain(&self) -> f32 {
+        self.volume.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0
     }
 
     /// Overwrites the buffer with stereo output, including silence when idle.
@@ -44,6 +63,7 @@ impl AudioPlayer {
         let Ok(mut playback) = self.playback.lock() else {
             return;
         };
+        let gain = self.gain();
         match playback.as_mut() {
             Some(Playback::Wave(wave)) => wave.render(output, self.sample_rate),
             Some(Playback::Midi(sequencer)) => {
@@ -58,6 +78,11 @@ impl AudioPlayer {
                 }
             }
             None => {}
+        }
+        if gain < 1.0 {
+            for frame in output.iter_mut() {
+                *frame = [frame[0] * gain, frame[1] * gain];
+            }
         }
     }
 
@@ -92,6 +117,10 @@ impl WavePlayback {
 }
 
 impl AudioSink for AudioPlayer {
+    fn set_volume(&self, volume: u32) {
+        AudioPlayer::set_volume(self, volume);
+    }
+
     fn play_bgm(&mut self, clip: PcmClip, looped: bool) {
         if !matches!(clip.channels, 1 | 2)
             || clip.samples.len() < usize::from(clip.channels)
@@ -175,6 +204,35 @@ mod tests {
         player.stop_bgm();
         renderer.render(&mut output);
         assert!(output.iter().flatten().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn volume_scales_rendered_amplitude() {
+        let mut player = AudioPlayer::new(8_000);
+        let clip = PcmClip {
+            sample_rate: 8_000,
+            channels: 2,
+            samples: vec![16384, -16384, 16384, -16384],
+        };
+        player.play_bgm(clip, true);
+        let mut output = [[0.0; 2]; 4];
+
+        player.set_volume(100);
+        player.render(&mut output);
+        assert_eq!(output[0], [0.5, -0.5], "full volume is untouched");
+
+        player.set_volume(50);
+        player.render(&mut output);
+        assert_eq!(output[0], [0.25, -0.25], "half volume halves amplitude");
+
+        player.set_volume(0);
+        player.render(&mut output);
+        assert!(output.iter().all(|frame| frame == &[0.0, 0.0]));
+
+        // Out-of-range values clamp so a game cannot boost the output.
+        player.set_volume(250);
+        player.render(&mut output);
+        assert_eq!(output[0], [0.5, -0.5], "values clamp to 100");
     }
 
     #[test]
