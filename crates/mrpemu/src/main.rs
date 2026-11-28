@@ -17,6 +17,7 @@ mod audio;
 
 use mrpemu_core::cfunction::{reset_instruction_counter, set_instruction_budget};
 use mrpemu_core::emulator::FRAME_RATE;
+use mrpemu_core::save_state;
 use mrpemu_core::{MrpKey, MrpMachine};
 
 /// Guest instruction budget shared by boot and all headless frames. Matches
@@ -58,6 +59,21 @@ struct Args {
     /// Number of frames to run before taking a screenshot.
     #[arg(long, default_value_t = 200)]
     screenshot_frames: u32,
+
+    /// Directory where guest-created files persist between runs. Loaded
+    /// before the first frame and flushed when the run ends.
+    #[arg(long)]
+    persist_dir: Option<PathBuf>,
+
+    /// Restore a machine snapshot before the first frame. The snapshot must
+    /// have been saved for this package.
+    #[arg(long)]
+    load_state: Option<PathBuf>,
+
+    /// Write a machine snapshot when the run ends (after the last frame or
+    /// when the window closes).
+    #[arg(long)]
+    save_state: Option<PathBuf>,
 
     /// Scripted phone key press at an exact frame, `frame:key`. Repeatable.
     /// Keys: up, down, left, right, ok, lsk, rsk, 0-9, star, pound.
@@ -262,6 +278,29 @@ fn capture_screenshot(
     Ok(())
 }
 
+/// Runs the end-of-run work shared by every mode: snapshot writing and
+/// persistence flush.
+fn finish_run(machine: &mut MrpMachine, args: &Args) -> Result<()> {
+    if let Some(path) = &args.save_state {
+        let mut buffer = vec![0u8; save_state::SERIALIZED_SIZE];
+        save_state::encode_machine(machine, &mut buffer)
+            .map_err(|error| anyhow::anyhow!("failed to encode save state: {error}"))?;
+        let len = save_state::snapshot_len(&buffer)
+            .map_err(|error| anyhow::anyhow!("bad snapshot: {error}"))?;
+        std::fs::write(path, &buffer[..len])
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        log::info!("save state written to {} ({} bytes)", path.display(), len);
+    }
+    if args.persist_dir.is_some() {
+        match machine.flush_persistence() {
+            Ok(count) if count > 0 => log::info!("persistence: flushed {count} files"),
+            Ok(_) => {}
+            Err(error) => log::warn!("persistence: flush failed: {error}"),
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let level = if args.verbose {
@@ -281,6 +320,20 @@ fn main() -> Result<()> {
     let mut machine = MrpMachine::from_path(&args.mrp_path)
         .with_context(|| format!("failed to load {}", args.mrp_path.display()))?;
     load_device_files(&mut machine, &args);
+    if let Some(state_path) = &args.load_state {
+        let data = std::fs::read(state_path)
+            .with_context(|| format!("failed to read {}", state_path.display()))?;
+        let restored = save_state::decode_machine(&data, save_state::content_crc32(&machine))
+            .map_err(|error| {
+                anyhow::anyhow!("failed to restore {}: {error}", state_path.display())
+            })?;
+        machine = restored;
+        log::info!("restored save state from {}", state_path.display());
+    }
+    if let Some(dir) = &args.persist_dir {
+        machine.set_persist_dir(dir);
+        log::info!("persistence directory: {}", dir.display());
+    }
     log::info!(
         "loaded {:?} (internal name {:?}, app id {})",
         machine.header().display_name,
@@ -296,13 +349,13 @@ fn main() -> Result<()> {
             path,
             &args.mrp_path,
         )?;
-        return Ok(());
+        return finish_run(&mut machine, &args);
     }
 
     if args.headless {
         let frames = run_scripted_frames(&mut machine, &presses, args.frames, &args.mrp_path)?;
         log::info!("Headless run completed: {frames} frames");
-        return Ok(());
+        return finish_run(&mut machine, &args);
     }
 
     // Audio output: open the default device and hand the sink to the core.
@@ -389,7 +442,7 @@ fn main() -> Result<()> {
             .context("failed to present frame")?;
     }
 
-    Ok(())
+    finish_run(&mut machine, &args)
 }
 
 #[cfg(test)]
@@ -407,6 +460,9 @@ mod tests {
         assert_eq!(args.instruction_limit, HEADLESS_INSTRUCTION_BUDGET);
         assert!(!args.headless);
         assert!(!args.verbose);
+        assert_eq!(args.persist_dir, None);
+        assert_eq!(args.load_state, None);
+        assert_eq!(args.save_state, None);
         assert!(Args::try_parse_from(["mrpemu"]).is_err());
     }
 

@@ -164,6 +164,19 @@ pub(crate) fn decode_value<T: DeserializeOwned>(decoded: &[u8]) -> Result<T> {
         .map_err(|error| SaveStateError::Decode(error.to_string()))
 }
 
+/// Returns the byte length of a snapshot in the fixed buffer (header plus
+/// payload), so frontends write only the used bytes to disk.
+pub fn snapshot_len(buffer: &[u8]) -> Result<usize> {
+    if buffer.len() < HEADER_SIZE {
+        return Err(SaveStateError::Truncated);
+    }
+    let payload_len = read_u32(buffer, 16) as usize;
+    HEADER_SIZE
+        .checked_add(payload_len)
+        .filter(|&end| end <= buffer.len())
+        .ok_or(SaveStateError::BadLength)
+}
+
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
