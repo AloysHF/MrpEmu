@@ -7,8 +7,10 @@
 
 pub mod ffi;
 
+#[cfg(not(target_os = "emscripten"))]
+use std::ffi::CString;
 use std::{
-    ffi::{c_char, c_void, CStr, CString},
+    ffi::{c_char, c_void, CStr},
     path::PathBuf,
     ptr,
     sync::{Mutex, MutexGuard},
@@ -16,16 +18,19 @@ use std::{
 };
 
 use ffi::*;
+use mrpemu_core::audio::AudioPlayer;
 use mrpemu_core::emulator::FRAME_RATE;
 use mrpemu_core::{MrpKey, MrpMachine};
 
-/// Sample rate reported until audio exists.
-const AUDIO_SAMPLE_RATE: f64 = 22_050.0;
+const AUDIO_SAMPLE_RATE: u32 = 48_000;
+const AUDIO_FRAMES_PER_RUN: usize = AUDIO_SAMPLE_RATE as usize / FRAME_RATE as usize;
+const _: () = assert!(AUDIO_FRAMES_PER_RUN as f64 * FRAME_RATE == AUDIO_SAMPLE_RATE as f64);
 
 #[derive(Default)]
 struct Callbacks {
     environment: EnvironmentCallback,
     video_refresh: VideoRefreshCallback,
+    audio_sample: AudioSampleCallback,
     audio_sample_batch: AudioSampleBatchCallback,
     input_poll: InputPollCallback,
     input_state: InputStateCallback,
@@ -35,9 +40,20 @@ struct Callbacks {
 struct Core {
     callbacks: Callbacks,
     emulator: Option<MrpMachine>,
+    audio: Option<AudioPlayer>,
     /// Raw bytes of the loaded package, kept so `retro_reset` can reload it.
     content: Vec<u8>,
     elapsed: Duration,
+}
+
+impl Core {
+    fn set_emulator(&mut self, mut emulator: MrpMachine) {
+        let audio = AudioPlayer::new(AUDIO_SAMPLE_RATE);
+        emulator.set_audio_sink(Box::new(audio.clone()));
+        self.audio = Some(audio);
+        self.emulator = Some(emulator);
+        self.elapsed = Duration::ZERO;
+    }
 }
 
 /// The libretro ABI may invoke callbacks from different threads, but the
@@ -62,11 +78,13 @@ static CORE: Mutex<SendCore> = Mutex::new(SendCore(Core {
     callbacks: Callbacks {
         environment: None,
         video_refresh: None,
+        audio_sample: None,
         audio_sample_batch: None,
         input_poll: None,
         input_state: None,
     },
     emulator: None,
+    audio: None,
     content: Vec::new(),
     elapsed: Duration::ZERO,
 }));
@@ -225,9 +243,8 @@ pub extern "C" fn retro_set_video_refresh(callback: VideoRefreshCallback) {
 }
 
 #[no_mangle]
-pub extern "C" fn retro_set_audio_sample(_callback: AudioSampleCallback) {
-    // No audio yet; the batch callback is reserved for future use. This entry
-    // point cannot panic, so it does not need the panic guard.
+pub extern "C" fn retro_set_audio_sample(callback: AudioSampleCallback) {
+    guard((), || core().callbacks.audio_sample = callback);
 }
 
 #[no_mangle]
@@ -258,6 +275,7 @@ pub extern "C" fn retro_deinit() {
     guard((), || {
         let mut core = core();
         core.emulator = None;
+        core.audio = None;
         core.content.clear();
     });
 }
@@ -312,7 +330,7 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut SystemAvInfo) {
             },
             timing: SystemTiming {
                 fps: FRAME_RATE,
-                sample_rate: AUDIO_SAMPLE_RATE,
+                sample_rate: f64::from(AUDIO_SAMPLE_RATE),
             },
         };
     });
@@ -337,8 +355,7 @@ pub extern "C" fn retro_reset() {
             Ok(mut emulator) => {
                 emulator.set_resolution(width, height);
                 *emulator.vfs_mut() = files;
-                core.emulator = Some(emulator);
-                core.elapsed = Duration::ZERO;
+                core.set_emulator(emulator);
             }
             Err(error) => log::error!("reset failed: {error}"),
         }
@@ -352,6 +369,7 @@ pub extern "C" fn retro_run() {
         let Core {
             callbacks,
             emulator,
+            audio,
             elapsed,
             ..
         } = &mut core.0;
@@ -389,7 +407,29 @@ pub extern "C" fn retro_run() {
                 );
             }
         }
+
+        let audio = audio.clone();
+        let batch = callbacks.audio_sample_batch;
+        let sample = callbacks.audio_sample;
+        drop(core);
+
+        if let Some(audio) = audio {
+            submit_audio(&audio, batch, sample);
+        }
     });
+}
+
+fn submit_audio(audio: &AudioPlayer, batch: AudioSampleBatchCallback, sample: AudioSampleCallback) {
+    let mut stereo = [[0.0; 2]; AUDIO_FRAMES_PER_RUN];
+    audio.render(&mut stereo);
+    let pcm = stereo.map(|frame| frame.map(|value| (value * 32768.0) as i16));
+    if let Some(batch) = batch {
+        unsafe { batch(pcm.as_flattened().as_ptr(), pcm.len()) };
+    } else if let Some(sample) = sample {
+        for [left, right] in pcm {
+            unsafe { sample(left, right) };
+        }
+    }
 }
 
 #[no_mangle]
@@ -471,8 +511,7 @@ pub unsafe extern "C" fn retro_load_game(info: *const GameInfo) -> bool {
             path.display()
         );
         core.content = emulator.package().to_vec();
-        core.emulator = Some(emulator);
-        core.elapsed = Duration::ZERO;
+        core.set_emulator(emulator);
         true
     })
 }
@@ -482,6 +521,7 @@ pub extern "C" fn retro_unload_game() {
     guard((), || {
         let mut core = core();
         core.emulator = None;
+        core.audio = None;
         core.content.clear();
     });
 }
@@ -537,4 +577,75 @@ pub unsafe extern "C" fn retro_get_memory_data(_id: u32) -> *mut c_void {
 #[no_mangle]
 pub extern "C" fn retro_get_memory_size(_id: u32) -> usize {
     guard(0, || 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mrpemu_core::audio::{AudioSink, PcmClip};
+
+    static CAPTURE: Mutex<Vec<[i16; 2]>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn capture_batch(data: *const i16, frames: usize) -> usize {
+        let samples = unsafe { std::slice::from_raw_parts(data, frames * 2) };
+        CAPTURE
+            .lock()
+            .unwrap()
+            .extend_from_slice(samples.as_chunks::<2>().0);
+        frames
+    }
+
+    unsafe extern "C" fn capture_sample(left: i16, right: i16) {
+        CAPTURE.lock().unwrap().push([left, right]);
+    }
+
+    #[test]
+    fn retro_run_submits_stereo_and_reset_clears_playback() {
+        use mrpemu_core::format::{FULL_HEADER_SIZE, MRP_MAGIC};
+
+        let mut content = vec![0; FULL_HEADER_SIZE];
+        content[..4].copy_from_slice(&MRP_MAGIC);
+        for offset in [4, 8, 12] {
+            content[offset..offset + 4].copy_from_slice(&200u32.to_le_bytes());
+        }
+        let emulator = MrpMachine::load(content.clone()).unwrap();
+        {
+            let mut core = core();
+            core.content = content;
+            core.set_emulator(emulator);
+            core.audio.as_mut().unwrap().play_bgm(
+                PcmClip {
+                    sample_rate: AUDIO_SAMPLE_RATE,
+                    channels: 2,
+                    samples: vec![1234, -2345],
+                },
+                true,
+            );
+        }
+        retro_set_audio_sample_batch(Some(capture_batch));
+        retro_set_audio_sample(Some(capture_sample));
+        retro_run();
+        let frames = std::mem::take(&mut *CAPTURE.lock().unwrap());
+        assert_eq!(frames.len(), 1600);
+        assert!(frames.iter().all(|&frame| frame == [1234, -2345]));
+
+        retro_set_audio_sample_batch(None);
+        retro_run();
+        assert_eq!(
+            std::mem::take(&mut *CAPTURE.lock().unwrap()),
+            [[1234, -2345]; 1600]
+        );
+
+        retro_reset();
+        retro_run();
+        assert_eq!(
+            std::mem::take(&mut *CAPTURE.lock().unwrap()),
+            [[0; 2]; 1600]
+        );
+
+        retro_unload_game();
+        retro_run();
+        assert!(CAPTURE.lock().unwrap().is_empty());
+        retro_set_audio_sample(None);
+    }
 }

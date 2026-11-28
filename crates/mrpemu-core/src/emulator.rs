@@ -428,6 +428,7 @@ impl MrpMachine {
                 }
             }
             if let Some(guest) = bridge.vm.guest.as_mut() {
+                guest.audio_sink.stop_bgm();
                 self.pending_audio_sink = Some(std::mem::replace(
                     &mut guest.audio_sink,
                     Box::new(crate::audio::NullAudioSink),
@@ -515,6 +516,7 @@ impl MrpMachine {
                     *last_error = Some(error.to_string());
                 }
             }
+            guest.audio_sink.stop_bgm();
             self.pending_audio_sink = Some(std::mem::replace(
                 &mut guest.audio_sink,
                 Box::new(crate::audio::NullAudioSink),

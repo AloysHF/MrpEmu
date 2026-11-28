@@ -3,10 +3,6 @@
 This guide covers installing and running the MrpEmu libretro core for
 RetroArch, loading content, and the current feature set.
 
-> **Status: experimental.** The core executes MRP applications and submits
-> RGB565 video to the frontend. See [Application Compatibility](Game-Compatibility.md)
-> for the verification criteria.
-
 ## Supported Platforms
 
 | Platform | Architecture | Libretro |
@@ -64,7 +60,6 @@ layout as the [standalone emulator](Standalone-Emulator.md#optional-device-files
 
 ## Planned Features
 
-- Audio output
 - Save states
 - Core options
 - Guest memory exposure

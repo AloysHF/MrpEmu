@@ -2051,26 +2051,34 @@ impl Guest {
                 MR_SUCCESS
             }
             55 | 56 => MR_SUCCESS, // shake
-            // mr_playSound(type, data, len, loop): decode the guest's WAV
-            // bytes and hand the PCM clip to the audio sink. Type 1 (MIDI)
-            // is logged and skipped until a synth exists.
             57 => {
+                // mr_playSound(type, data, len, loop)
                 let sound_type = self.cpu.reg_get(self.cpu.mode(), R0);
                 let data = self.cpu.reg_get(self.cpu.mode(), R1);
                 let len = self.cpu.reg_get(self.cpu.mode(), R2);
                 let looped = self.cpu.reg_get(self.cpu.mode(), R3) != 0;
                 let bytes = self.guest_bytes(data, len.min(4 * 1024 * 1024) as usize);
                 match sound_type {
-                    0 => match bytes.and_then(|bytes| crate::audio::decode_wav(&bytes).ok()) {
+                    0 => match bytes {
+                        Some(bytes) => self.audio_sink.play_midi(&bytes, looped),
+                        None => warn_once(
+                            "audio-midi",
+                            "mr_playSound: invalid MIDI buffer".to_string(),
+                        ),
+                    },
+                    1 => match bytes.and_then(|bytes| crate::audio::decode_wav(&bytes).ok()) {
                         Some(clip) => {
                             self.audio_sink.play_bgm(clip, looped);
                         }
                         None => {
-                            warn_once("audio", "mr_playSound: WAV decode failed".to_string());
+                            warn_once("audio-wav", "mr_playSound: WAV decode failed".to_string());
                         }
                     },
                     other => {
-                        warn_once("audio", format!("mr_playSound type {other} unsupported"));
+                        warn_once(
+                            "audio-unsupported",
+                            format!("mr_playSound type {other} unsupported"),
+                        );
                     }
                 }
                 MR_SUCCESS
@@ -5073,6 +5081,71 @@ pub fn local_datetime() -> (u32, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_play_sound_routes_midi_and_wav_by_sdk_type() {
+        use crate::audio::{AudioSink, PcmClip};
+        use std::{cell::RefCell, rc::Rc};
+
+        #[derive(Default)]
+        struct Calls {
+            midi: Option<(Vec<u8>, bool)>,
+            wav: Option<(PcmClip, bool)>,
+            stopped: bool,
+        }
+
+        struct RecordingSink(Rc<RefCell<Calls>>);
+
+        impl AudioSink for RecordingSink {
+            fn play_midi(&mut self, data: &[u8], looped: bool) {
+                self.0.borrow_mut().midi = Some((data.to_vec(), looped));
+            }
+
+            fn play_bgm(&mut self, clip: PcmClip, looped: bool) {
+                self.0.borrow_mut().wav = Some((clip, looped));
+            }
+
+            fn play_effect(&mut self, _clip: PcmClip) {}
+
+            fn stop_bgm(&mut self) {
+                self.0.borrow_mut().stopped = true;
+            }
+        }
+
+        let midi =
+            b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk\0\0\0\x0c\0\x90\x3c\x64\x60\x80\x3c\0\0\xff\x2f\0";
+        let wav = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x40\x1f\0\0\x80\x3e\0\0\x02\0\x10\0data\x02\0\0\0\x34\x12";
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        guest.audio_sink = Box::new(RecordingSink(Rc::clone(&calls)));
+        let mut screen = crate::display::Screen::new(240, 320);
+        let mode = guest.cpu.mode();
+
+        for (sound_type, data, looped) in [(0, midi.as_slice(), 1), (1, wav.as_slice(), 0)] {
+            let address = guest.scratch_buffer(data);
+            guest.cpu.reg_set(mode, R0, sound_type);
+            guest.cpu.reg_set(mode, R1, address);
+            guest.cpu.reg_set(mode, R2, data.len() as u32);
+            guest.cpu.reg_set(mode, R3, looped);
+            assert_eq!(guest.dispatch(57, &mut screen), 0);
+        }
+        assert_eq!(guest.dispatch(58, &mut screen), 0);
+
+        let calls = calls.borrow();
+        assert_eq!(calls.midi, Some((midi.to_vec(), true)));
+        assert_eq!(
+            calls.wav,
+            Some((
+                PcmClip {
+                    sample_rate: 8_000,
+                    channels: 1,
+                    samples: vec![0x1234]
+                },
+                false
+            ))
+        );
+        assert!(calls.stopped);
+    }
 
     #[test]
     fn native_asset_tables_have_separate_storage_and_a_screen_entry() {

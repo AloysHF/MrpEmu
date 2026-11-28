@@ -293,10 +293,16 @@ fn main() -> Result<()> {
     }
 
     // Audio output: open the default device and hand the sink to the core.
-    match audio::CpalSink::open() {
-        Ok(sink) => machine.set_audio_sink(Box::new(sink)),
-        Err(error) => log::warn!("audio disabled: {error:#}"),
-    }
+    let _audio_stream = match audio::open() {
+        Ok((player, stream)) => {
+            machine.set_audio_sink(Box::new(player));
+            Some(stream)
+        }
+        Err(error) => {
+            log::warn!("audio disabled: {error:#}");
+            None
+        }
+    };
 
     let (width, height) = (
         usize::from(machine.screen().width()),

@@ -1,6 +1,8 @@
-//! Guest audio: WAV decoding and the platform-independent sink the frontends
-//! implement. The core never touches host audio devices; `mr_playSound`
-//! decodes the guest's WAV bytes into PCM and hands the clip to the sink.
+//! Guest audio decoding and a shared stereo renderer for frontend sinks.
+
+mod player;
+
+pub use player::AudioPlayer;
 
 /// A decoded PCM clip (16-bit samples, interleaved channels).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,8 +23,7 @@ pub enum AudioError {
 }
 
 /// Parses a RIFF/WAVE file into a 16-bit PCM clip. Accepts 8-bit unsigned
-/// and 16-bit signed PCM inputs (the only encodings MRP packages ship);
-/// everything else (ADPCM, float, multi-channel >2) is rejected.
+/// and 16-bit signed PCM inputs with one or two channels.
 pub fn decode_wav(data: &[u8]) -> Result<PcmClip, AudioError> {
     if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
         return Err(AudioError::NotWav);
@@ -87,16 +88,16 @@ pub fn decode_wav(data: &[u8]) -> Result<PcmClip, AudioError> {
     })
 }
 
-/// The platform audio output. The core hands decoded clips to this; each
-/// frontend implements it against its own device layer. Single-threaded by
-/// design (the core drives the guest from one thread), so `Send` is not
-/// required — device streams are not always `Send`.
+/// The guest's audio command receiver. Frontends can install an [`AudioPlayer`]
+/// and pull stereo samples from a clone without sharing the guest itself.
 pub trait AudioSink {
     /// Starts (or replaces) the looping background clip.
     fn play_bgm(&mut self, clip: PcmClip, looped: bool);
-    /// Plays a one-shot effect; multiple effects may overlap.
+    /// Starts a Standard MIDI File if the sink supports MIDI.
+    fn play_midi(&mut self, _data: &[u8], _looped: bool) {}
+    /// Plays a one-shot effect.
     fn play_effect(&mut self, clip: PcmClip);
-    /// Stops the background clip.
+    /// Stops the active background audio.
     fn stop_bgm(&mut self);
 }
 

@@ -52,12 +52,11 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
   `.mrp` file and opens a scaled window
 - **Libretro core** — `mrpemu_libretro` presents RGB565 game frames and maps
   RetroPad controls to the phone keypad
-- **Desktop PCM audio** — plays supported WAV clips through the host audio device
+- **Shared audio** — plays Standard MIDI Files and PCM WAV in the desktop, libretro, and EmulatorJS builds
 
 ### Planned (Roadmap)
 
 - **Platform service coverage and game compatibility**
-- **Additional audio formats and libretro audio output**
 - **Save states**
 - **Network services** — the platform's online features
 

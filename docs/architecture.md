@@ -84,12 +84,26 @@ platform calls and can invoke a secondary ext entry point while preserving
 the suspended ARM caller's registers. MiniJ can send binary strings and
 guest memory buffers to the handler without truncating the payload.
 
+### Audio
+
+The native `mr_playSound` bridge forwards Standard MIDI Files (type 0,
+formats 0 and 1 with ticks-per-quarter-note timing) and decodes PCM WAV
+(type 1, mono or stereo with 8-bit or 16-bit samples). The shared audio
+player handles play, loop, and stop for one active sound. It synthesizes
+MIDI with RustySynth-ext and the embedded FluidR3Mono GM 2.312 sound bank,
+so MIDI playback requires no device files or system MIDI synthesizer.
+The player resamples WAV and renders normalized stereo PCM on request.
+
+The desktop frontend uses CPAL to pull PCM at the device rate. Libretro and
+EmulatorJS submit 1,600 signed 16-bit stereo frames per guest update at 48 kHz
+and 30 updates per second. Headless and screenshot runs use the silent sink
+and skip MIDI synthesis. Work on additional audio formats is ongoing.
+
 ## Current implementation status
 
 The core runs MiniJ and native ARM/Thumb code and exposes display, keypad,
-file, and timer services. The desktop frontend plays supported PCM clips.
-Platform service coverage, libretro audio, save states, and networking are
-ongoing work.
+file, and timer services. Platform service coverage, save states, and
+networking are ongoing work.
 
 ## Boot flow (today)
 

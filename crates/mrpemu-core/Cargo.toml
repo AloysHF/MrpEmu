@@ -12,6 +12,7 @@ encoding_rs.workspace = true
 flate2.workspace = true
 armv4t_emu.workspace = true
 unifont.workspace = true
+rustysynth-ext = { version = "1.5.0", features = ["sf3"] }
 
 [dev-dependencies]
 env_logger.workspace = true
