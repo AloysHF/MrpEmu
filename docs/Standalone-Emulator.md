@@ -48,6 +48,9 @@ mrpemu [OPTIONS] <MRP_PATH>
 | `-S, --screenshot <PATH>` | path | Save a PNG of the presented frame and exit. Implies headless. |
 | `--screenshot-frames <COUNT>` | integer | Number of frames to run before capturing. Defaults to 200. |
 | `--press <FRAME:KEY>` | text | Scripted key press at an exact frame; repeatable. Headless and screenshot runs only. |
+| `--persist-dir <DIR>` | path | Directory where guest-created files persist between runs. Loaded before the first frame and flushed when the run ends. |
+| `--load-state <PATH>` | path | Restore a machine snapshot before the first frame. The snapshot must have been saved for this package. |
+| `--save-state <PATH>` | path | Write a machine snapshot when the run ends (after the last frame or when the window closes). |
 | `-v, --verbose` | flag | Enable debug logging. |
 
 The screen defaults to 240×320. A file or parent folder labeled `240x400`
@@ -91,6 +94,10 @@ fires one key-down edge and one key-up edge on consecutive frames:
 ```bash
 # Run 120 frames without a window
 mrpemu path/to/app.mrp --headless --frames 120
+
+# Save progress across runs: guest files persist and the state can resume
+mrpemu path/to/app.mrp --persist-dir saves/ --save-state state.bin
+mrpemu path/to/app.mrp --persist-dir saves/ --load-state state.bin
 
 # Capture the frame after 200 scripted frames and two key presses
 mrpemu path/to/app.mrp -S shot.png --screenshot-frames 200 \

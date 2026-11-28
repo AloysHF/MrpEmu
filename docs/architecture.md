@@ -111,8 +111,9 @@ and skip MIDI synthesis. Work on additional audio formats is ongoing.
 ## Current implementation status
 
 The core runs MiniJ and native ARM/Thumb code and exposes display, keypad,
-file, and timer services. Platform service coverage, save states, and
-networking are ongoing work.
+file, and timer services, plus machine snapshots (`save_state.rs`) and
+guest file persistence. Platform service coverage and networking are
+ongoing work.
 
 ## Boot flow (today)
 

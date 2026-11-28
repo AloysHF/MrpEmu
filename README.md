@@ -48,6 +48,10 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
   keys, and the number keys
 - **In-memory guest filesystem** — packaged and session-created files,
   including resources from guest-loaded RAM packages and optional device files
+- **Guest file persistence and save states** — guest-created files persist to
+  a per-game directory (desktop `--persist-dir`, RetroArch save directory),
+  and the full machine state snapshots to a versioned, checksummed save
+  state on every frontend
 - **Standalone desktop frontend** — the `mrpemu` binary (minifb): loads an
   `.mrp` file and opens a scaled window
 - **Libretro core** — `mrpemu_libretro` presents RGB565 game frames and maps
@@ -57,7 +61,6 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
 ### Planned (Roadmap)
 
 - **Platform service coverage and game compatibility**
-- **Save states**
 - **Network services** — the platform's online features
 
 ## Usage
