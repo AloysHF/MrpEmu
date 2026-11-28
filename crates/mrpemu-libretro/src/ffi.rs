@@ -20,6 +20,7 @@ pub const LOG_ERROR: u32 = 3;
 pub const PIXEL_FORMAT_RGB565: u32 = 2;
 pub const DEVICE_NONE: u32 = 0;
 pub const DEVICE_JOYPAD: u32 = 1;
+pub const DEVICE_POINTER: u32 = 6;
 
 pub const JOYPAD_B: u32 = 0;
 pub const JOYPAD_Y: u32 = 1;
@@ -31,6 +32,10 @@ pub const JOYPAD_LEFT: u32 = 6;
 pub const JOYPAD_RIGHT: u32 = 7;
 pub const JOYPAD_A: u32 = 8;
 pub const JOYPAD_X: u32 = 9;
+
+pub const POINTER_X: u32 = 0;
+pub const POINTER_Y: u32 = 1;
+pub const POINTER_PRESSED: u32 = 2;
 
 pub type EnvironmentCallback = Option<unsafe extern "C" fn(u32, *mut c_void) -> bool>;
 pub type VideoRefreshCallback = Option<unsafe extern "C" fn(*const c_void, u32, u32, usize)>;

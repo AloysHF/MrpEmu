@@ -1,7 +1,9 @@
 //! Guest audio decoding and a shared stereo renderer for frontend sinks.
 
+mod mp3;
 mod player;
 
+pub(crate) use mp3::decode_mp3;
 pub use player::AudioPlayer;
 
 /// A decoded PCM clip (16-bit samples, interleaved channels).

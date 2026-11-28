@@ -51,8 +51,8 @@ MrpEmu uses the `mrpemu` command, crates and libretro core identifiers.
 - **Standalone desktop frontend** — the `mrpemu` binary (minifb): loads an
   `.mrp` file and opens a scaled window
 - **Libretro core** — `mrpemu_libretro` presents RGB565 game frames and maps
-  RetroPad controls to the phone keypad
-- **Shared audio** — plays Standard MIDI Files and PCM WAV in the desktop, libretro, and EmulatorJS builds
+  RetroPad controls and touchscreen or mouse input to the phone
+- **Shared audio** — plays Standard MIDI Files, PCM WAV, and MP3 in the desktop, libretro, and EmulatorJS builds
 
 ### Planned (Roadmap)
 
@@ -159,31 +159,14 @@ crates/
 ```
 
 - **`mrpemu-core`** — package parsing, MiniJ and ARM/Thumb execution, the
-  `mrc_` service bridge, the framebuffer, the keypad, and guest storage.
+  `mrc_` service bridge, the framebuffer, phone input, and guest storage.
 - **`mrpemu`** — the standalone desktop frontend: command line, window loop,
-  keyboard input.
+  keyboard and mouse input.
 - **`mrpemu-libretro`** — content loading, video, and input for RetroArch
   and other libretro frontends.
 
 See [Architecture](docs/architecture.md) for the platform background, the
 layered design, and the current implementation status.
-
-## Controls
-
-Applications expect a feature-phone keypad. The guest keypad model covers the
-direction keys, OK, the left/right soft keys and the number keys. The desktop
-frontend currently binds:
-
-| Phone input | Keyboard |
-| --- | --- |
-| Direction pad | Arrow keys |
-| OK / confirm | Enter |
-| Left soft key | Z |
-| Right soft key | X |
-| Digits | 0–9 |
-| Exit | Escape |
-
-See the [RetroArch Core](docs/RetroArch-Core.md) guide for the RetroPad mapping.
 
 ## Game Compatibility
 

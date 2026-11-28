@@ -2074,6 +2074,21 @@ impl Guest {
                             warn_once("audio-wav", "mr_playSound: WAV decode failed".to_string());
                         }
                     },
+                    2 => match bytes {
+                        Some(bytes) => match crate::audio::decode_mp3(bytes) {
+                            Ok(clip) => {
+                                log::debug!("playing MP3 ({len} bytes, loop={looped})");
+                                self.audio_sink.play_bgm(clip, looped);
+                            }
+                            Err(error) => {
+                                warn_once("audio-mp3", format!("mr_playSound: {error}"));
+                            }
+                        },
+                        None => warn_once(
+                            "audio-mp3-buffer",
+                            "mr_playSound: invalid MP3 buffer".to_string(),
+                        ),
+                    },
                     other => {
                         warn_once(
                             "audio-unsupported",
@@ -5145,6 +5160,41 @@ mod tests {
             ))
         );
         assert!(calls.stopped);
+    }
+
+    #[test]
+    fn native_mp3_sound_plays_loops_and_stops() {
+        use crate::audio::AudioPlayer;
+
+        // A synthetic mono 1 kHz tone encoded at 16 kHz with an ID3 tag.
+        let mp3 = include_bytes!("../tests/fixtures/tone.mp3");
+        let player = AudioPlayer::new(48_000);
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        guest.audio_sink = Box::new(player.clone());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let address = guest.scratch_buffer(mp3);
+        let mode = guest.cpu.mode();
+        let mut output = vec![[0.0; 2]; 48_000];
+
+        for looped in [0, 1] {
+            guest.cpu.reg_set(mode, R0, 2);
+            guest.cpu.reg_set(mode, R1, address);
+            guest.cpu.reg_set(mode, R2, mp3.len() as u32);
+            guest.cpu.reg_set(mode, R3, looped);
+            assert_eq!(guest.dispatch(57, &mut screen), 0);
+
+            player.render(&mut output);
+            assert!(output[..12_000].iter().any(|[left, _]| left.abs() > 0.01));
+            assert!(output.iter().all(|[left, right]| left == right));
+            assert_eq!(
+                output[36_000..].iter().any(|[left, _]| left.abs() > 0.01),
+                looped != 0
+            );
+        }
+
+        assert_eq!(guest.dispatch(58, &mut screen), 0);
+        player.render(&mut output);
+        assert!(output.iter().all(|frame| *frame == [0.0; 2]));
     }
 
     #[test]

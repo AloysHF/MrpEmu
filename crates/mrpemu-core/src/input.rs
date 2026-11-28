@@ -32,10 +32,18 @@ pub enum MrpKey {
     Pound,
 }
 
-/// Current press state of every [`MrpKey`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TouchState {
+    pub x: u16,
+    pub y: u16,
+    pub pressed: bool,
+}
+
+/// Current keypad and touchscreen state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputState {
     pressed: BTreeSet<MrpKey>,
+    touch: TouchState,
 }
 
 impl InputState {
@@ -63,9 +71,25 @@ impl InputState {
         self.pressed.iter().copied()
     }
 
-    /// Releases every key.
+    /// Sets the touch position in guest screen pixels and its contact state.
+    /// Supply the final position with `pressed = false` when releasing.
+    pub fn set_touch(&mut self, x: u16, y: u16, pressed: bool) {
+        self.touch = TouchState { x, y, pressed };
+    }
+
+    /// Releases the touch at its last known position.
+    pub fn release_touch(&mut self) {
+        self.touch.pressed = false;
+    }
+
+    pub(crate) fn touch(&self) -> TouchState {
+        self.touch
+    }
+
+    /// Releases every key and any active touch.
     pub fn clear(&mut self) {
         self.pressed.clear();
+        self.release_touch();
     }
 }
 

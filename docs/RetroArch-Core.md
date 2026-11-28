@@ -48,6 +48,12 @@ layout as the [standalone emulator](Standalone-Emulator.md#optional-device-files
 - Content reset with the original screen geometry
 - RetroPad input mapped to the phone keypad
 
+## Controls
+
+For touchscreen applications, tap and drag on the game image with one finger
+or the left mouse button. The core reads the frontend's pointer alongside
+RetroPad input.
+
 | Phone input | RetroPad |
 | --- | --- |
 | Direction keys | D-pad |

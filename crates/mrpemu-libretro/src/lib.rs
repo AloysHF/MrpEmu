@@ -1,9 +1,7 @@
 //! Libretro core for the MrpEmu MRP emulator.
 //!
-//! Presents a loaded `.mrp` application as a 240×320 RGB565 retro console.
-//! The guest key model (D-pad, OK, two soft keys, numeric keys) is mapped
-//! onto the RetroArch joypad; the mapping is documented through input
-//! descriptors.
+//! Presents an RGB565 phone screen. RetroPad buttons drive the guest keypad,
+//! and the frontend pointer drives a single touch on the screen.
 
 pub mod ffi;
 
@@ -338,8 +336,7 @@ pub unsafe extern "C" fn retro_get_system_av_info(info: *mut SystemAvInfo) {
 
 #[no_mangle]
 pub extern "C" fn retro_set_controller_port_device(_port: u32, _device: u32) {
-    // The core reads a fixed joypad layout; per-port device switching is a
-    // no-op. This entry point cannot panic, so it does not need the guard.
+    // The core polls both the joypad and pointer on port 0.
 }
 
 #[no_mangle]
@@ -381,17 +378,11 @@ pub extern "C" fn retro_run() {
             unsafe { poll() };
         }
 
-        // Sync the frontend joypad into the guest key state.
-        for (id, key, _) in JOYPAD_MAP {
-            let pressed = callbacks
+        update_input(emulator, |device, id| {
+            callbacks
                 .input_state
-                .is_some_and(|callback| unsafe { callback(0, DEVICE_JOYPAD, 0, *id) != 0 });
-            if pressed {
-                emulator.input_mut().press(*key);
-            } else {
-                emulator.input_mut().release(*key);
-            }
-        }
+                .map_or(0, |callback| unsafe { callback(0, device, 0, id) })
+        });
 
         emulator.run_frame_at(*elapsed);
         *elapsed += Duration::from_secs_f64(1.0 / FRAME_RATE);
@@ -417,6 +408,36 @@ pub extern "C" fn retro_run() {
             submit_audio(&audio, batch, sample);
         }
     });
+}
+
+fn update_input(emulator: &mut MrpMachine, read: impl Fn(u32, u32) -> i16) {
+    for &(id, key, _) in JOYPAD_MAP {
+        if read(DEVICE_JOYPAD, id) != 0 {
+            emulator.input_mut().press(key);
+        } else {
+            emulator.input_mut().release(key);
+        }
+    }
+
+    let x = read(DEVICE_POINTER, POINTER_X);
+    let y = read(DEVICE_POINTER, POINTER_Y);
+    if read(DEVICE_POINTER, POINTER_PRESSED) != 0 && x != i16::MIN && y != i16::MIN {
+        let screen = emulator.screen();
+        let x = pointer_to_pixel(x, screen.width());
+        let y = pointer_to_pixel(y, screen.height());
+        emulator.input_mut().set_touch(x, y, true);
+    } else {
+        // A touchscreen may stop reporting position as soon as the finger lifts.
+        emulator.input_mut().release_touch();
+    }
+}
+
+fn pointer_to_pixel(position: i16, size: u16) -> u16 {
+    // Libretro normalizes the video viewport to -32767..=32767 on both axes.
+    let half_range = i64::from(i16::MAX);
+    let offset = i64::from(position) + half_range;
+    let last_pixel = i64::from(size.saturating_sub(1));
+    ((offset * last_pixel + half_range) / (2 * half_range)) as u16
 }
 
 fn submit_audio(audio: &AudioPlayer, batch: AudioSampleBatchCallback, sample: AudioSampleCallback) {
@@ -583,6 +604,8 @@ pub extern "C" fn retro_get_memory_size(_id: u32) -> usize {
 mod tests {
     use super::*;
     use mrpemu_core::audio::{AudioSink, PcmClip};
+    use mrpemu_core::format::{FULL_HEADER_SIZE, MRP_MAGIC};
+    use mrpemu_core::input::InputState;
 
     static CAPTURE: Mutex<Vec<[i16; 2]>> = Mutex::new(Vec::new());
 
@@ -599,15 +622,45 @@ mod tests {
         CAPTURE.lock().unwrap().push([left, right]);
     }
 
-    #[test]
-    fn retro_run_submits_stereo_and_reset_clears_playback() {
-        use mrpemu_core::format::{FULL_HEADER_SIZE, MRP_MAGIC};
-
+    fn sample_content() -> Vec<u8> {
         let mut content = vec![0; FULL_HEADER_SIZE];
         content[..4].copy_from_slice(&MRP_MAGIC);
         for offset in [4, 8, 12] {
             content[offset..offset + 4].copy_from_slice(&200u32.to_le_bytes());
         }
+        content
+    }
+
+    #[test]
+    fn maps_pointer_and_releases_at_the_last_position_alongside_joypad() {
+        let mut emulator = MrpMachine::load(sample_content()).unwrap();
+        emulator.set_resolution(320, 480);
+
+        for ((x, y, pressed), (pixel_x, pixel_y, touch_active)) in [
+            ((-32767, 32767, 1), (0, 479, true)),
+            ((-16384, -16384, 1), (80, 120, true)),
+            ((0, -32767, 1), (160, 0, true)),
+            ((0, 0, 0), (160, 0, false)),
+            ((32767, 0, 1), (319, 240, true)),
+            ((i16::MIN, 0, 1), (319, 240, false)),
+        ] {
+            update_input(&mut emulator, |device, id| match (device, id) {
+                (DEVICE_JOYPAD, JOYPAD_A) => 1,
+                (DEVICE_POINTER, POINTER_X) => x,
+                (DEVICE_POINTER, POINTER_Y) => y,
+                (DEVICE_POINTER, POINTER_PRESSED) => pressed,
+                _ => 0,
+            });
+            let mut expected = InputState::new();
+            expected.press(MrpKey::Ok);
+            expected.set_touch(pixel_x, pixel_y, touch_active);
+            assert_eq!(emulator.input(), &expected);
+        }
+    }
+
+    #[test]
+    fn retro_run_submits_stereo_and_reset_clears_playback() {
+        let content = sample_content();
         let emulator = MrpMachine::load(content.clone()).unwrap();
         {
             let mut core = core();

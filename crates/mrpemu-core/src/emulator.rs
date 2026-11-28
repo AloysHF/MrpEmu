@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::display::{Screen, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use crate::error::MrpError;
 use crate::format::MrpHeader;
-use crate::input::{InputState, MrpKey};
+use crate::input::{InputState, MrpKey, TouchState};
 use crate::script::ScriptBridge;
 use crate::vfs::MemoryVfs;
 
@@ -28,6 +28,7 @@ pub struct MrpMachine {
     boot_attempted: bool,
     boot_error: Option<String>,
     last_keys: BTreeSet<MrpKey>,
+    last_touch: TouchState,
     /// Directory for guest-created file persistence.
     persist_dir: Option<std::path::PathBuf>,
     /// Screen resolution (detected from the corpus directory or default).
@@ -50,6 +51,7 @@ impl MrpMachine {
             boot_attempted: false,
             boot_error: None,
             last_keys: BTreeSet::new(),
+            last_touch: TouchState::default(),
             persist_dir: None,
             resolution: (240, 320),
             pending_audio_sink: None,
@@ -211,7 +213,7 @@ impl MrpMachine {
     }
 
     /// Advances the application by one frame: boots through the start.mr
-    /// script on first use, then delivers key edges and fires due timers.
+    /// script on first use, then delivers input events and fires due timers.
     pub fn run_frame(&mut self) {
         self.run_frame_with_clock(None);
     }
@@ -253,11 +255,13 @@ impl MrpMachine {
         let pressed: Vec<MrpKey> = current.difference(&self.last_keys).copied().collect();
         let released: Vec<MrpKey> = self.last_keys.difference(&current).copied().collect();
         self.last_keys = current;
+        let touch = self.input.touch();
+        let last_touch = std::mem::replace(&mut self.last_touch, touch);
 
-        let pump = |bridge: &mut ScriptBridge, event_type: i32, p0: i32| {
+        let pump = |bridge: &mut ScriptBridge, event_type: i32, p0: i32, p1: i32| {
             // Try the guest's ext handler first.
             if let Some(guest) = bridge.vm.guest.as_mut() {
-                let result = guest.send_event(event_type, p0, 0, &mut bridge.vm.screen);
+                let result = guest.send_event(event_type, p0, p1, &mut bridge.vm.screen);
                 if let Err(error) = &result {
                     log::debug!("guest event {event_type} failed: {error}");
                 }
@@ -266,7 +270,7 @@ impl MrpMachine {
                 }
             }
             // Fall through to the script's dealevent.
-            let _ = bridge.send_event(event_type, p0, 0);
+            let _ = bridge.send_event(event_type, p0, p1);
         };
 
         let menu_active = bridge
@@ -286,9 +290,9 @@ impl MrpMachine {
                 guest.move_menu_selection(1);
             } else if pressed.contains(&MrpKey::Ok) || pressed.contains(&MrpKey::LeftSoft) {
                 let selection = guest.menu.as_ref().map(|m| m.selection).unwrap_or(0);
-                pump(bridge, 4, selection as i32);
+                pump(bridge, 4, selection as i32, 0);
             } else if pressed.contains(&MrpKey::RightSoft) {
-                pump(bridge, 5, 0);
+                pump(bridge, 5, 0, 0);
             } else if let Some(digit) = pressed.iter().find_map(|key| match key {
                 MrpKey::Num0 => Some(9usize),
                 MrpKey::Num1 => Some(0),
@@ -302,14 +306,23 @@ impl MrpMachine {
                 MrpKey::Num9 => Some(8),
                 _ => None,
             }) {
-                pump(bridge, 4, digit as i32);
+                pump(bridge, 4, digit as i32, 0);
             }
         } else {
             for key in pressed {
-                pump(bridge, 0, Self::mrc_key_code(key));
+                pump(bridge, 0, Self::mrc_key_code(key), 0);
             }
             for key in released {
-                pump(bridge, 1, Self::mrc_key_code(key));
+                pump(bridge, 1, Self::mrc_key_code(key), 0);
+            }
+            let touch_event = match (last_touch.pressed, touch.pressed) {
+                (false, true) => Some(2),                        // MR_MOUSE_DOWN
+                (true, false) => Some(3),                        // MR_MOUSE_UP
+                (true, true) if last_touch != touch => Some(12), // MR_MOUSE_MOVE
+                _ => None,
+            };
+            if let Some(event_type) = touch_event {
+                pump(bridge, event_type, i32::from(touch.x), i32::from(touch.y));
             }
         }
 
@@ -624,5 +637,51 @@ mod tests {
             MrpMachine::load(data),
             Err(MrpError::BadMagic { .. })
         ));
+    }
+
+    #[test]
+    fn delivers_touch_edges_and_coordinates_to_the_native_handler() {
+        use crate::cfunction::{Guest, EXT_BASE};
+
+        let mut machine = MrpMachine::load(sample_package()).unwrap();
+        let mut guest = Guest::new(machine.guest_config(), Vec::new());
+        let recorded = EXT_BASE + 20;
+        for (i, word) in [
+            0xe59f_3008, // ldr r3, [pc, #8]
+            0xe883_0007, // stmia r3, {r0-r2}
+            0xe3a0_0000, // mov r0, #0
+            0xe12f_ff1e, // bx lr
+            recorded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            guest.w32(EXT_BASE + i as u32 * 4, word);
+        }
+        guest.event_function = EXT_BASE;
+        machine.script = Some(ScriptBridge::with_guest(guest, machine.screen.clone()));
+
+        let untouched = [u32::MAX; 3];
+        for (frame, ((x, y, pressed), expected)) in [
+            ((10, 20, false), untouched),
+            ((11, 22, true), [2, 11, 22]),
+            ((13, 25, true), [12, 13, 25]),
+            ((13, 25, true), untouched),
+            ((14, 27, false), [3, 14, 27]),
+            ((16, 29, false), untouched),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let guest = machine.script.as_mut().unwrap().vm.guest.as_mut().unwrap();
+            for offset in [0, 4, 8] {
+                guest.w32(recorded + offset, u32::MAX);
+            }
+            machine.input_mut().set_touch(x, y, pressed);
+            machine.run_frame_at(Duration::from_millis(frame as u64 * 33));
+            let guest = machine.guest_ref().unwrap();
+            let actual = [0, 4, 8].map(|offset| guest.r32(recorded + offset));
+            assert_eq!(actual, expected, "frame {frame}");
+        }
     }
 }

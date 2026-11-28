@@ -42,13 +42,16 @@ crates/
 
 - **`mrpemu-core`** — everything platform-independent: `.mrp` package
   parsing, the MiniJ and ARM/Thumb interpreters, the service bridge, the
-  RGB565 framebuffer, the phone keypad, and guest storage. Frontends drive
-  the machine through its framebuffer and keypad interface.
+  RGB565 framebuffer, phone input, and guest storage. The input interface
+  accepts keypad state and a single touch in guest screen coordinates.
 - **`mrpemu`** — the standalone desktop frontend built on minifb. It loads an
   `.mrp` path from the command line, presents the core's framebuffer in a
-  window, and feeds host keyboard events into the keypad model.
+  window, and maps the keyboard to the keypad and the left mouse button
+  to touch press, drag, and release.
 - **`mrpemu-libretro`** — loads content, reports RGB565 game frames and
-  screen geometry, and maps RetroPad input to the phone keypad.
+  screen geometry, and maps RetroPad input to the phone keypad. It converts
+  the frontend's normalized pointer into the same guest touch coordinates
+  used by the desktop frontend.
 
 ## Emulation strategy
 
@@ -88,11 +91,12 @@ guest memory buffers to the handler without truncating the payload.
 
 The native `mr_playSound` bridge forwards Standard MIDI Files (type 0,
 formats 0 and 1 with ticks-per-quarter-note timing) and decodes PCM WAV
-(type 1, mono or stereo with 8-bit or 16-bit samples). The shared audio
-player handles play, loop, and stop for one active sound. It synthesizes
+(type 1, mono or stereo with 8-bit or 16-bit samples) and MP3 (type 2).
+Symphonia decodes MP3 into PCM. The shared audio player handles play,
+loop, and stop for one active sound. It synthesizes
 MIDI with RustySynth-ext and the embedded FluidR3Mono GM 2.312 sound bank,
 so MIDI playback requires no device files or system MIDI synthesizer.
-The player resamples WAV and renders normalized stereo PCM on request.
+The player resamples decoded clips and renders normalized stereo PCM on request.
 
 The desktop frontend uses CPAL to pull PCM at the device rate. Libretro and
 EmulatorJS submit 1,600 signed 16-bit stereo frames per guest update at 48 kHz

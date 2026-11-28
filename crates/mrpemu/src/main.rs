@@ -6,7 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,8 +28,8 @@ struct Args {
     /// Path to the `.mrp` application package to run.
     mrp_path: PathBuf,
 
-    /// Integer scale factor applied to the phone screen.
-    #[arg(long, default_value_t = 2)]
+    /// Positive integer scale factor applied to the phone screen.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
     scale: u32,
 
     /// Directory with optional Mythroad system files and plugins.
@@ -308,10 +308,11 @@ fn main() -> Result<()> {
         usize::from(machine.screen().width()),
         usize::from(machine.screen().height()),
     );
+    let scale = args.scale as usize;
     let mut window = Window::new(
         &format!("MrpEmu — {}", machine.header().display_name),
-        width * args.scale as usize,
-        height * args.scale as usize,
+        width * scale,
+        height * scale,
         WindowOptions::default(),
     )
     .context("failed to open window")?;
@@ -319,6 +320,7 @@ fn main() -> Result<()> {
     let mut buffer = vec![0; width * height];
     let frame_duration = Duration::from_secs_f64(1.0 / FRAME_RATE);
     let mut elapsed = Duration::ZERO;
+    let mut touch_position = (0, 0);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let held = window.get_keys();
@@ -329,6 +331,17 @@ fn main() -> Result<()> {
                 machine.input_mut().release(*guest);
             }
         }
+        if let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) {
+            touch_position = (
+                (x as usize / scale).min(width - 1) as u16,
+                (y as usize / scale).min(height - 1) as u16,
+            );
+        }
+        machine.input_mut().set_touch(
+            touch_position.0,
+            touch_position.1,
+            window.is_active() && window.get_mouse_down(MouseButton::Left),
+        );
 
         machine.run_frame_at(elapsed);
         elapsed += frame_duration;

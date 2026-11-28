@@ -40,7 +40,7 @@ mrpemu [OPTIONS] <MRP_PATH>
 | Option | Value | Description |
 |---|---|---|
 | `<MRP_PATH>` | path | *required* — path to the `.mrp` application package. |
-| `--scale <SCALE>` | integer | Integer window scale factor applied to the detected framebuffer size. Defaults to 2. |
+| `--scale <SCALE>` | positive integer | Window scale factor applied to the detected framebuffer size. Defaults to 2. |
 | `--system-dir <DIR>` | path | Root directory for optional Mythroad device files. Defaults to the package's parent directory. |
 | `--headless` | flag | Run without opening a window, then exit. |
 | `--frames <COUNT>` | integer | Number of frames to run in headless mode. Defaults to 60. |
@@ -119,10 +119,10 @@ be added to the `$recipes` table (an empty `Press` array opts a title out
 of the global schedule) after the sequence is verified in
 [Application Compatibility](Game-Compatibility.md).
 
-## Key Mappings
+## Controls
 
-The guest keypad model covers the direction keys, OK, the left/right soft
-keys, and the number keys. The desktop frontend currently binds:
+Use the left mouse button to tap or drag in touchscreen applications.
+The desktop keyboard maps to the phone keypad as follows.
 
 | Phone input | Keyboard |
 | --- | --- |
