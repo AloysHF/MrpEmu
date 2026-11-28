@@ -11,20 +11,23 @@ pub(crate) fn system_font(path: &str) -> Option<&'static [u8]> {
     use std::sync::OnceLock;
     static SMALL: OnceLock<Vec<u8>> = OnceLock::new();
     static MEDIUM: OnceLock<Vec<u8>> = OnceLock::new();
+    // Legacy GB12 loaders look for this download record beside the installed font.
+    const SMALL_FONT_ADL: [u8; 8] = [1, 0, 0, 0, 0xa0, 0xd9, 8, 0];
     match path {
-        "system/gb12.uc2" => Some(SMALL.get_or_init(|| make_system_font(12))),
-        "system/gb16.uc2" => Some(MEDIUM.get_or_init(|| make_system_font(16))),
+        "system/gb12.uc2" => Some(SMALL.get_or_init(|| make_system_font(12, 65_535))),
+        "system/gb12_uc2.adl" => Some(&SMALL_FONT_ADL),
+        "system/gb16.uc2" => Some(MEDIUM.get_or_init(|| make_system_font(16, 65_536))),
         _ => None,
     }
 }
 
-fn make_system_font(size: usize) -> Vec<u8> {
+fn make_system_font(size: usize, cell_count: usize) -> Vec<u8> {
     // UC2 stores an MSB-first cell at a fixed offset for each UCS-2 code point.
     let cell_bytes = size * size / 8;
-    let mut data = vec![0; 65536 * cell_bytes];
+    let mut data = vec![0; cell_count * cell_bytes];
     for (character, glyph) in unifont::enumerate_glyphs() {
         let code = character as usize;
-        if code >= 65536 {
+        if code >= cell_count {
             break;
         }
         if character.is_control() || character.is_whitespace() {
@@ -97,6 +100,31 @@ impl Screen {
         }
         self.pixels[usize::from(y) * usize::from(self.width) + usize::from(x)] = color;
         true
+    }
+
+    pub(crate) fn draw_editor(&mut self, title: &str, text: &str) {
+        self.fill(0x1082);
+        self.draw_label(title, 8, 8);
+        self.draw_label(text, 8, 40);
+        self.draw_label("OK / Back", 8, self.height.saturating_sub(24));
+    }
+
+    fn draw_label(&mut self, label: &str, mut x: u16, y: u16) {
+        for ch in label.chars() {
+            let glyph = unifont::get_glyph(ch).unwrap_or_else(|| unifont::get_glyph('?').unwrap());
+            let width = glyph.get_width() as u16;
+            if x.saturating_add(width) > self.width {
+                break;
+            }
+            for row in 0..16 {
+                for col in 0..width {
+                    if glyph.get_pixel(usize::from(col), usize::from(row)) {
+                        self.set_pixel(x + col, y.saturating_add(row), 0xffff);
+                    }
+                }
+            }
+            x += width;
+        }
     }
 }
 

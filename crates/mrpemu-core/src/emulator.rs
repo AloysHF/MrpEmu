@@ -97,6 +97,40 @@ impl MrpMachine {
         &mut self.input
     }
 
+    /// Whether a guest edit dialog currently owns the input focus.
+    pub fn is_editing(&self) -> bool {
+        self.guest_ref()
+            .and_then(|guest| guest.edit.as_ref())
+            .is_some_and(|edit| edit.visible)
+    }
+
+    /// Appends host text to the active guest edit dialog.
+    pub fn type_edit_text(&mut self, text: &str) {
+        if let Some(edit) = self.active_edit_mut() {
+            for ch in text.chars() {
+                edit.append(ch);
+            }
+        }
+    }
+
+    /// Removes the final character in the active guest edit dialog.
+    pub fn backspace_edit_text(&mut self) {
+        if let Some(edit) = self.active_edit_mut() {
+            edit.text.pop();
+        }
+    }
+
+    fn active_edit_mut(&mut self) -> Option<&mut crate::cfunction::EditState> {
+        self.script
+            .as_mut()?
+            .vm
+            .guest
+            .as_mut()?
+            .edit
+            .as_mut()
+            .filter(|edit| edit.visible)
+    }
+
     pub fn vfs(&self) -> &MemoryVfs {
         &self.vfs
     }
@@ -279,7 +313,33 @@ impl MrpMachine {
             .as_ref()
             .map(|guest| guest.menu.is_some())
             .unwrap_or(false);
-        if menu_active {
+        let edit = bridge
+            .vm
+            .guest
+            .as_mut()
+            .and_then(|guest| guest.edit.as_mut())
+            .filter(|edit| edit.visible);
+        if let Some(edit) = edit {
+            if let Some((_, button)) = edit.confirmation.filter(|(key, _)| released.contains(key)) {
+                edit.visible = false;
+                edit.confirmation = None;
+                pump(bridge, 6, button, 0); // MR_DIALOG_EVENT
+            } else {
+                for key in pressed {
+                    match key {
+                        MrpKey::Ok | MrpKey::LeftSoft => edit.confirmation = Some((key, 0)),
+                        MrpKey::RightSoft => edit.confirmation = Some((key, 1)),
+                        _ => {
+                            if let Some(digit) =
+                                char::from_digit(Self::mrc_key_code(key) as u32, 10)
+                            {
+                                edit.append(digit);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if menu_active {
             // The platform menu owns key input while shown: Up/Down move
             // the selection, OK selects (MR_MENU_SELECT carries the item
             // index), RSK cancels (MR_MENU_RETURN), digits pick items.
@@ -387,6 +447,15 @@ impl MrpMachine {
         // Sync the presented guest screen into the machine's public screen
         // so frontends and tests observe post-boot drawing.
         self.screen.clone_from(&bridge.vm.screen);
+        if let Some(edit) = bridge
+            .vm
+            .guest
+            .as_ref()
+            .and_then(|guest| guest.edit.as_ref())
+            .filter(|edit| edit.visible)
+        {
+            self.screen.draw_editor(&edit.title, &edit.display_text());
+        }
     }
 
     /// Boots the application: runs start.mr on the script bridge first
@@ -599,6 +668,7 @@ fn resolution_from_path(path: &Path) -> (u16, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfunction::{Guest, EXT_BASE, TABLE_BASE};
 
     fn sample_package() -> Vec<u8> {
         let mut data = vec![0u8; crate::format::FULL_HEADER_SIZE];
@@ -607,6 +677,24 @@ mod tests {
         data[8..12].copy_from_slice(&200u32.to_le_bytes());
         data[12..16].copy_from_slice(&200u32.to_le_bytes());
         data
+    }
+
+    fn record_native_events(guest: &mut Guest) -> u32 {
+        let recorded = EXT_BASE + 20;
+        for (i, word) in [
+            0xe59f_3008, // ldr r3, [pc, #8]
+            0xe883_0007, // stmia r3, {r0-r2}
+            0xe3a0_0000, // mov r0, #0
+            0xe12f_ff1e, // bx lr
+            recorded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            guest.w32(EXT_BASE + i as u32 * 4, word);
+        }
+        guest.event_function = EXT_BASE;
+        recorded
     }
 
     #[test]
@@ -640,25 +728,67 @@ mod tests {
     }
 
     #[test]
-    fn delivers_touch_edges_and_coordinates_to_the_native_handler() {
-        use crate::cfunction::{Guest, EXT_BASE};
-
+    fn native_edit_returns_ucs2_text_and_a_dialog_event() {
         let mut machine = MrpMachine::load(sample_package()).unwrap();
         let mut guest = Guest::new(machine.guest_config(), Vec::new());
-        let recorded = EXT_BASE + 20;
-        for (i, word) in [
-            0xe59f_3008, // ldr r3, [pc, #8]
-            0xe883_0007, // stmia r3, {r0-r2}
-            0xe3a0_0000, // mov r0, #0
-            0xe12f_ff1e, // bx lr
-            recorded,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            guest.w32(EXT_BASE + i as u32 * 4, word);
-        }
-        guest.event_function = EXT_BASE;
+        let title = guest.scratch_buffer(b"\0N\0a\0m\0e\0\0");
+        let mode = guest.cpu.mode();
+        guest.cpu.reg_set(mode, 0, title);
+        guest.cpu.reg_set(mode, 3, 3);
+        let edit_create = guest.r32(TABLE_BASE + 75 * 4);
+        let handle = guest
+            .run_guest(edit_create, 100, &mut machine.screen)
+            .unwrap();
+        assert!(handle > 0 && handle != u32::MAX);
+
+        let recorded = record_native_events(&mut guest);
+        machine.script = Some(ScriptBridge::with_guest(guest, machine.screen.clone()));
+
+        assert!(machine.is_editing());
+        machine.type_edit_text("abc");
+        machine.backspace_edit_text();
+        machine.type_edit_text("中d");
+        machine.input_mut().press(MrpKey::Ok);
+        machine.run_frame_at(Duration::ZERO);
+        assert!(machine.is_editing());
+        machine.input_mut().release(MrpKey::Ok);
+        machine.run_frame_at(Duration::from_millis(33));
+        assert!(!machine.is_editing());
+
+        let bridge = machine.script.as_mut().unwrap();
+        let guest = bridge.vm.guest.as_mut().unwrap();
+        assert_eq!(
+            [0, 4, 8].map(|offset| guest.r32(recorded + offset)),
+            [6, 0, 0]
+        );
+        let get_text = guest.r32(TABLE_BASE + 77 * 4);
+        guest.cpu.reg_set(mode, 0, handle);
+        let text = guest
+            .run_guest(get_text, 100, &mut bridge.vm.screen)
+            .unwrap();
+        assert_eq!(guest.guest_bytes(text, 8).unwrap(), b"\0a\0b\x4e\x2d\0\0");
+        let release = guest.r32(TABLE_BASE + 76 * 4);
+        guest.cpu.reg_set(mode, 0, handle);
+        assert_eq!(
+            guest
+                .run_guest(release, 100, &mut bridge.vm.screen)
+                .unwrap(),
+            0
+        );
+        guest.cpu.reg_set(mode, 0, handle);
+        assert_eq!(
+            guest
+                .run_guest(get_text, 100, &mut bridge.vm.screen)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn delivers_touch_edges_and_coordinates_to_the_native_handler() {
+        let mut machine = MrpMachine::load(sample_package()).unwrap();
+        let mut guest = Guest::new(machine.guest_config(), Vec::new());
+        let recorded = record_native_events(&mut guest);
         machine.script = Some(ScriptBridge::with_guest(guest, machine.screen.clone()));
 
         let untouched = [u32::MAX; 3];

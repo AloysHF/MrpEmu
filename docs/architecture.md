@@ -74,7 +74,10 @@ resource cache and read it later in the same session. Native code can
 register a RAM package and use the file bridge to look up, borrow or
 decompress its members. It can also select a package in guest storage.
 The frontends may seed guest storage with optional device files at load
-time. The framebuffer supports 240×320, 240×400, and 320×480 displays.
+time. The core supplies fallback bitmap fonts and the GB12 companion file
+for applications that read them directly. Native edit dialogs accept text
+from the frontend and return UCS-2 text through the guest's edit handle.
+The framebuffer supports 240×320, 240×400, and 320×480 displays.
 Native drawing follows the current guest framebuffer pointer, and an
 explicit video submission retains its pixels for the frontend. Optional
 platform extended RAM is allocated separately from the SDK's main heap.
@@ -91,8 +94,8 @@ guest memory buffers to the handler without truncating the payload.
 
 The native `mr_playSound` bridge forwards Standard MIDI Files (type 0,
 formats 0 and 1 with ticks-per-quarter-note timing) and decodes PCM WAV
-(type 1, mono or stereo with 8-bit or 16-bit samples) and MP3 (type 2).
-Symphonia decodes MP3 into PCM. The shared audio player handles play,
+(type 1, mono or stereo with 8-bit or 16-bit samples), MP3 (type 2), and
+AMR-NB files (type 5, 8 kHz mono). The shared audio player handles play,
 loop, and stop for one active sound. It synthesizes
 MIDI with RustySynth-ext and the embedded FluidR3Mono GM 2.312 sound bank,
 so MIDI playback requires no device files or system MIDI synthesizer.

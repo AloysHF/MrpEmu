@@ -6,9 +6,11 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 mod audio;
@@ -143,6 +145,17 @@ const KEY_MAP: &[(Key, MrpKey)] = &[
     (Key::Key8, MrpKey::Num8),
     (Key::Key9, MrpKey::Num9),
 ];
+
+#[derive(Clone, Default)]
+struct WindowText(Rc<RefCell<String>>);
+
+impl InputCallback for WindowText {
+    fn add_char(&mut self, codepoint: u32) {
+        if let Some(ch) = char::from_u32(codepoint) {
+            self.0.borrow_mut().push(ch);
+        }
+    }
+}
 
 /// Expands one RGB565 pixel to 8-bit RGB for PNG output.
 fn rgb565_to_rgb8(pixel: u16) -> [u8; 3] {
@@ -317,15 +330,34 @@ fn main() -> Result<()> {
     )
     .context("failed to open window")?;
     window.set_target_fps(FRAME_RATE as usize);
+    let window_text = WindowText::default();
+    window.set_input_callback(Box::new(window_text.clone()));
     let mut buffer = vec![0; width * height];
     let frame_duration = Duration::from_secs_f64(1.0 / FRAME_RATE);
     let mut elapsed = Duration::ZERO;
     let mut touch_position = (0, 0);
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    while window.is_open() {
+        let editing = machine.is_editing();
+        let escape = window.is_key_down(Key::Escape);
+        if escape && !editing {
+            break;
+        }
+        let text = std::mem::take(&mut *window_text.0.borrow_mut());
+        if editing {
+            machine.type_edit_text(&text);
+            if window.is_key_pressed(Key::Backspace, KeyRepeat::Yes) {
+                machine.backspace_edit_text();
+            }
+        }
         let held = window.get_keys();
         for (host, guest) in KEY_MAP {
-            if held.contains(host) {
+            let pressed = if editing && *guest == MrpKey::RightSoft {
+                escape
+            } else {
+                (!editing || *guest == MrpKey::Ok) && held.contains(host)
+            };
+            if pressed {
                 machine.input_mut().press(*guest);
             } else {
                 machine.input_mut().release(*guest);

@@ -71,7 +71,8 @@ cargo run --release -p mrpemu -- path/to/app.mrp
 
 Some packages expect a platform plugin, such as the Flash player. Place
 your device files under `--system-dir` with this layout. Missing files
-are skipped and the emulator supplies fallback bitmap fonts.
+are skipped. The emulator supplies fallback bitmap fonts and the GB12
+font's companion file.
 
 ```text
 plugins/flaengine.mrp
@@ -132,6 +133,9 @@ The desktop keyboard maps to the phone keypad as follows.
 | Right soft key | X |
 | Digits | 0–9 |
 | Exit | Escape |
+
+When an application opens a text editor, type with the desktop keyboard.
+Use Backspace to erase, Enter to confirm, and Escape to cancel.
 
 The RetroArch core uses its own input path; see the
 [RetroArch Core](RetroArch-Core.md) guide.

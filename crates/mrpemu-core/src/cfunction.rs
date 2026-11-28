@@ -465,6 +465,7 @@ pub struct Guest {
     pub next_gui_handle: u32,
     /// The active platform menu (runtime-rendered, key-driven).
     pub menu: Option<MenuState>,
+    pub(crate) edit: Option<EditState>,
     /// The host-side Lua state the ext drives through the internal table's
     /// `asm_mrp_*` bridge (entries 16-76).
     pub lua: crate::luastate::LuaState,
@@ -486,6 +487,39 @@ pub struct MenuState {
     pub items: Vec<Vec<u8>>,
     pub count: usize,
     pub selection: usize,
+}
+
+pub(crate) struct EditState {
+    handle: u32,
+    pub title: String,
+    pub text: Vec<u16>,
+    kind: u32,
+    max_chars: usize,
+    buffer: u32,
+    buffer_size: u32,
+    pub visible: bool,
+    pub confirmation: Option<(crate::input::MrpKey, i32)>,
+}
+
+impl EditState {
+    pub fn append(&mut self, ch: char) {
+        let allowed = match self.kind {
+            1 => ch.is_ascii_digit(),
+            3 => ch.is_alphabetic(),
+            _ => true,
+        };
+        if allowed && !ch.is_control() && ch.len_utf16() == 1 && self.text.len() < self.max_chars {
+            self.text.push(ch as u16);
+        }
+    }
+
+    pub fn display_text(&self) -> String {
+        if self.kind == 2 {
+            "*".repeat(self.text.len())
+        } else {
+            String::from_utf16_lossy(&self.text)
+        }
+    }
 }
 
 /// A loaded bitmap with dimensions and RGB565 pixel data.
@@ -553,6 +587,7 @@ impl Guest {
             bitmaps: std::collections::HashMap::new(),
             next_gui_handle: 0,
             menu: None,
+            edit: None,
             lua: crate::luastate::LuaState::new(),
             vm_bridge_ret: 0,
             lua_string_ptrs: std::collections::HashMap::new(),
@@ -2089,6 +2124,24 @@ impl Guest {
                             "mr_playSound: invalid MP3 buffer".to_string(),
                         ),
                     },
+                    5 => {
+                        if let Some(bytes) = bytes {
+                            match crate::audio::decode_amr(&bytes) {
+                                Ok(clip) => {
+                                    log::debug!("playing AMR-NB ({len} bytes, loop={looped})");
+                                    self.audio_sink.play_bgm(clip, looped);
+                                }
+                                Err(error) => {
+                                    warn_once("audio-amr", format!("mr_playSound: {error}"));
+                                }
+                            }
+                        } else {
+                            warn_once(
+                                "audio-amr-buffer",
+                                "mr_playSound: invalid AMR-NB buffer".to_string(),
+                            );
+                        }
+                    }
                     other => {
                         warn_once(
                             "audio-unsupported",
@@ -2107,7 +2160,7 @@ impl Guest {
             62 => MR_FAILED,      // connectWAP: offline
             // GUI natives: menu/dialog/text/edit/win. Each Create returns a
             // nonzero handle; Set/Show/Refresh return MR_SUCCESS; Release
-            // and GetText return success. This lets ext code that builds
+            // return success. This lets ext code that builds
             // GUI-based UIs proceed past the creation gate.
             63 => {
                 // mrc_menuCreate(title, num)
@@ -2163,12 +2216,9 @@ impl Guest {
                 self.next_gui_handle as i32
             }
             73..=74 => MR_SUCCESS, // textRelease/Refresh
-            75 => {
-                self.next_gui_handle += 1;
-                self.next_gui_handle as i32
-            }
-            76 => MR_SUCCESS, // editRelease
-            77 => 0,          // editGetText → empty string (nil terminated at r0)
+            75 => self.swi_edit_create(),
+            76 => self.swi_edit_release(),
+            77 => self.swi_edit_get_text(),
             78 => {
                 self.next_gui_handle += 1;
                 self.next_gui_handle as i32
@@ -2894,6 +2944,73 @@ impl Guest {
         self.ensure_system_font(&path);
         self.find_file(&path, true)
             .map_or(-1, |index| self.files[index].1.len() as i32)
+    }
+
+    fn swi_edit_create(&mut self) -> i32 {
+        let mode = self.cpu.mode();
+        let title = self.cpu.reg_get(mode, R0);
+        let text = self.cpu.reg_get(mode, R1);
+        let kind = self.cpu.reg_get(mode, R2);
+        let max_chars = self.cpu.reg_get(mode, R3);
+        if self.edit.is_some() || kind > 3 || max_chars > LG_MEM_LEN / 2 - 1 {
+            return -1;
+        }
+
+        let buffer_size = (max_chars + 1) * 2;
+        let buffer = self.heap_malloc(buffer_size);
+        if buffer == 0 {
+            return -1;
+        }
+        let title = self.read_platform_text(title, true);
+        let text = self
+            .guest_ucs2_bytes(text)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take(max_chars as usize)
+            .copied()
+            .map(u16::from_be_bytes)
+            .collect();
+        self.next_gui_handle += 1;
+        self.edit = Some(EditState {
+            handle: self.next_gui_handle,
+            title,
+            text,
+            kind,
+            max_chars: max_chars as usize,
+            buffer,
+            buffer_size,
+            visible: true,
+            confirmation: None,
+        });
+        self.next_gui_handle as i32
+    }
+
+    fn swi_edit_release(&mut self) -> i32 {
+        let handle = self.cpu.reg_get(self.cpu.mode(), R0);
+        let Some(edit) = self.edit.take_if(|edit| edit.handle == handle) else {
+            return -1;
+        };
+        self.heap_free(edit.buffer, edit.buffer_size);
+        0
+    }
+
+    fn swi_edit_get_text(&mut self) -> i32 {
+        let handle = self.cpu.reg_get(self.cpu.mode(), R0);
+        let Some(edit) = self.edit.as_ref().filter(|edit| edit.handle == handle) else {
+            return 0;
+        };
+        let start = edit.buffer as usize;
+        let bytes = edit.text.len() * 2;
+        for (word, cell) in edit
+            .text
+            .iter()
+            .zip(self.mem[start..start + bytes].as_chunks_mut::<2>().0)
+        {
+            cell.copy_from_slice(&word.to_be_bytes());
+        }
+        self.mem[start + bytes..start + bytes + 2].fill(0);
+        edit.buffer as i32
     }
 
     fn ensure_system_font(&mut self, path: &str) {
@@ -5198,6 +5315,37 @@ mod tests {
     }
 
     #[test]
+    fn native_amr_sound_renders_mono_as_stereo() {
+        use crate::audio::AudioPlayer;
+        use amr_nb::{rfc4867, Dtx, Encoder, Mode};
+
+        let tone = std::array::from_fn(|i| {
+            let phase = i as f32 * (std::f32::consts::TAU * 400.0 / 8_000.0);
+            (phase.sin() * 8_000.0) as i16
+        });
+        let mut encoder = Encoder::new(Dtx::Off);
+        let frames: Vec<_> = (0..4).map(|_| encoder.encode(Mode::MR122, &tone)).collect();
+        let amr = rfc4867::write_storage(&frames).unwrap();
+
+        let player = AudioPlayer::new(48_000);
+        let mut guest = Guest::new(GuestConfig::default(), Vec::new());
+        guest.audio_sink = Box::new(player.clone());
+        let mut screen = crate::display::Screen::new(240, 320);
+        let address = guest.scratch_buffer(&amr);
+        let mode = guest.cpu.mode();
+        guest.cpu.reg_set(mode, R0, 5);
+        guest.cpu.reg_set(mode, R1, address);
+        guest.cpu.reg_set(mode, R2, amr.len() as u32);
+        assert_eq!(guest.dispatch(57, &mut screen), 0);
+
+        let mut output = vec![[0.0; 2]; 4_800];
+        player.render(&mut output);
+        assert!(output[..3_840].iter().any(|[left, _]| left.abs() > 0.01));
+        assert!(output.iter().all(|[left, right]| left == right));
+        assert!(output[3_841..].iter().all(|&frame| frame == [0.0; 2]));
+    }
+
+    #[test]
     fn native_asset_tables_have_separate_storage_and_a_screen_entry() {
         let config = GuestConfig {
             screen_width: 240,
@@ -5555,11 +5703,19 @@ mod tests {
         assert_eq!(guest.dispatch(42, &mut screen), 1);
 
         let file = guest.file_data("system/gb12.uc2").unwrap();
-        assert_eq!(file.len(), 65536 * 18);
+        assert_eq!(file.len(), 65535 * 18);
         let cjk = 0x4e2d * 18;
         assert!(file[cjk..cjk + 18].iter().any(|&byte| byte != 0));
         let space = usize::from(b' ') * 18;
         assert!(file[space..space + 18].iter().all(|&byte| byte == 0));
+
+        let companion = guest.scratch_buffer(b"system/gb12_uc2.adl");
+        guest.cpu.reg_set(mode, R0, companion);
+        assert_eq!(guest.dispatch(42, &mut screen), 1);
+        assert_eq!(
+            guest.file_data("system/gb12_uc2.adl").unwrap(),
+            [1, 0, 0, 0, 0xa0, 0xd9, 8, 0]
+        );
     }
 
     #[test]

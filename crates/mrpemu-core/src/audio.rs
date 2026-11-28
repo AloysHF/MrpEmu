@@ -1,8 +1,10 @@
 //! Guest audio decoding and a shared stereo renderer for frontend sinks.
 
+mod amr;
 mod mp3;
 mod player;
 
+pub(crate) use amr::decode_amr;
 pub(crate) use mp3::decode_mp3;
 pub use player::AudioPlayer;
 
