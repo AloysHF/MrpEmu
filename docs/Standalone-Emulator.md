@@ -48,6 +48,7 @@ mrpemu [OPTIONS] <MRP_PATH>
 | `-S, --screenshot <PATH>` | path | Save a PNG of the presented frame and exit. Implies headless. |
 | `--screenshot-frames <COUNT>` | integer | Number of frames to run before capturing. Defaults to 200. |
 | `--press <FRAME:KEY>` | text | Scripted key press at an exact frame; repeatable. Headless and screenshot runs only. |
+| `--volume <0-100>` | integer | Playback volume in percent. Defaults to 100; values above 100 fail the parse. |
 | `--persist-dir <DIR>` | path | Directory where guest-created files persist between runs. Loaded before the first frame and flushed when the run ends. |
 | `--load-state <PATH>` | path | Restore a machine snapshot before the first frame. The snapshot must have been saved for this package. |
 | `--save-state <PATH>` | path | Write a machine snapshot when the run ends (after the last frame or when the window closes). |
